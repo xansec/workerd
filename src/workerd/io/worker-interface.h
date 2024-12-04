@@ -17,7 +17,7 @@ class IoContext_IncomingRequest;
 // An interface representing the services made available by a worker/pipeline to handle a
 // request.
 class WorkerInterface: public kj::HttpService {
-public:
+ public:
   // Constructs a WorkerInterface where any method called will throw the given exception.
   static kj::Own<WorkerInterface> fromException(kj::Exception&& e);
 
@@ -60,7 +60,7 @@ public:
   };
 
   class AlarmFulfiller {
-  public:
+   public:
     AlarmFulfiller(kj::Own<kj::PromiseFulfiller<AlarmResult>> fulfiller);
     KJ_DISALLOW_COPY(AlarmFulfiller);
     AlarmFulfiller(AlarmFulfiller&&) = default;
@@ -70,7 +70,7 @@ public:
     void reject(const kj::Exception& e);
     void cancel();
 
-  private:
+   private:
     kj::Maybe<kj::Own<kj::PromiseFulfiller<AlarmResult>>> maybeFulfiller;
     kj::Maybe<kj::PromiseFulfiller<AlarmResult>&> getFulfiller();
   };
@@ -101,7 +101,7 @@ public:
   static constexpr auto ALARM_RETRY_MAX_TRIES = 6;
 
   class CustomEvent {
-  public:
+   public:
     struct Result {
       // Outcome for logging / metrics purposes.
       EventOutcome outcome;
@@ -117,6 +117,9 @@ public:
     virtual kj::Promise<Result> sendRpc(capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
         capnp::ByteStreamFactory& byteStreamFactory,
         rpc::EventDispatcher::Client dispatcher) = 0;
+
+    // The event is not supported by the target, raise an appropriate error.
+    virtual kj::Promise<Result> notSupported() = 0;
 
     // Get the type for this event for logging / metrics purposes. This is intended for use by the
     // RequestObserver. The RequestObserver implementation will define what numbers correspond to
@@ -140,13 +143,112 @@ public:
   [[nodiscard]] virtual kj::Promise<CustomEvent::Result> customEvent(
       kj::Own<CustomEvent> event) = 0;
 
-private:
+ private:
   kj::Maybe<kj::Own<kj::HttpService>> adapterService;
 };
 
 // Given a Promise for a WorkerInterface, return a WorkerInterface whose methods will first wait
 // for the promise, then invoke the destination object.
 kj::Own<WorkerInterface> newPromisedWorkerInterface(kj::Promise<kj::Own<WorkerInterface>> promise);
+
+template <typename Func>
+class LazyWorkerInterface final: public WorkerInterface {
+ public:
+  LazyWorkerInterface(Func func): func(kj::mv(func)) {}
+
+  void ensureResolve() {
+    if (promise == kj::none) {
+      promise = KJ_ASSERT_NONNULL(func)()
+                    .then([this](kj::Own<WorkerInterface> result) { worker = kj::mv(result); })
+                    .eagerlyEvaluate(nullptr)
+                    .fork();
+      func = kj::none;
+    }
+  }
+
+  kj::Promise<void> request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody,
+      Response& response) override {
+    ensureResolve();
+    KJ_IF_SOME(w, worker) {
+      co_await w->request(method, url, headers, requestBody, response);
+    } else {
+      co_await KJ_ASSERT_NONNULL(promise);
+      co_await KJ_ASSERT_NONNULL(worker)->request(method, url, headers, requestBody, response);
+    }
+  }
+
+  kj::Promise<void> connect(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::AsyncIoStream& connection,
+      ConnectResponse& response,
+      kj::HttpConnectSettings settings) override {
+    ensureResolve();
+    KJ_IF_SOME(w, worker) {
+      co_await w->connect(host, headers, connection, response, kj::mv(settings));
+    } else {
+      co_await KJ_ASSERT_NONNULL(promise);
+      co_await KJ_ASSERT_NONNULL(worker)->connect(
+          host, headers, connection, response, kj::mv(settings));
+    }
+  }
+
+  kj::Promise<void> prewarm(kj::StringPtr url) override {
+    ensureResolve();
+    KJ_IF_SOME(w, worker) {
+      co_return co_await w->prewarm(url);
+    } else {
+      co_await KJ_ASSERT_NONNULL(promise);
+      co_return co_await KJ_ASSERT_NONNULL(worker)->prewarm(url);
+    }
+  }
+
+  kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
+    ensureResolve();
+    KJ_IF_SOME(w, worker) {
+      co_return co_await w->runScheduled(scheduledTime, cron);
+    } else {
+      co_await KJ_ASSERT_NONNULL(promise);
+      co_return co_await KJ_ASSERT_NONNULL(worker)->runScheduled(scheduledTime, cron);
+    }
+  }
+
+  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
+    ensureResolve();
+    KJ_IF_SOME(w, worker) {
+      co_return co_await w->runAlarm(scheduledTime, retryCount);
+    } else {
+      co_await KJ_ASSERT_NONNULL(promise);
+      co_return co_await KJ_ASSERT_NONNULL(worker)->runAlarm(scheduledTime, retryCount);
+    }
+  }
+
+  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
+    ensureResolve();
+    KJ_IF_SOME(w, worker) {
+      co_return co_await w->customEvent(kj::mv(event));
+    } else {
+      co_await KJ_ASSERT_NONNULL(promise);
+      co_return co_await KJ_ASSERT_NONNULL(worker)->customEvent(kj::mv(event));
+    }
+  }
+
+ private:
+  kj::Maybe<Func> func;
+  kj::Maybe<kj::ForkedPromise<void>> promise;
+  kj::Maybe<kj::Own<WorkerInterface>> worker;
+};
+// Similar to newPromisedWorkerInterface but receives a function that returns a Promise for a
+// WorkerInterface. This is useful when you are not sure if the worker will be used or not and
+// you don't want it to be created in case it isn't used. If you just create a
+// PromisedWorkerInterface then the async loop might run the promise before it is eventually
+// destroyed even if it was never used.
+template <typename Func>
+kj::Own<WorkerInterface> newLazyWorkerInterface(Func func) {
+  return kj::heap<LazyWorkerInterface<Func>>(kj::mv(func));
+}
 
 // Adapts WorkerInterface to HttpClient, including taking ownership.
 //
@@ -162,7 +264,7 @@ kj::Own<WorkerInterface> newRevocableWebSocketWorkerInterface(
 // is intended to be single-use, this class is also inherently single-use (i.e. only one event
 // can be delivered).
 class RpcWorkerInterface: public WorkerInterface {
-public:
+ public:
   RpcWorkerInterface(capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
       capnp::ByteStreamFactory& byteStreamFactory,
       rpc::EventDispatcher::Client dispatcher);
@@ -184,7 +286,7 @@ public:
   kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override;
   kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override;
 
-private:
+ private:
   capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
   capnp::ByteStreamFactory& byteStreamFactory;
   rpc::EventDispatcher::Client dispatcher;

@@ -87,7 +87,7 @@ kj::String operator"" _blockquote(const char* str, size_t n) {
 }
 
 class TestStream {
-public:
+ public:
   TestStream(kj::WaitScope& ws, kj::Own<kj::AsyncIoStream> stream)
       : ws(ws),
         stream(kj::mv(stream)) {}
@@ -202,7 +202,7 @@ public:
         {});
   }
 
-private:
+ private:
   kj::WaitScope& ws;
   kj::Own<kj::AsyncIoStream> stream;
 
@@ -308,7 +308,7 @@ private:
 };
 
 class TestServer final: private kj::Filesystem, private kj::EntropySource, private kj::Clock {
-public:
+ public:
   TestServer(kj::StringPtr configText, kj::SourceLocation loc = {})
       : ws(loop),
         config(parseConfig(configText, loc)),
@@ -369,6 +369,12 @@ public:
     return TestStream(ws, KJ_REQUIRE_NONNULL(sockets.find(addr), addr)->connect().wait(ws));
   }
 
+  // Try to connect to the address and return whether or not this connection attempt hangs,
+  // i.e. a listener exists but connections are not being accepted.
+  bool connectHangs(kj::StringPtr addr) {
+    return !KJ_REQUIRE_NONNULL(sockets.find(addr), addr)->connect().poll(ws);
+  }
+
   // Expect an incoming connection on the given address and from a network with the given
   // allowed / denied peer list.
   TestStream receiveSubrequest(kj::StringPtr addr,
@@ -419,7 +425,7 @@ public:
 
   kj::Date fakeDate;
 
-private:
+ private:
   kj::UnwindDetector unwindDetector;
 
   // ---------------------------------------------------------------------------
@@ -470,7 +476,7 @@ private:
   }
 
   class MockAddress final: public kj::NetworkAddress {
-  public:
+   public:
     MockAddress(TestServer& test, kj::StringPtr peerFilter, kj::String address)
         : test(test),
           peerFilter(peerFilter),
@@ -504,14 +510,14 @@ private:
       KJ_UNIMPLEMENTED("unused");
     }
 
-  private:
+   private:
     TestServer& test;
     kj::StringPtr peerFilter;
     kj::String address;
   };
 
   class MockNetwork final: public kj::Network {
-  public:
+   public:
     MockNetwork(TestServer& test,
         kj::ArrayPtr<const kj::StringPtr> allow,
         kj::ArrayPtr<const kj::StringPtr> deny)
@@ -531,7 +537,7 @@ private:
       return kj::heap<MockNetwork>(test, allow, deny);
     }
 
-  private:
+   private:
     TestServer& test;
     kj::String filter;
   };
@@ -2285,6 +2291,104 @@ KJ_TEST("Server: Durable Objects websocket hibernation") {
   wsConn.send(kj::str("\x81\x1a", confirmEviction));
   wsConn.recvWebSocket(evicted);
 }
+
+KJ_TEST("Server: tail workers") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2024-11-01",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async fetch(req, env, ctx) {
+                `    console.log("foo", "bar");
+                `    console.log("baz");
+                `    return new Response("OK");
+                `  }
+                `}
+            )
+          ],
+          tails = ["tail", "tail2"],
+        )
+      ),
+      ( name = "tail",
+        worker = (
+          compatibilityDate = "2024-11-01",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async tail(req, env, ctx) {
+                `    await fetch("http://tail", {
+                `      method: "POST",
+                `      body: JSON.stringify(req[0].logs.map(log => log.message))
+                `    });
+                `  }
+                `}
+            )
+          ],
+        )
+      ),
+      ( name = "tail2",
+        worker = (
+          compatibilityDate = "2024-11-01",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async tail(req, env, ctx) {
+                `    await fetch("http://tail2/" + req[0].logs.length);
+                `  }
+                `}
+            )
+          ],
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj);
+
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+  conn.recvHttp200("OK");
+
+  auto subreq = test.receiveInternetSubrequest("tail");
+  subreq.recv(R"(
+    POST / HTTP/1.1
+    Content-Length: 23
+    Host: tail
+    Content-Type: text/plain;charset=UTF-8
+
+    [["foo","bar"],["baz"]])"_blockquote);
+
+  auto subreq2 = test.receiveInternetSubrequest("tail2");
+  subreq2.recv(R"(
+    GET /2 HTTP/1.1
+    Host: tail2
+
+    )"_blockquote);
+
+  subreq.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+
+  subreq2.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+}
+
 // =======================================================================================
 // Test HttpOptions on receive
 
@@ -2535,6 +2639,9 @@ KJ_TEST("Server: drain incoming HTTP connections") {
 
   // But conn2 is still open.
   KJ_EXPECT(!conn2.isEof());
+
+  // New connections shouldn't be accepted at this point.
+  KJ_EXPECT(test.connectHangs("test-addr"));
 
   // Finish the request on conn2.
   conn2.send(" / HTTP/1.1\nHost: foo\n\n");

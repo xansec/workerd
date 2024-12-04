@@ -108,7 +108,7 @@ int decryptFinalHelper(kj::StringPtr algorithm,
 // The base key is used to avoid repeating the JWK export logic. It also happens to simplify the
 // concrete implementations to only define encrypt/decrypt.
 class AesKeyBase: public CryptoKey::Impl {
-public:
+ public:
   explicit AesKeyBase(kj::Array<kj::byte> keyData,
       CryptoKey::AesKeyAlgorithm keyAlgorithm,
       bool extractable,
@@ -117,7 +117,7 @@ public:
         keyData(kj::mv(keyData)),
         keyAlgorithm(kj::mv(keyAlgorithm)) {}
 
-protected:
+ protected:
   kj::StringPtr getAlgorithmName() const override final {
     // AesKeyAlgorithm is constructed from normalizedName which points into the static constant
     // defined in crypto.c++ for lookup.
@@ -133,6 +133,11 @@ protected:
         CRYPTO_memcmp(keyData.begin(), other.begin(), keyData.size()) == 0;
   }
 
+  bool equals(const jsg::BufferSource& other) const override final {
+    return keyData.size() == other.size() &&
+        CRYPTO_memcmp(keyData.begin(), other.asArrayPtr().begin(), keyData.size()) == 0;
+  }
+
   kj::StringPtr jsgGetMemoryName() const override {
     return "AesKeyBase"_kjc;
   }
@@ -144,12 +149,12 @@ protected:
     tracker.trackField("keyAlgorithm", keyAlgorithm);
   }
 
-private:
+ private:
   CryptoKey::AlgorithmVariant getAlgorithm(jsg::Lock& js) const override final {
     return keyAlgorithm;
   }
 
-  SubtleCrypto::ExportKeyData exportKey(kj::StringPtr format) const override final {
+  SubtleCrypto::ExportKeyData exportKey(jsg::Lock& js, kj::StringPtr format) const override final {
     JSG_REQUIRE(format == "raw" || format == "jwk", DOMNotSupportedError, getAlgorithmName(),
         " key only supports exporting \"raw\" & \"jwk\", not \"", format, "\".");
 
@@ -184,24 +189,28 @@ private:
       return jwk;
     }
 
-    return kj::heapArray(keyData.asPtr());
+    // Every export should be a separate copy.
+    auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, keyData.size());
+    backing.asArrayPtr().copyFrom(keyData);
+    return jsg::BufferSource(js, kj::mv(backing));
   }
 
-protected:
+ protected:
   ZeroOnFree keyData;
   CryptoKey::AesKeyAlgorithm keyAlgorithm;
 };
 
 class AesGcmKey final: public AesKeyBase {
-public:
+ public:
   explicit AesGcmKey(kj::Array<kj::byte> keyData,
       CryptoKey::AesKeyAlgorithm keyAlgorithm,
       bool extractable,
       CryptoKeyUsageSet usages)
       : AesKeyBase(kj::mv(keyData), kj::mv(keyAlgorithm), extractable, usages) {}
 
-private:
-  kj::Array<kj::byte> encrypt(SubtleCrypto::EncryptAlgorithm&& algorithm,
+ private:
+  jsg::BufferSource encrypt(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
       kj::ArrayPtr<const kj::byte> plainText) const override {
     kj::ArrayPtr<kj::byte> iv =
         JSG_REQUIRE_NONNULL(algorithm.iv, TypeError, "Missing field \"iv\" in \"algorithm\".");
@@ -242,31 +251,32 @@ private:
     // a stream cipher in that it does not add padding and can process partial blocks, meaning that
     // we know the exact ciphertext size in advance.
     auto tagByteSize = tagLength / 8;
-    auto cipherText = kj::heapArray<kj::byte>(plainText.size() + tagByteSize);
+    auto cipherText = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, plainText.size() + tagByteSize);
 
     // Perform the actual encryption.
 
     int cipherSize = 0;
-    OSSLCALL(EVP_EncryptUpdate(
-        cipherCtx.get(), cipherText.begin(), &cipherSize, plainText.begin(), plainText.size()));
+    OSSLCALL(EVP_EncryptUpdate(cipherCtx.get(), cipherText.asArrayPtr().begin(), &cipherSize,
+        plainText.begin(), plainText.size()));
     KJ_ASSERT(cipherSize == plainText.size(), "EVP_EncryptUpdate should encrypt all at once");
 
     int finalCipherSize = 0;
-    OSSLCALL(
-        EVP_EncryptFinal_ex(cipherCtx.get(), cipherText.begin() + cipherSize, &finalCipherSize));
+    OSSLCALL(EVP_EncryptFinal_ex(
+        cipherCtx.get(), cipherText.asArrayPtr().begin() + cipherSize, &finalCipherSize));
     KJ_ASSERT(finalCipherSize == 0, "EVP_EncryptFinal_ex should not output any data");
 
     // Concatenate the tag onto the cipher text.
     KJ_ASSERT(cipherSize + tagByteSize == cipherText.size(), "imminent buffer overrun");
-    OSSLCALL(EVP_CIPHER_CTX_ctrl(
-        cipherCtx.get(), EVP_CTRL_GCM_GET_TAG, tagByteSize, cipherText.begin() + cipherSize));
+    OSSLCALL(EVP_CIPHER_CTX_ctrl(cipherCtx.get(), EVP_CTRL_GCM_GET_TAG, tagByteSize,
+        cipherText.asArrayPtr().begin() + cipherSize));
     cipherSize += tagByteSize;
     KJ_ASSERT(cipherSize == cipherText.size(), "buffer overrun");
 
-    return cipherText;
+    return jsg::BufferSource(js, kj::mv(cipherText));
   }
 
-  kj::Array<kj::byte> decrypt(SubtleCrypto::EncryptAlgorithm&& algorithm,
+  jsg::BufferSource decrypt(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
       kj::ArrayPtr<const kj::byte> cipherText) const override {
     kj::ArrayPtr<kj::byte> iv =
         JSG_REQUIRE_NONNULL(algorithm.iv, TypeError, "Missing field \"iv\" in \"algorithm\".");
@@ -303,10 +313,10 @@ private:
     auto actualCipherText = cipherText.first(cipherText.size() - tagLength / 8);
     auto tagText = cipherText.slice(actualCipherText.size(), cipherText.size());
 
-    auto plainText = kj::heapArray<kj::byte>(actualCipherText.size());
+    auto plainText = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, actualCipherText.size());
 
     // Perform the actual decryption.
-    OSSLCALL(EVP_DecryptUpdate(cipherCtx.get(), plainText.begin(), &plainSize,
+    OSSLCALL(EVP_DecryptUpdate(cipherCtx.get(), plainText.asArrayPtr().begin(), &plainSize,
         actualCipherText.begin(), actualCipherText.size()));
     KJ_ASSERT(plainSize == plainText.size());
 
@@ -322,23 +332,24 @@ private:
         const_cast<kj::byte*>(tagText.begin())));
 
     plainSize += decryptFinalHelper(getAlgorithmName(), actualCipherText.size(), plainSize,
-        cipherCtx.get(), plainText.begin() + plainSize);
+        cipherCtx.get(), plainText.asArrayPtr().begin() + plainSize);
     KJ_ASSERT(plainSize == plainText.size());
 
-    return plainText;
+    return jsg::BufferSource(js, kj::mv(plainText));
   }
 };
 
 class AesCbcKey final: public AesKeyBase {
-public:
+ public:
   explicit AesCbcKey(kj::Array<kj::byte> keyData,
       CryptoKey::AesKeyAlgorithm keyAlgorithm,
       bool extractable,
       CryptoKeyUsageSet usages)
       : AesKeyBase(kj::mv(keyData), kj::mv(keyAlgorithm), extractable, usages) {}
 
-private:
-  kj::Array<kj::byte> encrypt(SubtleCrypto::EncryptAlgorithm&& algorithm,
+ private:
+  jsg::BufferSource encrypt(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
       kj::ArrayPtr<const kj::byte> plainText) const override {
     kj::ArrayPtr<kj::byte> iv =
         JSG_REQUIRE_NONNULL(algorithm.iv, TypeError, "Missing field \"iv\" in \"algorithm\".");
@@ -355,7 +366,7 @@ private:
 
     auto blockSize = EVP_CIPHER_CTX_block_size(cipherCtx.get());
     size_t paddingSize = blockSize - (plainText.size() % blockSize);
-    auto cipherText = kj::heapArray<kj::byte>(plainText.size() + paddingSize);
+    auto cipherText = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, plainText.size() + paddingSize);
 
     // Perform the actual encryption.
     //
@@ -363,21 +374,22 @@ private:
     //   takes care of it for us by default in EVP_EncryptFinal_ex().
 
     int cipherSize = 0;
-    OSSLCALL(EVP_EncryptUpdate(
-        cipherCtx.get(), cipherText.begin(), &cipherSize, plainText.begin(), plainText.size()));
+    OSSLCALL(EVP_EncryptUpdate(cipherCtx.get(), cipherText.asArrayPtr().begin(), &cipherSize,
+        plainText.begin(), plainText.size()));
     KJ_ASSERT(cipherSize <= cipherText.size(), "buffer overrun");
 
     KJ_ASSERT(cipherSize + blockSize <= cipherText.size(), "imminent buffer overrun");
     int finalCipherSize = 0;
-    OSSLCALL(
-        EVP_EncryptFinal_ex(cipherCtx.get(), cipherText.begin() + cipherSize, &finalCipherSize));
+    OSSLCALL(EVP_EncryptFinal_ex(
+        cipherCtx.get(), cipherText.asArrayPtr().begin() + cipherSize, &finalCipherSize));
     cipherSize += finalCipherSize;
     KJ_ASSERT(cipherSize == cipherText.size(), "buffer overrun");
 
-    return cipherText;
+    return jsg::BufferSource(js, kj::mv(cipherText));
   }
 
-  kj::Array<kj::byte> decrypt(SubtleCrypto::EncryptAlgorithm&& algorithm,
+  jsg::BufferSource decrypt(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
       kj::ArrayPtr<const kj::byte> cipherText) const override {
     kj::ArrayPtr<kj::byte> iv =
         JSG_REQUIRE_NONNULL(algorithm.iv, TypeError, "Missing field \"iv\" in \"algorithm\".");
@@ -408,31 +420,35 @@ private:
     KJ_ASSERT(plainSize <= plainText.size());
 
     // TODO(perf): Avoid this copy, see comment in the encrypt implementation functions.
-    return kj::heapArray(plainText.begin(), plainSize);
+    auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, plainSize);
+    backing.asArrayPtr().copyFrom(plainText.first(plainSize));
+    return jsg::BufferSource(js, kj::mv(backing));
   }
 };
 
 class AesCtrKey final: public AesKeyBase {
   static constexpr size_t expectedCounterByteSize = 16;
 
-public:
+ public:
   explicit AesCtrKey(kj::Array<kj::byte> keyData,
       CryptoKey::AesKeyAlgorithm keyAlgorithm,
       bool extractable,
       CryptoKeyUsageSet usages)
       : AesKeyBase(kj::mv(keyData), kj::mv(keyAlgorithm), extractable, usages) {}
 
-  kj::Array<kj::byte> encrypt(SubtleCrypto::EncryptAlgorithm&& algorithm,
+  jsg::BufferSource encrypt(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
       kj::ArrayPtr<const kj::byte> plainText) const override {
-    return encryptOrDecrypt(kj::mv(algorithm), plainText);
+    return encryptOrDecrypt(js, kj::mv(algorithm), plainText);
   }
 
-  kj::Array<kj::byte> decrypt(SubtleCrypto::EncryptAlgorithm&& algorithm,
+  jsg::BufferSource decrypt(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
       kj::ArrayPtr<const kj::byte> cipherText) const override {
-    return encryptOrDecrypt(kj::mv(algorithm), cipherText);
+    return encryptOrDecrypt(js, kj::mv(algorithm), cipherText);
   }
 
-protected:
+ protected:
   static const EVP_CIPHER& lookupAesType(size_t keyLengthBytes) {
     switch (keyLengthBytes) {
       case 16:
@@ -448,8 +464,9 @@ protected:
     KJ_FAIL_ASSERT("CryptoKey has invalid data length");
   }
 
-  kj::Array<kj::byte> encryptOrDecrypt(
-      SubtleCrypto::EncryptAlgorithm&& algorithm, kj::ArrayPtr<const kj::byte> data) const {
+  jsg::BufferSource encryptOrDecrypt(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
+      kj::ArrayPtr<const kj::byte> data) const {
     auto& counter = JSG_REQUIRE_NONNULL(
         algorithm.counter, TypeError, "Missing \"counter\" member in \"algorithm\".");
     JSG_REQUIRE(counter.size() == expectedCounterByteSize, DOMOperationError,
@@ -472,9 +489,8 @@ protected:
 
     const auto& cipher = lookupAesType(keyData.size());
 
-    kj::Vector<kj::byte> result;
     // The output of AES-CTR is the same size as the input.
-    result.resize(data.size());
+    auto result = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, data.size());
 
     auto numCounterValues = newBignum();
     JSG_REQUIRE(BN_lshift(numCounterValues.get(), BN_value_one(), counterBitLength),
@@ -505,15 +521,15 @@ protected:
 
     if (BN_cmp(numBlocksUntilReset.get(), numOutputBlocks.get()) >= 0) {
       // If the counter doesn't need any wrapping, can evaluate this as a single call.
-      process(&cipher, data, counter, result.asPtr());
-      return result.releaseAsArray();
+      process(&cipher, data, counter, result.asArrayPtr());
+      return jsg::BufferSource(js, kj::mv(result));
     }
 
     // Need this to be done in 2 parts using the current counter block and then resetting the
     // counter portion of the block back to zero.
     auto inputSizePart1 = BN_get_word(numBlocksUntilReset.get()) * AES_BLOCK_SIZE;
 
-    process(&cipher, data.first(inputSizePart1), counter, result.asPtr());
+    process(&cipher, data.first(inputSizePart1), counter, result.asArrayPtr());
 
     // Zero the counter bits of the block. Chromium creates a copy but we own our buffer.
     {
@@ -528,12 +544,12 @@ protected:
     }
 
     process(&cipher, data.slice(inputSizePart1, data.size()), counter,
-        result.slice(inputSizePart1, result.size()));
+        result.asArrayPtr().slice(inputSizePart1, result.size()));
 
-    return result.releaseAsArray();
+    return jsg::BufferSource(js, kj::mv(result));
   }
 
-private:
+ private:
   kj::Own<BIGNUM> getCounter(
       kj::ArrayPtr<kj::byte> counterBlock, const unsigned counterBitLength) const {
     // See GetCounter from https://chromium.googlesource.com/chromium/src/+/refs/tags/91.0.4458.2/components/webcrypto/algorithms/aes_ctr.cc#86
@@ -613,14 +629,15 @@ private:
 };
 
 class AesKwKey final: public AesKeyBase {
-public:
+ public:
   explicit AesKwKey(kj::Array<kj::byte> keyData,
       CryptoKey::AesKeyAlgorithm keyAlgorithm,
       bool extractable,
       CryptoKeyUsageSet usages)
       : AesKeyBase(kj::mv(keyData), kj::mv(keyAlgorithm), extractable, usages) {}
 
-  kj::Array<kj::byte> wrapKey(SubtleCrypto::EncryptAlgorithm&& algorithm,
+  jsg::BufferSource wrapKey(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
       kj::ArrayPtr<const kj::byte> unwrappedKey) const override {
     // Resources used to implement this:
     // https://www.ietf.org/rfc/rfc3394.txt
@@ -636,8 +653,7 @@ public:
         "equal to 16 and less than or equal to ",
         SIZE_MAX - 8);
 
-    kj::Vector<kj::byte> wrapped(unwrappedKey.size() + 8);
-    wrapped.resize(unwrappedKey.size() + 8);
+    auto wrapped = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, unwrappedKey.size() + 8);
     // Wrapping adds 8 bytes of overhead for storing the IV which we check on decryption.
 
     AES_KEY aesKey;
@@ -646,14 +662,15 @@ public:
         internalDescribeOpensslErrors());
 
     JSG_REQUIRE(wrapped.size() ==
-            AES_wrap_key(
-                &aesKey, nullptr, wrapped.begin(), unwrappedKey.begin(), unwrappedKey.size()),
+            AES_wrap_key(&aesKey, nullptr, wrapped.asArrayPtr().begin(), unwrappedKey.begin(),
+                unwrappedKey.size()),
         DOMOperationError, getAlgorithmName(), " key wrapping failed", tryDescribeOpensslErrors());
 
-    return wrapped.releaseAsArray();
+    return jsg::BufferSource(js, kj::mv(wrapped));
   }
 
-  kj::Array<kj::byte> unwrapKey(SubtleCrypto::EncryptAlgorithm&& algorithm,
+  jsg::BufferSource unwrapKey(jsg::Lock& js,
+      SubtleCrypto::EncryptAlgorithm&& algorithm,
       kj::ArrayPtr<const kj::byte> wrappedKey) const override {
     // Resources used to implement this:
     // https://www.ietf.org/rfc/rfc3394.txt
@@ -667,9 +684,7 @@ public:
         "Provided a wrapped key to unwrap this is ", wrappedKey.size() * 8,
         " bits that is less than the minimal length of 192 bits.");
 
-    kj::Vector<kj::byte> unwrapped(wrappedKey.size() - 8);
-    // Key wrap adds 8 bytes of overhead because it mixes in the IV.
-    unwrapped.resize(wrappedKey.size() - 8);
+    auto unwrapped = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, wrappedKey.size() - 8);
 
     AES_KEY aesKey;
     JSG_REQUIRE(0 == AES_set_decrypt_key(keyData.begin(), keyData.size() * 8, &aesKey),
@@ -679,12 +694,12 @@ public:
     // null for the IV value here will tell OpenSSL to validate using the default IV from RFC3394.
     // https://github.com/openssl/openssl/blob/13a574d8bb2523181f8150de49bc041c9841f59d/crypto/modes/wrap128.c
     JSG_REQUIRE(unwrapped.size() ==
-            AES_unwrap_key(
-                &aesKey, nullptr, unwrapped.begin(), wrappedKey.begin(), wrappedKey.size()),
+            AES_unwrap_key(&aesKey, nullptr, unwrapped.asArrayPtr().begin(), wrappedKey.begin(),
+                wrappedKey.size()),
         DOMOperationError, getAlgorithmName(), " key unwrapping failed",
         tryDescribeOpensslErrors());
 
-    return unwrapped.releaseAsArray();
+    return jsg::BufferSource(js, kj::mv(unwrapped));
   }
 };
 

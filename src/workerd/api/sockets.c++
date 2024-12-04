@@ -160,6 +160,7 @@ jsg::Ref<Socket> setupSocket(jsg::Lock& js,
   auto openedPrPair = js.newPromiseAndResolver<SocketInfo>();
   openedPrPair.promise.markAsHandled(js);
   auto writable = jsg::alloc<WritableStream>(ioContext, kj::mv(sysStreams.writable),
+      ioContext.getMetrics().tryCreateWritableByteStreamObserver(),
       getWritableHighWaterMark(options), openedPrPair.promise.whenResolved(js));
 
   auto result = jsg::alloc<Socket>(js, ioContext, kj::mv(refcountedConnection),
@@ -180,6 +181,7 @@ jsg::Ref<Socket> connectImplNoOutputLock(jsg::Lock& js,
 
   auto& ioContext = IoContext::current();
   JSG_REQUIRE(!ioContext.isFiddle(), TypeError, "Socket API not supported in web preview mode.");
+  auto userSpan = ioContext.makeUserTraceSpan("connect"_kjc);
 
   // Extract the domain/ip we are connecting to from the address.
   kj::String domain;
@@ -417,7 +419,7 @@ void Socket::handleProxyStatus(jsg::Lock& js, kj::Promise<kj::Maybe<kj::Exceptio
 
 void Socket::handleProxyError(jsg::Lock& js, kj::Exception e) {
   resolveFulfiller(js, kj::cp(e));
-  openedResolver.reject(js, kj::mv(e));
+  openedResolver.reject(js, kj::cp(e));
   readable->getController().cancel(js, kj::none).markAsHandled(js);
   writable->getController().abort(js, js.error(e.getDescription())).markAsHandled(js);
 }

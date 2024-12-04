@@ -22,6 +22,7 @@
 #include <workerd/api/modules.h>
 #include <workerd/api/node/node.h>
 #include <workerd/api/pyodide/pyodide.h>
+#include <workerd/api/pyodide/setup-emscripten.h>
 #include <workerd/api/queue.h>
 #include <workerd/api/r2-admin.h>
 #include <workerd/api/r2.h>
@@ -131,12 +132,14 @@ static const PythonConfig defaultConfig{
 struct WorkerdApi::Impl final {
   kj::Own<CompatibilityFlags::Reader> features;
   kj::Maybe<kj::Own<jsg::modules::ModuleRegistry>> maybeOwnedModuleRegistry;
+  kj::Own<IsolateLimitEnforcer> limitEnforcer;
+  kj::Own<IsolateObserver> observer;
   JsgWorkerdIsolate jsgIsolate;
   api::MemoryCacheProvider& memoryCacheProvider;
   const PythonConfig& pythonConfig;
 
   class Configuration {
-  public:
+   public:
     Configuration(Impl& impl)
         : features(*impl.features),
           jsgConfig(jsg::JsgConfig{
@@ -150,24 +153,31 @@ struct WorkerdApi::Impl final {
       return jsgConfig;
     }
 
-  private:
+   private:
     CompatibilityFlags::Reader& features;
     jsg::JsgConfig jsgConfig;
   };
 
   Impl(jsg::V8System& v8System,
       CompatibilityFlags::Reader featuresParam,
-      IsolateLimitEnforcer& limitEnforcer,
-      kj::Own<jsg::IsolateObserver> observer,
+      kj::Own<IsolateLimitEnforcer> limitEnforcerParam,
+      kj::Own<IsolateObserver> observerParam,
       api::MemoryCacheProvider& memoryCacheProvider,
       const PythonConfig& pythonConfig = defaultConfig,
       kj::Maybe<kj::Own<jsg::modules::ModuleRegistry>> newModuleRegistry = kj::none)
       : features(capnp::clone(featuresParam)),
         maybeOwnedModuleRegistry(kj::mv(newModuleRegistry)),
-        jsgIsolate(
-            v8System, Configuration(*this), kj::mv(observer), limitEnforcer.getCreateParams()),
+        limitEnforcer(kj::mv(limitEnforcerParam)),
+        observer(kj::atomicAddRef(*observerParam)),
+        jsgIsolate(v8System,
+            Configuration(*this),
+            kj::mv(observerParam),
+            limitEnforcer->getCreateParams()),
         memoryCacheProvider(memoryCacheProvider),
-        pythonConfig(pythonConfig) {}
+        pythonConfig(pythonConfig) {
+    jsgIsolate.runInLockScope(
+        [&](JsgWorkerdIsolate::Lock& lock) { limitEnforcer->customizeIsolate(lock.v8Isolate); });
+  }
 
   static v8::Local<v8::String> compileTextGlobal(
       JsgWorkerdIsolate::Lock& lock, capnp::Text::Reader reader) {
@@ -209,14 +219,14 @@ struct WorkerdApi::Impl final {
 
 WorkerdApi::WorkerdApi(jsg::V8System& v8System,
     CompatibilityFlags::Reader features,
-    IsolateLimitEnforcer& limitEnforcer,
-    kj::Own<jsg::IsolateObserver> observer,
+    kj::Own<IsolateLimitEnforcer> limitEnforcer,
+    kj::Own<IsolateObserver> observer,
     api::MemoryCacheProvider& memoryCacheProvider,
     const PythonConfig& pythonConfig,
     kj::Maybe<kj::Own<jsg::modules::ModuleRegistry>> newModuleRegistry)
     : impl(kj::heap<Impl>(v8System,
           features,
-          limitEnforcer,
+          kj::mv(limitEnforcer),
           kj::mv(observer),
           memoryCacheProvider,
           pythonConfig,
@@ -264,6 +274,22 @@ jsg::JsObject WorkerdApi::wrapExecutionContext(
     jsg::Lock& lock, jsg::Ref<api::ExecutionContext> ref) const {
   return jsg::JsObject(
       kj::downcast<JsgWorkerdIsolate::Lock>(lock).wrap(lock.v8Context(), kj::mv(ref)));
+}
+
+IsolateLimitEnforcer& WorkerdApi::getLimitEnforcer() {
+  return *impl->limitEnforcer;
+}
+
+const IsolateLimitEnforcer& WorkerdApi::getLimitEnforcer() const {
+  return *impl->limitEnforcer;
+}
+
+IsolateObserver& WorkerdApi::getMetrics() {
+  return *impl->observer;
+}
+
+const IsolateObserver& WorkerdApi::getMetrics() const {
+  return *impl->observer;
 }
 
 Worker::Script::Source WorkerdApi::extractSource(kj::StringPtr name,
@@ -373,8 +399,9 @@ kj::Maybe<jsg::ModuleRegistry::ModuleInfo> WorkerdApi::tryCompileModule(jsg::Loc
               lock, Impl::compileJsonGlobal(lock, module.getJson())));
     }
     case config::Worker::Module::ES_MODULE: {
+      // TODO(soon): Make sure passing nullptr to compile cache is desired.
       return jsg::ModuleRegistry::ModuleInfo(lock, module.getName(), module.getEsModule(),
-          jsg::ModuleInfoCompileOption::BUNDLE, observer);
+          nullptr /* compile cache */, jsg::ModuleInfoCompileOption::BUNDLE, observer);
     }
     case config::Worker::Module::COMMON_JS_MODULE: {
       kj::Maybe<kj::Array<kj::StringPtr>> named = kj::none;
@@ -510,14 +537,25 @@ void WorkerdApi::compileModules(jsg::Lock& lockParam,
     if (hasPythonModules(confModules)) {
       KJ_REQUIRE(featureFlags.getPythonWorkers(),
           "The python_workers compatibility flag is required to use Python.");
-      // Inject Pyodide bundle
-      if (featureFlags.getPythonExternalBundle()) {
-        auto pythonRelease = KJ_ASSERT_NONNULL(getPythonSnapshotRelease(featureFlags));
-        auto version = getPythonBundleName(pythonRelease);
-        auto bundle = KJ_ASSERT_NONNULL(
-            fetchPyodideBundle(impl->pythonConfig, version), "Failed to get Pyodide bundle");
-        modules->addBuiltinBundle(bundle, kj::none);
+      auto pythonRelease = KJ_ASSERT_NONNULL(getPythonSnapshotRelease(featureFlags));
+      auto version = getPythonBundleName(pythonRelease);
+      auto bundle = KJ_ASSERT_NONNULL(
+          fetchPyodideBundle(impl->pythonConfig, version), "Failed to get Pyodide bundle");
+      // Inject SetupEmscripten module
+      {
+        auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
+        auto context = lock.newContext<api::ServiceWorkerGlobalScope>({}, lock.v8Isolate);
+        v8::Context::Scope scope(context.getHandle(lock));
+        // Init emscripten synchronously, the python script will import setup-emscripten and
+        // call setEmscriptenModele
+        auto emscriptenRuntime = api::pyodide::EmscriptenRuntime::initialize(lock, true, bundle);
+        modules->addBuiltinModule("internal:setup-emscripten",
+            jsg::alloc<SetupEmscripten>(kj::mv(emscriptenRuntime)),
+            workerd::jsg::ModuleRegistry::Type::INTERNAL);
       }
+
+      // Inject Pyodide bundle
+      modules->addBuiltinBundle(bundle, kj::none);
       // Inject pyodide bootstrap module (TODO: load this from the capnproto bundle?)
       {
         auto mainModule = confModules.begin();
@@ -528,87 +566,37 @@ void WorkerdApi::compileModules(jsg::Lock& lockParam,
         auto path = kj::Path::parse(mainModule->getName());
         modules->add(path, kj::mv(KJ_REQUIRE_NONNULL(info)));
       }
+
       // Inject metadata that the entrypoint module will read.
-      {
-        using ModuleInfo = jsg::ModuleRegistry::ModuleInfo;
-        using ObjectModuleInfo = jsg::ModuleRegistry::ObjectModuleInfo;
-        using ResolveMethod = jsg::ModuleRegistry::ResolveMethod;
-        auto specifier = "pyodide-internal:runtime-generated/metadata";
-        auto metadataReader = makePyodideMetadataReader(conf, impl->pythonConfig);
-        modules->addBuiltinModule(specifier,
-            [specifier = kj::str(specifier), metadataReader = kj::mv(metadataReader)](
-                jsg::Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) mutable {
-          auto& wrapper = JsgWorkerdIsolate_TypeWrapper::from(js.v8Isolate);
-          auto wrap = wrapper.wrap(js.v8Context(), kj::none, kj::mv(metadataReader));
-          return kj::Maybe(ModuleInfo(js, specifier, kj::none, ObjectModuleInfo(js, wrap)));
-        },
-            jsg::ModuleRegistry::Type::INTERNAL);
+      modules->addBuiltinModule("pyodide-internal:runtime-generated/metadata",
+          makePyodideMetadataReader(conf, impl->pythonConfig), jsg::ModuleRegistry::Type::INTERNAL);
+
+      // Inject packages tar file
+      if (featureFlags.getPythonExternalPackages()) {
+        modules->addBuiltinModule("pyodide-internal:packages_tar_reader", "export default { }"_kj,
+            workerd::jsg::ModuleRegistry::Type::INTERNAL, {});
+      } else {
+        modules->addBuiltinModule("pyodide-internal:packages_tar_reader",
+            jsg::alloc<ReadOnlyBuffer>(PYODIDE_PACKAGES_TAR.get()),
+            workerd::jsg::ModuleRegistry::Type::INTERNAL);
       }
+
       // Inject artifact bundler.
-      {
-        using ModuleInfo = jsg::ModuleRegistry::ModuleInfo;
-        using ObjectModuleInfo = jsg::ModuleRegistry::ObjectModuleInfo;
-        using ResolveMethod = jsg::ModuleRegistry::ResolveMethod;
-        auto specifier = "pyodide-internal:artifacts";
-        modules->addBuiltinModule(specifier,
-            [specifier = kj::str(specifier)](
-                jsg::Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) mutable {
-          auto& wrapper = JsgWorkerdIsolate_TypeWrapper::from(js.v8Isolate);
-          auto wrap =
-              wrapper.wrap(js.v8Context(), kj::none, ArtifactBundler::makeDisabledBundler());
-          return kj::Maybe(ModuleInfo(js, specifier, kj::none, ObjectModuleInfo(js, wrap)));
-        },
-            jsg::ModuleRegistry::Type::INTERNAL);
-      }
+      modules->addBuiltinModule("pyodide-internal:artifacts",
+          ArtifactBundler::makeDisabledBundler(), jsg::ModuleRegistry::Type::INTERNAL);
 
       // Inject jaeger internal tracer in a disabled state (we don't have a use for it in workerd)
-      {
-        using ModuleInfo = jsg::ModuleRegistry::ModuleInfo;
-        using ObjectModuleInfo = jsg::ModuleRegistry::ObjectModuleInfo;
-        using ResolveMethod = jsg::ModuleRegistry::ResolveMethod;
-        auto specifier = "pyodide-internal:internalJaeger";
-        modules->addBuiltinModule(specifier,
-            [specifier = kj::str(specifier)](
-                jsg::Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) mutable {
-          auto& wrapper = JsgWorkerdIsolate_TypeWrapper::from(js.v8Isolate);
-          auto wrap = wrapper.wrap(js.v8Context(), kj::none, DisabledInternalJaeger::create());
-          return kj::Maybe(ModuleInfo(js, specifier, kj::none, ObjectModuleInfo(js, wrap)));
-        },
-            jsg::ModuleRegistry::Type::INTERNAL);
-      }
+      modules->addBuiltinModule("pyodide-internal:internalJaeger", DisabledInternalJaeger::create(),
+          jsg::ModuleRegistry::Type::INTERNAL);
 
       // Inject disk cache module
-      {
-        using ModuleInfo = jsg::ModuleRegistry::ModuleInfo;
-        using ObjectModuleInfo = jsg::ModuleRegistry::ObjectModuleInfo;
-        using ResolveMethod = jsg::ModuleRegistry::ResolveMethod;
-        auto specifier = "pyodide-internal:disk_cache";
-        auto diskCache = jsg::alloc<DiskCache>(impl->pythonConfig.packageDiskCacheRoot);
-        modules->addBuiltinModule(specifier,
-            [specifier = kj::str(specifier), diskCache = kj::mv(diskCache)](
-                jsg::Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) mutable {
-          auto& wrapper = JsgWorkerdIsolate_TypeWrapper::from(js.v8Isolate);
-          auto wrap = wrapper.wrap(js.v8Context(), kj::none, kj::mv(diskCache));
-          return kj::Maybe(ModuleInfo(js, specifier, kj::none, ObjectModuleInfo(js, wrap)));
-        },
-            jsg::ModuleRegistry::Type::INTERNAL);
-      }
+      modules->addBuiltinModule("pyodide-internal:disk_cache",
+          jsg::alloc<DiskCache>(impl->pythonConfig.packageDiskCacheRoot),
+          jsg::ModuleRegistry::Type::INTERNAL);
 
       // Inject a (disabled) SimplePythonLimiter
-      {
-        using ModuleInfo = jsg::ModuleRegistry::ModuleInfo;
-        using ObjectModuleInfo = jsg::ModuleRegistry::ObjectModuleInfo;
-        using ResolveMethod = jsg::ModuleRegistry::ResolveMethod;
-        auto specifier = "pyodide-internal:limiter";
-        modules->addBuiltinModule(specifier,
-            [specifier = kj::str(specifier)](
-                jsg::Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) mutable {
-          auto& wrapper = JsgWorkerdIsolate_TypeWrapper::from(js.v8Isolate);
-          auto wrap = wrapper.wrap(js.v8Context(), kj::none, SimplePythonLimiter::makeDisabled());
-          return kj::Maybe(ModuleInfo(js, specifier, kj::none, ObjectModuleInfo(js, wrap)));
-        },
-            jsg::ModuleRegistry::Type::INTERNAL);
-      }
+      modules->addBuiltinModule("pyodide-internal:limiter", SimplePythonLimiter::makeDisabled(),
+          jsg::ModuleRegistry::Type::INTERNAL);
     }
 
     for (auto module: confModules) {

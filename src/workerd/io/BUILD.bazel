@@ -59,6 +59,7 @@ wd_cc_library(
         "compatibility-date.h",
         "features.h",
         "hibernation-manager.h",
+        "io-channels.h",
         "io-context.h",
         "io-own.h",
         "io-util.h",
@@ -86,7 +87,6 @@ wd_cc_library(
         ":actor-id",
         ":actor-storage_capnp",
         ":cdp_capnp",
-        ":io-channels",
         ":io-gate",
         ":io-helpers",
         ":limit-enforcer",
@@ -100,7 +100,6 @@ wd_cc_library(
         "//src/workerd/api:data-url",
         "//src/workerd/api:deferred-proxy",
         "//src/workerd/api:encoding",
-        "//src/workerd/api:r2-api_capnp",
         "//src/workerd/api:url",
         "//src/workerd/jsg",
         "//src/workerd/util:autogate",
@@ -130,6 +129,9 @@ wd_cc_library(
         "actor-sqlite.h",
         "actor-storage.h",
     ],
+    implementation_deps = [
+        "@sqlite3",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":actor-storage_capnp",
@@ -158,6 +160,8 @@ wd_cc_library(
         "@capnp-cpp//src/capnp:capnp-rpc",
         "@capnp-cpp//src/capnp:capnpc",
         "@capnp-cpp//src/kj:kj-async",
+        "@capnp-cpp//src/kj/compat:kj-http",
+        "@ssl",
     ],
 )
 
@@ -224,16 +228,7 @@ wd_cc_library(
     name = "actor-id",
     hdrs = ["actor-id.h"],
     visibility = ["//visibility:public"],
-)
-
-wd_cc_library(
-    name = "io-channels",
-    hdrs = ["io-channels.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":actor-id",
-        ":trace",
-    ],
+    deps = ["@capnp-cpp//src/kj"],
 )
 
 genrule(
@@ -242,6 +237,7 @@ genrule(
     outs = ["trimmed-supported-compatibility-date.txt"],
     cmd = "tr -d '\n' < $(location supported-compatibility-date.txt) > $(location trimmed-supported-compatibility-date.txt)",
     cmd_ps = "(Get-Content $(location supported-compatibility-date.txt) -Raw -Encoding Ascii).TrimEnd() | Set-Content $(location trimmed-supported-compatibility-date.txt) -NoNewLine -Encoding Ascii",
+    visibility = ["//visibility:public"],
 )
 
 capnp_embed(
@@ -322,5 +318,13 @@ kj_test(
     deps = [
         ":observer",
         "@capnp-cpp//src/capnp:capnpc",
+    ],
+)
+
+kj_test(
+    src = "trace-test.c++",
+    deps = [
+        ":trace",
+        "//src/workerd/util:thread-scopes",
     ],
 )

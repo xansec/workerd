@@ -34,6 +34,7 @@ interface VectorizeError {
  * This list is expected to grow as support for more operations are released.
  */
 type VectorizeVectorMetadataFilterOp = '$eq' | '$ne';
+type VectorizeVectorMetadataFilterCollectionOp = '$in' | '$nin';
 
 /**
  * Filter criteria for vector metadata used to limit the retrieved query result set.
@@ -47,6 +48,12 @@ type VectorizeVectorMetadataFilter = {
           VectorizeVectorMetadataValue,
           string[]
         > | null;
+      }
+    | {
+        [Op in VectorizeVectorMetadataFilterCollectionOp]?: Exclude<
+          VectorizeVectorMetadataValue,
+          string[]
+        >[];
       };
 };
 
@@ -111,7 +118,7 @@ interface VectorizeIndexDetails {
  */
 interface VectorizeIndexInfo {
   /** The number of records containing vectors within the index. */
-  vectorsCount: number;
+  vectorCount: number;
   /** Number of dimensions the index has been configured for. */
   dimensions: number;
   /** ISO 8601 datetime of the last processed mutation on in the index. All changes before this mutation will be reflected in the index state. */
@@ -241,6 +248,16 @@ declare abstract class Vectorize {
    */
   public query(
     vector: VectorFloatArray | number[],
+    options?: VectorizeQueryOptions
+  ): Promise<VectorizeMatches>;
+  /**
+   * Use the provided vector-id to perform a similarity search across the index.
+   * @param vectorId Id for a vector in the index against which the index should be queried.
+   * @param options Configuration options to massage the returned data.
+   * @returns A promise that resolves with matched and scored vectors.
+   */
+  public queryById(
+    vectorId: string,
     options?: VectorizeQueryOptions
   ): Promise<VectorizeMatches>;
   /**

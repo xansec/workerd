@@ -3,6 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 #pragma once
 
+#include <workerd/jsg/jsg.h>
+
 #include <kj/common.h>
 #include <kj/string.h>
 
@@ -40,7 +42,7 @@ constexpr bool canBeTranscoded(Encoding encoding) noexcept {
 }
 
 class Converter final {
-public:
+ public:
   explicit Converter(Encoding encoding, kj::StringPtr substitude = ""_kj);
   KJ_DISALLOW_COPY_AND_MOVE(Converter);
 
@@ -50,12 +52,12 @@ public:
   void reset();
   void setSubstituteChars(kj::StringPtr sub);
 
-private:
+ private:
   kj::Own<UConverter> conv_;
 };
 
-kj::Array<kj::byte> transcode(
-    kj::ArrayPtr<kj::byte> source, Encoding fromEncoding, Encoding toEncoding);
+jsg::BufferSource transcode(
+    jsg::Lock& js, kj::ArrayPtr<kj::byte> source, Encoding fromEncoding, Encoding toEncoding);
 
 }  // namespace i18n
 

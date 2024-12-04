@@ -7,7 +7,6 @@ default:
   @just --list
 
 pwd := `pwd`
-clang_version := "18"
 
 prepare:
   cargo install gen-compile-commands
@@ -25,20 +24,20 @@ build-asan *args="//...":
   just build {{args}} --config=asan --sandbox_debug
 
 test *args="//...":
-  bazel test {{args}} --test_env=LLVM_SYMBOLIZER=llvm-symbolizer-{{clang_version}}
+  bazel test {{args}}
 
 test-asan *args="//...":
   just test {{args}} --config=asan
 
 # e.g. just stream-test //src/cloudflare:cloudflare.capnp@eslint
 stream-test args:
-  bazel test {{args}} --test_output=streamed --test_env=LLVM_SYMBOLIZER=llvm-symbolizer-{{clang_version}}
+  bazel test {{args}} --test_output=streamed
 
 # e.g. just node-test zlib
 node-test test_name:
   just stream-test //src/workerd/api/node:tests/{{test_name}}-nodejs-test
 
-format:
+format: rustfmt
   python3 tools/cross/format.py
 
 internal-pr:
@@ -51,6 +50,12 @@ update-deps prefix="":
 # equivalent to `cargo update`; use `workspace` or <package> to limit update scope
 update-rust package="full":
   bazel run //deps/rust:crates_vendor -- --repin {{package}}
+
+rust-analyzer:
+  bazel run @rules_rust//tools/rust_analyzer:gen_rust_project
+
+rustfmt:
+  bazel run @rules_rust//:rustfmt
 
 # example: just bench mimetype
 bench path:

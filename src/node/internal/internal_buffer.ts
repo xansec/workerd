@@ -381,7 +381,7 @@ function fromString(string: StringLike, encoding?: string) {
       `Unable to decode string using encoding ${encoding}`
     );
   }
-  return fromArrayBuffer(ab, 0, ab.byteLength);
+  return fromArrayBuffer(ab.buffer, 0, ab.byteLength);
 }
 
 function fromArrayLike(array: Uint8Array | ReadonlyArray<number>) {
@@ -537,7 +537,7 @@ Buffer.concat = function concat(
   validateOffset(length, 'length');
 
   const ab = bufferUtil.concat(list, length as number);
-  return fromArrayBuffer(ab, 0, length);
+  return fromArrayBuffer(ab.buffer, 0, length);
 };
 
 function base64ByteLength(str: string) {
@@ -2688,9 +2688,13 @@ export function transcode(
   if (normalizedToEncoding === undefined) {
     throw new ERR_UNKNOWN_ENCODING(toEncoding);
   }
-  return Buffer.from(
-    bufferUtil.transcode(source, normalizedFromEncoding, normalizedToEncoding)
+
+  const u8: Uint8Array = bufferUtil.transcode(
+    source,
+    normalizedFromEncoding,
+    normalizedToEncoding
   );
+  return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
 }
 
 export function resolveObjectURL(_id: string): unknown {

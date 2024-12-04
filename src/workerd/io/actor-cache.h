@@ -5,6 +5,7 @@
 #pragma once
 
 #include <workerd/io/actor-storage.capnp.h>
+#include <workerd/jsg/exception.h>
 
 #include <kj/async.h>
 #include <kj/debug.h>
@@ -47,7 +48,7 @@ struct ActorCacheWriteOptions {
 
 // Common interface between ActorCache and ActorCache::Transaction.
 class ActorCacheOps {
-public:
+ public:
   typedef kj::String Key;
   typedef kj::StringPtr KeyPtr;
   // Keys are text for now, but we could also change this to `Array<const byte>`.
@@ -163,12 +164,12 @@ public:
 // This extends ActorCacheOps and adds some methods that don't make sense as part of
 // ActorCache::Transaction.
 class ActorCacheInterface: public ActorCacheOps {
-public:
+ public:
   // If the actor's storage is backed by SQLite, return the underlying database.
   virtual kj::Maybe<SqliteDatabase&> getSqliteDatabase() = 0;
 
   class Transaction: public ActorCacheOps {
-  public:
+   public:
     // Write all changes to the underlying ActorCache.
     //
     // If commit() is not called before the Transaction is destroyed, nothing is written.
@@ -234,10 +235,30 @@ public:
   virtual kj::Maybe<kj::Promise<void>> onNoPendingFlush() = 0;
 
   // Implements the respective PITR API calls. The default implementations throw JSG errors saying
-  // PITR is not implemented.
-  virtual kj::Promise<kj::String> getCurrentBookmark();
-  virtual kj::Promise<kj::String> getBookmarkForTime(kj::Date timestamp);
-  virtual kj::Promise<kj::String> onNextSessionRestoreBookmark(kj::StringPtr bookmark);
+  // PITR is not implemented. These methods are meant to be implemented internally.
+  virtual kj::Promise<kj::String> getCurrentBookmark() {
+    JSG_FAIL_REQUIRE(
+        Error, "This Durable Object's storage back-end does not implement point-in-time recovery.");
+  }
+
+  virtual kj::Promise<kj::String> getBookmarkForTime(kj::Date timestamp) {
+    JSG_FAIL_REQUIRE(
+        Error, "This Durable Object's storage back-end does not implement point-in-time recovery.");
+  }
+
+  virtual kj::Promise<kj::String> onNextSessionRestoreBookmark(kj::StringPtr bookmark) {
+    JSG_FAIL_REQUIRE(
+        Error, "This Durable Object's storage back-end does not implement point-in-time recovery.");
+  }
+
+  virtual kj::Promise<void> waitForBookmark(kj::StringPtr bookmark) {
+    JSG_FAIL_REQUIRE(
+        Error, "This Durable Object's storage back-end does not implement point-in-time recovery.");
+  }
+
+  virtual void ensureReplicas() {
+    JSG_FAIL_REQUIRE(Error, "This Durable Object's storage back-end does not support replication.");
+  }
 };
 
 // An in-memory caching layer on top of ActorStorage.Stage RPC interface.
@@ -257,13 +278,13 @@ public:
 // accounted across many actors (typically, all actors in the same isolate), so that the cache
 // size limit can be set based on the per-isolate memory limit.
 class ActorCache final: public ActorCacheInterface {
-public:
+ public:
   // Shared LRU for a whole isolate.
   class SharedLru;
 
   // Hooks that can be used to customize ActorCache behavior or report statistics.
   class Hooks {
-  public:
+   public:
     // Called when the alarm time is dirty when neverFlush is set and ensureFlushScheduled is called.
     virtual void updateAlarmInMemory(kj::Maybe<kj::Date> newAlarmTime) {};
 
@@ -321,10 +342,10 @@ public:
   // Check for inconsistencies in the cache, e.g. redundant entries.
   void verifyConsistencyForTest();
 
-private:
+ private:
   // Backs the `kj::Own<void>` returned by `armAlarmHandler()`.
   class DeferredAlarmDeleter: public kj::Disposer {
-  public:
+   public:
     // The `Own<void>` returned by `armAlarmHandler()` is actually set up to point to the
     // `ActorCache` itself, but with an alternate disposer that deletes the alarm rather than
     // the whole object.
@@ -404,7 +425,7 @@ private:
     kj::Maybe<ActorCache&> maybeCache;
     const Key key;
 
-  private:
+   private:
     // The value associated with this key. If our `valueStatus` below is `ABSENT` or `UNKNOWN`, it
     // will have size 0.
     //
@@ -420,7 +441,7 @@ private:
     // This enum indicates how synchronized this entry is with storage.
     EntrySyncStatus syncStatus = EntrySyncStatus::NOT_IN_CACHE;
 
-  public:
+   public:
     EntryValueStatus getValueStatus() const {
       return valueStatus;
     }
@@ -510,7 +531,7 @@ private:
 
   // Callbacks for a kj::TreeIndex for a kj::Table<kj::Own<Entry>>.
   class EntryTableCallbacks {
-  public:
+   public:
     inline KeyPtr keyForRow(const kj::Own<Entry>& row) const {
       return row->key;
     }
@@ -569,7 +590,7 @@ private:
   };
 
   class CountedDeleteWaiter {
-  public:
+   public:
     explicit CountedDeleteWaiter(ActorCache& cache, kj::Own<CountedDelete> state)
         : cache(cache),
           state(kj::mv(state)) {
@@ -592,7 +613,7 @@ private:
       return *state;
     }
 
-  private:
+   private:
     ActorCache& cache;
     kj::Own<CountedDelete> state;
   };
@@ -607,7 +628,7 @@ private:
 
   // Wrapper around kj::List that keeps track of the total size of all elements.
   class DirtyList {
-  public:
+   public:
     void add(Entry& entry) {
       inner.add(entry);
       innerSize += entry.size();
@@ -629,7 +650,7 @@ private:
       return inner.end();
     }
 
-  private:
+   private:
     kj::List<Entry, &Entry::link> inner;
     size_t innerSize = 0;
   };
@@ -848,9 +869,9 @@ private:
 class ActorCacheOps::GetResultList {
   using Entry = ActorCache::Entry;
 
-public:
+ public:
   class Iterator {
-  public:
+   public:
     KeyValuePtrPairWithCache operator*() {
       KJ_IREQUIRE(ptr->get()->getValueStatus() == ActorCache::EntryValueStatus::PRESENT);
       return {ptr->get()->key, ptr->get()->getValuePtr().orDefault({}), *statusPtr};
@@ -870,7 +891,7 @@ public:
       return ptr == other.ptr && statusPtr == other.statusPtr;
     }
 
-  private:
+   private:
     const kj::Own<Entry>* ptr;
     const CacheStatus* statusPtr;
 
@@ -893,7 +914,7 @@ public:
   // Construct a simple GetResultList from key-value pairs.
   explicit GetResultList(kj::Vector<KeyValuePair> contents);
 
-private:
+ private:
   kj::Vector<kj::Own<Entry>> entries;
   kj::Vector<CacheStatus> cacheStatuses;
 
@@ -950,7 +971,7 @@ struct ActorCacheSharedLruOptions {
 };
 
 class ActorCache::SharedLru {
-public:
+ public:
   using Options = ActorCacheSharedLruOptions;
 
   explicit SharedLru(Options options);
@@ -963,7 +984,7 @@ public:
     return size.load(std::memory_order_relaxed);
   }
 
-private:
+ private:
   const Options options;
 
   // List of clean values, across all caches, ordered from least-recently-used to
@@ -992,7 +1013,7 @@ private:
 // It is up to a higher layer to make sure that only one transaction occurs at a time, perhaps
 // using critical sections.
 class ActorCache::Transaction final: public ActorCacheInterface::Transaction {
-public:
+ public:
   Transaction(ActorCache& cache);
   ~Transaction() noexcept(false);
 
@@ -1021,7 +1042,7 @@ public:
   kj::Promise<void> rollback() override;
   // Implements ActorCacheInterface::Transaction.
 
-private:
+ private:
   ActorCache& cache;
 
   struct Change {
@@ -1031,7 +1052,7 @@ private:
 
   // Callbacks for a kj::TreeIndex for a kj::Table<Change>.
   class ChangeTableCallbacks {
-  public:
+   public:
     inline KeyPtr keyForRow(const Change& row) const {
       return row.entry->key;
     }

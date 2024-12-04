@@ -1,6 +1,5 @@
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("//:build/pyodide_bucket.bzl", "PYODIDE_IMPORTS_TO_TEST")
-load("//:build/wd_test.bzl", "wd_test")
 load("//src/workerd/server/tests/python:import_tests.bzl", "gen_import_tests")
 load("//src/workerd/server/tests/python:py_wd_test.bzl", "py_wd_test")
 
@@ -12,6 +11,7 @@ copy_file(
     name = "pyodide_dev.capnp.bin@rule",
     src = "//src/pyodide:pyodide.capnp.bin",
     out = "pyodide-bundle-cache/pyodide_dev.capnp.bin",
+    visibility = ["//visibility:public"],
 )
 
 py_wd_test(
@@ -26,11 +26,33 @@ py_wd_test(
 )
 
 py_wd_test(
+    src = "sdk/sdk.wd-test",
+    args = ["--experimental"],
+    data = glob(
+        [
+            "sdk/*",
+        ],
+        exclude = ["**/*.wd-test"],
+    ),
+)
+
+py_wd_test(
     src = "env-param/env.wd-test",
     args = ["--experimental"],
     data = glob(
         [
             "env-param/*",
+        ],
+        exclude = ["**/*.wd-test"],
+    ),
+)
+
+py_wd_test(
+    src = "asgi/asgi.wd-test",
+    args = ["--experimental"],
+    data = glob(
+        [
+            "asgi/*",
         ],
         exclude = ["**/*.wd-test"],
     ),

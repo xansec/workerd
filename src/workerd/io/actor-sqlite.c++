@@ -9,6 +9,8 @@
 #include <workerd/jsg/exception.h>
 #include <workerd/util/sentry.h>
 
+#include <sqlite3.h>
+
 #include <algorithm>
 
 namespace workerd {
@@ -344,7 +346,17 @@ void ActorSqlite::maybeDeleteDeferredAlarm() {
   inAlarmHandler = false;
 
   if (haveDeferredDelete) {
-    metadata.setAlarm(kj::none);
+    // If we have reached this point, the client is destroying its DeferredAlarmDeleter at the end
+    // of an alarm handler run, and deletion hasn't been cancelled, indicating that the handler
+    // returned success.
+    //
+    // If the output gate has somehow broken in the interim, attempting to write the deletion here
+    // will cause the DeferredAlarmDeleter destructor to throw, which the caller probably isn't
+    // expecting.  So we'll skip the deletion attempt, and let the caller detect the gate
+    // brokenness through other means.
+    if (broken == kj::none) {
+      metadata.setAlarm(kj::none);
+    }
     haveDeferredDelete = false;
   }
 }
@@ -511,15 +523,22 @@ ActorCacheInterface::DeleteAllResults ActorSqlite::deleteAll(WriteOptions option
     }
   }
 
-  if (localAlarmState == kj::none && !deleteAllCommitScheduled) {
-    // If we're not going to perform a write to restore alarm state, we'll want to make sure the
-    // commit callback is called for the deleteAll().
+  if (!deleteAllCommitScheduled) {
+    // Make sure a commit callback is queued for the deleteAll().
     commitTasks.add(outputGate.lockWhile(kj::evalLater([this]() mutable -> kj::Promise<void> {
       // Don't commit if shutdown() has been called.
       requireNotBroken();
 
       deleteAllCommitScheduled = false;
-      return commitCallback();
+      if (currentTxn.is<ImplicitTxn*>()) {
+        // An implicit transaction is already scheduled, so we'll count on it to perform a commit when it's
+        // done. This is particularly important for the case where deleteAll() was called while an alarm
+        // is outstanding; resetting the alarm state (below) starts an implicit transaction.
+        // We don't want to commit the deletion without that transaction.
+        return kj::READY_NOW;
+      } else {
+        return commitCallback();
+      }
     })));
     deleteAllCommitScheduled = true;
   }
@@ -606,12 +625,7 @@ kj::OneOf<ActorSqlite::CancelAlarmHandler, ActorSqlite::RunAlarmHandler> ActorSq
         //
         // TODO(perf): If we already have such a rescheduling request in-flight, might want to
         // coalesce with the existing request?
-        if (localAlarmState == kj::none) {
-          // If clean scheduled time is unset, don't need to reschedule; just cancel the alarm.
-          return CancelAlarmHandler{.waitBeforeCancel = kj::READY_NOW};
-        } else {
-          return CancelAlarmHandler{.waitBeforeCancel = requestScheduledAlarm(localAlarmState)};
-        }
+        return CancelAlarmHandler{.waitBeforeCancel = requestScheduledAlarm(localAlarmState)};
       } else {
         return CancelAlarmHandler{.waitBeforeCancel = kj::READY_NOW};
       }
@@ -646,6 +660,21 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::onNoPendingFlush() {
   //   gate is not blocked by `allowUnconfirmed` writes. At present we haven't actually
   //   implemented `allowUnconfirmed` yet.
   return outputGate.wait();
+}
+
+void ActorSqlite::TxnCommitRegulator::onError(
+    kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const {
+  KJ_IF_SOME(c, sqliteErrorCode) {
+    if (c == SQLITE_CONSTRAINT) {
+      JSG_ASSERT(false, Error,
+          "Durable Object was reset and rolled back to its last known good state because the "
+          "application left the database in a state where constraints were violated: ",
+          message);
+    }
+  }
+
+  // For any other type of error, fall back to the default behavior (throwing a non-JSG exception)
+  // as we don't know for sure that the problem is the application's fault.
 }
 
 const ActorSqlite::Hooks ActorSqlite::Hooks::DEFAULT = ActorSqlite::Hooks{};

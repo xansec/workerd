@@ -9,7 +9,7 @@ namespace workerd::jsg {
 
 // A WHATWG-compliant URL implementation provided by ada-url.
 class Url final {
-public:
+ public:
   // Keep in sync with ada::scheme:type
   enum class SchemeType {
     HTTP = 0,
@@ -119,7 +119,7 @@ public:
 
   static kj::Array<kj::byte> percentDecode(kj::ArrayPtr<const kj::byte> input);
 
-private:
+ private:
   Url(kj::Own<void> inner);
   kj::Own<void> inner;
 };
@@ -132,29 +132,29 @@ constexpr Url::EquivalenceOption operator&(Url::EquivalenceOption a, Url::Equiva
 }
 
 class UrlSearchParams final {
-public:
+ public:
   class KeyIterator final {
-  public:
+   public:
     bool hasNext() const;
     kj::Maybe<kj::ArrayPtr<const char>> next() const;
 
-  private:
+   private:
     KeyIterator(kj::Own<void> inner);
     kj::Own<void> inner;
     friend class UrlSearchParams;
   };
   class ValueIterator final {
-  public:
+   public:
     bool hasNext() const;
     kj::Maybe<kj::ArrayPtr<const char>> next() const;
 
-  private:
+   private:
     ValueIterator(kj::Own<void> inner);
     kj::Own<void> inner;
     friend class UrlSearchParams;
   };
   class EntryIterator final {
-  public:
+   public:
     struct Entry {
       kj::ArrayPtr<const char> key;
       kj::ArrayPtr<const char> value;
@@ -162,7 +162,7 @@ public:
     bool hasNext() const;
     kj::Maybe<Entry> next() const;
 
-  private:
+   private:
     EntryIterator(kj::Own<void> inner);
     kj::Own<void> inner;
     friend class UrlSearchParams;
@@ -199,7 +199,9 @@ public:
     tracker.trackField("inner", toStr());
   }
 
-private:
+  void reset(kj::Maybe<kj::ArrayPtr<const char>> input);
+
+ private:
   UrlSearchParams(kj::Own<void> inner);
   kj::Own<void> inner;
 };
@@ -217,7 +219,7 @@ inline kj::String KJ_STRINGIFY(const UrlSearchParams& searchParams) {
 // Encapsulates a parsed URLPattern.
 // @see https://wicg.github.io/urlpattern
 class UrlPattern final {
-public:
+ public:
   // If the value is T, the operation is successful.
   // If the value is kj::String, that's an Error message.
   template <typename T>
@@ -225,7 +227,7 @@ public:
 
   // An individual, compiled component of a URLPattern.
   class Component final {
-  public:
+   public:
     Component(kj::String pattern, kj::String regex, kj::Array<kj::String> names);
 
     Component(Component&&) = default;
@@ -250,7 +252,7 @@ public:
       }
     }
 
-  private:
+   private:
     // The normalized pattern for this component.
     kj::String pattern = nullptr;
 
@@ -353,7 +355,7 @@ public:
     tracker.trackField("hash", hash);
   }
 
-private:
+ private:
   UrlPattern(kj::Array<Component> components, bool ignoreCase);
 
   Component protocol;
@@ -372,4 +374,4 @@ private:
 
 // Append _url to a string literal to create a parsed URL. An assert will be triggered
 // if the value cannot be parsed successfully.
-const workerd::jsg::Url operator"" _url(const char* str, size_t size) KJ_WARN_UNUSED_RESULT;
+const workerd::jsg::Url operator""_url(const char* str, size_t size) KJ_WARN_UNUSED_RESULT;

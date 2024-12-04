@@ -97,7 +97,7 @@ export default {
       ) {
         return Response.json({});
       } else if (request.method === 'POST' && pathname.endsWith('/query')) {
-        /** @type {VectorizeQueryOptions & {vector: number[]}} */
+        /** @type {VectorizeQueryOptions & ({vector: number[]} | {vectorId: string})} */
         const body = await request.json();
         let returnSet = structuredClone(exampleVectorMatches);
         if (
@@ -108,6 +108,16 @@ export default {
           const criteria = body?.filter?.['text']?.['$eq'];
           returnSet = returnSet.filter(
             (m) => m.metadata?.['text'] === criteria
+          );
+        }
+        if (
+          body?.filter?.['text'] &&
+          typeof body?.filter?.['text'] === 'object' &&
+          body?.filter?.['text']?.['$in'] !== undefined
+        ) {
+          const criteria = body?.filter?.['text']?.['$in'];
+          returnSet = returnSet.filter((m) =>
+            criteria.includes(m.metadata?.['text'])
           );
         }
         if (!body?.returnValues)

@@ -143,7 +143,7 @@ void disposeSqlite(sqlite3_stmt* stmt) {
 
 template <typename T>
 class SqliteDisposer: public kj::Disposer {
-public:
+ public:
   void disposeImpl(void* pointer) const override {
     disposeSqlite(reinterpret_cast<T*>(pointer));
   }
@@ -225,6 +225,7 @@ static constexpr kj::StringPtr ALLOWED_SQLITE_FUNCTIONS[] = {
   // "sqlite_source_id"_kj,
   // "sqlite_version"_kj,
   "substr"_kj,
+  "substring"_kj,
   "total_changes"_kj,
   "trim"_kj,
   "typeof"_kj,
@@ -553,8 +554,11 @@ void SqliteDatabase::applyChange(const StateChange& change) {
 
 // Set up the regulator that will be used for authorizer callbacks while preparing this
 // statement.
-SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(
-    const Regulator& regulator, kj::StringPtr sqlCode, uint prepFlags, Multi multi) {
+SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(const Regulator& regulator,
+    kj::StringPtr sqlCode,
+    uint prepFlags,
+    Multi multi,
+    kj::Maybe<kj::Vector<Statement>&> prelude) {
   sqlite3* db = &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
 
   ParseContext parseContext;
@@ -566,6 +570,22 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(
       "can't prepare statements inside executeWithRegulator() callback");
   KJ_DEFER(currentRegulator = kj::none);
   currentRegulator = regulator;
+
+  // If we fail, we need to discard any statements we added to the prelude, because the next time
+  // the statement runs they'll be parsed again and added again.
+  uint preludeInitialSize = 0;
+  KJ_IF_SOME(p, prelude) {
+    preludeInitialSize = p.size();
+  }
+  KJ_ON_SCOPE_FAILURE({
+    KJ_IF_SOME(p, prelude) {
+      while (p.size() > preludeInitialSize) {
+        p.removeLast();
+      }
+    } else {
+      // (else block needed to squelch spurious clang warning)
+    }
+  });
 
   for (;;) {
     sqlite3_stmt* result;
@@ -635,11 +655,18 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(
           // Apply any state changes from executing the statement.
           applyChange(parseContext.stateChange);
 
+          KJ_IF_SOME(p, prelude) {
+            p.add(Statement(*this, regulator,
+                StatementAndEffect{.statement = kj::mv(ownResult),
+                  .stateChange = kj::mv(parseContext.stateChange)}));
+          }
+
           // Reset parse context for next statement.
           parseContext = {};
 
           // Reduce `sqlCode` to include only what we haven't already executed.
           sqlCode = kj::StringPtr(tail, sqlCode.end());
+
           continue;
         }
         break;
@@ -1108,11 +1135,18 @@ SqliteDatabase::Statement SqliteDatabase::prepare(
       *this, regulator, prepareSql(regulator, sqlCode, SQLITE_PREPARE_PERSISTENT, SINGLE));
 }
 
-SqliteDatabase::StatementAndEffect& SqliteDatabase::Statement::getStatementAndEffect() {
+SqliteDatabase::StatementAndEffect& SqliteDatabase::Statement::prepareForExecution() {
+  for (auto& stmt: prelude) {
+    stmt.run();
+  }
+
   KJ_IF_SOME(sqlCode, stmt.tryGet<kj::String>()) {
     // Database was reset. Recompile the statement against the new database. (This could throw,
     // of course, if the statement depends on tables that haven't been recreated yet.)
-    stmt = db.prepareSql(regulator, sqlCode, SQLITE_PREPARE_PERSISTENT, SINGLE);
+    //
+    // We use the MULTI flag here in case this Statement was created by prepareMulti(). If multiple
+    // statements are parsed, they'll be added to our `prelude`, and also executed immediately.
+    stmt = db.prepareSql(regulator, sqlCode, SQLITE_PREPARE_PERSISTENT, MULTI, prelude);
   }
 
   return KJ_ASSERT_NONNULL(stmt.tryGet<StatementAndEffect>());
@@ -1131,7 +1165,7 @@ SqliteDatabase::Query::Query(SqliteDatabase& db,
     kj::ArrayPtr<const ValuePtr> bindings)
     : ResetListener(db),
       regulator(regulator),
-      maybeStatement(statement.getStatementAndEffect()) {
+      maybeStatement(statement.prepareForExecution()) {
   // If we throw from the constructor, the destructor won't run. Need to call destroy() explicitly.
   KJ_ON_SCOPE_FAILURE(destroy());
   init(bindings);
@@ -2013,12 +2047,12 @@ sqlite3_vfs SqliteDatabase::Vfs::makeKjVfs() {
 // -----------------------------------------------------------------------------
 
 class SqliteDatabase::Vfs::DefaultLockManager final: public SqliteDatabase::LockManager {
-public:
+ public:
   kj::Own<Lock> lock(kj::PathPtr path, const kj::ReadableFile& mainDatabaseFile) const override {
     return kj::heap<LockImpl>(*this, path);
   }
 
-private:
+ private:
   class LockImpl;
   struct LockState;
   using LockMap = kj::HashMap<kj::PathPtr, LockState*>;
@@ -2046,7 +2080,7 @@ private:
   };
 
   class LockImpl final: public Lock {
-  public:
+   public:
     LockImpl(const DefaultLockManager& lockManager, kj::PathPtr path): lockManager(lockManager) {
       auto mlock = lockManager.lockMap.lockExclusive();
       auto& slot = mlock->findOrCreate(path, [&]() {
@@ -2225,7 +2259,7 @@ private:
       }
     }
 
-  private:
+   private:
     const DefaultLockManager& lockManager;
     kj::Own<LockState> state;
     Level currentLevel = UNLOCKED;

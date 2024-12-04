@@ -26,14 +26,14 @@ static constexpr bool IsWithinBounds(size_t off, size_t len, size_t max) noexcep
 class MIMEType;
 
 class MIMEParams final: public jsg::Object {
-private:
+ private:
   template <typename T>
   struct IteratorState final {
     kj::Array<T> values;
     uint index = 0;
   };
 
-public:
+ public:
   MIMEParams(kj::Maybe<MimeType&> mimeType = kj::none);
 
   static jsg::Ref<MIMEParams> constructor();
@@ -66,7 +66,7 @@ public:
     JSG_ITERABLE(entries);
   }
 
-private:
+ private:
   template <typename T>
   static kj::Maybe<T> iteratorNext(jsg::Lock& js, IteratorState<T>& state) {
     if (state.index >= state.values.size()) {
@@ -87,7 +87,7 @@ private:
 };
 
 class MIMEType final: public jsg::Object {
-public:
+ public:
   explicit MIMEType(MimeType inner);
   ~MIMEType() noexcept(false);
   static jsg::Ref<MIMEType> constructor(kj::String input);
@@ -109,7 +109,7 @@ public:
     JSG_METHOD_NAMED(toJSON, toString);
   }
 
-private:
+ private:
   workerd::MimeType inner;
   jsg::Ref<MIMEParams> params;
 };
@@ -155,11 +155,21 @@ private:
   V(WeakSet)
 
 class UtilModule final: public jsg::Object {
-public:
+ public:
   UtilModule() = default;
   UtilModule(jsg::Lock&, const jsg::Url&) {}
 
   jsg::Name getResourceTypeInspect(jsg::Lock& js);
+
+#ifdef _WIN32
+  static constexpr kj::StringPtr processPlatform = "win32"_kj;
+#elif defined(__linux__)
+  static constexpr kj::StringPtr processPlatform = "linux"_kj;
+#elif defined(__APPLE__)
+  static constexpr kj::StringPtr processPlatform = "darwin"_kj;
+#else
+  static constexpr kj::StringPtr processPlatform = "unsupported-platform"_kj;
+#endif
 
   // `getOwnNonIndexProperties()` `filter`s
   static constexpr int ALL_PROPERTIES = jsg::PropertyFilter::ALL_PROPERTIES;
@@ -223,6 +233,12 @@ public:
   // then it becomes a non-op.
   void processExitImpl(jsg::Lock& js, int code);
 
+  // IMPORTANT: This function will always return "linux" on production.
+  // This is only added for Node.js compatibility and running OS specific tests
+  kj::StringPtr getProcessPlatform() const {
+    return processPlatform;
+  }
+
   JSG_RESOURCE_TYPE(UtilModule) {
     JSG_NESTED_TYPE(MIMEType);
     JSG_NESTED_TYPE(MIMEParams);
@@ -251,6 +267,7 @@ public:
 
     JSG_METHOD(getBuiltinModule);
     JSG_METHOD(processExitImpl);
+    JSG_LAZY_READONLY_INSTANCE_PROPERTY(processPlatform, getProcessPlatform);
   }
 };
 

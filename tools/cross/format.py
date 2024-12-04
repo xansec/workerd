@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
+import json
 import logging
-import os
 import platform
 import subprocess
 import sys
@@ -10,11 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from sys import exit
-from typing import Callable, Optional
-
-PRETTIER = os.environ.get(
-    "PRETTIER", "bazel-bin/node_modules/prettier/bin/prettier.cjs"
-)
+from typing import Optional
 
 
 def parse_args() -> Namespace:
@@ -67,13 +63,19 @@ def parse_args() -> Namespace:
 
 
 def filter_files_by_globs(
-    files: list[Path], dir_path: Path, globs: tuple[str, ...]
+    files: list[Path], dir_path: Path, globs: tuple[str, ...], excludes: tuple[str, ...]
 ) -> list[Path]:
     return [
         file
         for file in files
-        if file.is_relative_to(dir_path) and matches_any_glob(globs, file)
+        if file.is_relative_to(dir_path)
+        and matches_any_glob(globs, file)
+        and not relative_to_any(excludes, file)
     ]
+
+
+def relative_to_any(excludes: tuple[str, ...], file: Path) -> bool:
+    return any(file.is_relative_to(exclude) for exclude in excludes)
 
 
 def matches_any_glob(globs: tuple[str, ...], file: Path) -> bool:
@@ -120,10 +122,10 @@ def run_bazel_tool(
         tool_path = init_external_dir() / tool_target / "file" / "downloaded"
 
     if not tool_path.exists():
-        fetch_target = (
+        build_target = (
             f"@{tool_target}//:file" if is_archive else f"@{tool_target}//file"
         )
-        subprocess.run(["bazel", "fetch", fetch_target])
+        subprocess.run(["bazel", "build", build_target])
 
     return subprocess.run([tool_path, *args])
 
@@ -138,6 +140,8 @@ def clang_format(files: list[Path], check: bool = False) -> bool:
 
 
 def prettier(files: list[Path], check: bool = False) -> bool:
+    PRETTIER = "bazel-bin/node_modules/prettier/bin/prettier.cjs"
+
     if not Path(PRETTIER).exists():
         subprocess.run(["bazel", "build", "//:node_modules/prettier"])
 
@@ -203,30 +207,22 @@ def git_get_all_files() -> list[Path]:
 class FormatConfig:
     directory: str
     globs: tuple[str, ...]
-    formatter: Callable[[list[Path], bool], bool]
+    formatter: str
+    excludes: tuple[str, ...] = ()
 
 
-FORMATTERS = [
-    FormatConfig(
-        directory="src/workerd", globs=("*.c++", "*.h"), formatter=clang_format
-    ),
-    FormatConfig(
-        directory="src",
-        globs=("*.js", "*.ts", "*.cjs", "*.ejs", "*.mjs"),
-        formatter=prettier,
-    ),
-    FormatConfig(directory="src", globs=("*.json",), formatter=prettier),
-    FormatConfig(directory=".", globs=("*.py",), formatter=ruff),
-    FormatConfig(
-        directory=".",
-        globs=("*.bzl", "WORKSPACE", "BUILD", "BUILD.*"),
-        formatter=buildifier,
-    ),
-]
+FORMATTERS = {
+    "clang-format": clang_format,
+    "prettier": prettier,
+    "ruff": ruff,
+    "buildifier": buildifier,
+}
 
 
 def format(config: FormatConfig, files: list[Path], check: bool) -> tuple[bool, str]:
-    matching_files = filter_files_by_globs(files, Path(config.directory), config.globs)
+    matching_files = filter_files_by_globs(
+        files, Path(config.directory), config.globs, config.excludes
+    )
 
     if not matching_files:
         return (
@@ -234,7 +230,7 @@ def format(config: FormatConfig, files: list[Path], check: bool) -> tuple[bool, 
             f"No matching files for {config.directory} ({', '.join(config.globs)})",
         )
 
-    result = config.formatter(matching_files, check)
+    result = FORMATTERS[config.formatter](matching_files, check)
     message = (
         f"{len(matching_files)} files in {config.directory} ({', '.join(config.globs)})"
     )
@@ -246,17 +242,21 @@ def format(config: FormatConfig, files: list[Path], check: bool) -> tuple[bool, 
 
 def main() -> None:
     options = parse_args()
+
     if options.subcommand == "git":
         files = git_get_modified_files(options.target, options.source, options.staged)
     else:
         files = git_get_all_files()
+
+    with (Path(__file__).parent / "format.json").open() as fp:
+        configs = json.load(fp, object_hook=lambda o: FormatConfig(**o))
 
     all_ok = True
 
     with ThreadPoolExecutor() as executor:
         future_to_config = {
             executor.submit(format, config, files, options.check): config
-            for config in FORMATTERS
+            for config in configs
         }
         for future in as_completed(future_to_config):
             config = future_to_config[future]

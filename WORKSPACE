@@ -14,7 +14,7 @@ deps_gen()
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 
-NODE_VERSION = "20.14.0"
+NODE_VERSION = "22.11.0"
 
 load("@bazel_skylib//:workspace.bzl", "bazel_skylib_workspace")
 
@@ -44,9 +44,9 @@ http_archive(
         "//:patches/sqlite/0002-macOS-missing-PATH-fix.patch",
         "//:patches/sqlite/0003-sqlite-complete-early-exit.patch",
     ],
-    sha256 = "ab9aae38a11b931f35d8d1c6d62826d215579892e6ffbf89f20bdce106a9c8c5",
-    strip_prefix = "sqlite-src-3440000",
-    url = "https://sqlite.org/2023/sqlite-src-3440000.zip",
+    sha256 = "f59c349bedb470203586a6b6d10adb35f2afefa49f91e55a672a36a09a8fedf7",
+    strip_prefix = "sqlite-src-3470000",
+    url = "https://sqlite.org/2024/sqlite-src-3470000.zip",
 )
 
 load("@rules_python//python:repositories.bzl", "py_repositories", "python_register_toolchains")
@@ -120,13 +120,9 @@ filegroup(
 
 # tcmalloc requires Abseil.
 #
-# WARNING: This MUST appear before rules_fuzzing_dependencies(), below. Otherwise,
-#   rules_fuzzing_dependencies() will choose to pull in an older version of Abseil. Absurdly, Bazel
-#   simply ignores later attempts to define the same repo name, rather than erroring out. This led
-#   to confusing compiler errors in tcmalloc in the past.
 git_repository(
     name = "com_google_absl",
-    commit = "ed3733b91e472a1e7a641c1f0c1e6c0ea698e958",
+    commit = "dc257ad54f38739767a6cb26eb57fd51c37bfe3c",
     remote = "https://chromium.googlesource.com/chromium/src/third_party/abseil-cpp.git",
 )
 
@@ -162,26 +158,6 @@ bind(
     actual = "@com_google_absl//absl/types:optional",
 )
 
-# tcmalloc requires this "rules_fuzzing" package. Its build files fail analysis without it, even
-# though it is unused for our purposes.
-http_archive(
-    name = "rules_fuzzing",
-    integrity = "sha256-PsDu4FskNVLMSnhLMDI9CIv3PLIXfd2gLIJ+aJgZM/E=",
-    strip_prefix = "rules_fuzzing-0.5.2",
-    url = "https://github.com/bazelbuild/rules_fuzzing/archive/refs/tags/v0.5.2.tar.gz",
-)
-
-load("@rules_fuzzing//fuzzing:repositories.bzl", "rules_fuzzing_dependencies")
-
-rules_fuzzing_dependencies(
-    honggfuzz = False,
-    jazzer = False,
-)
-
-load("@rules_fuzzing//fuzzing:init.bzl", "rules_fuzzing_init")
-
-rules_fuzzing_init()
-
 # OK, now we can bring in tcmalloc itself.
 http_archive(
     name = "com_google_tcmalloc",
@@ -199,7 +175,7 @@ git_repository(
     name = "zlib",
     build_file = "//:build/BUILD.zlib",
     # Must match the version used by v8
-    commit = "d3aea2341cdeaf7e717bc257a59aa7a9407d318a",
+    commit = "fa9f14143c7938e6a1d18443900efee7a1e5e669",
     remote = "https://chromium.googlesource.com/chromium/src/third_party/zlib.git",
 )
 
@@ -209,9 +185,13 @@ rules_rust_dependencies()
 
 rust_register_toolchains(
     edition = "2021",
-    # Rust registers wasm targets by default which we don't need, workerd is only built for its native platform.
-    extra_target_triples = [],
-    versions = ["1.81.0"],  # LLVM 18
+    extra_target_triples = [
+        # Add support for macOS cross-compilation
+        "x86_64-apple-darwin",
+        # Add support for macOS rosetta
+        "aarch64-unknown-linux-gnu",
+    ],
+    versions = ["1.82.0"],  # LLVM 19
 )
 
 load("@rules_rust//crate_universe:repositories.bzl", "crate_universe_dependencies")
@@ -276,11 +256,11 @@ load("@aspect_rules_esbuild//esbuild:dependencies.bzl", "rules_esbuild_dependenc
 
 rules_esbuild_dependencies()
 
-load("@aspect_rules_esbuild//esbuild:repositories.bzl", "esbuild_register_toolchains")
+load("@aspect_rules_esbuild//esbuild:repositories.bzl", "LATEST_ESBUILD_VERSION", "esbuild_register_toolchains")
 
 esbuild_register_toolchains(
     name = "esbuild",
-    esbuild_version = "0.23.0",
+    esbuild_version = LATEST_ESBUILD_VERSION,
 )
 
 # ========================================================================================
@@ -300,32 +280,32 @@ esbuild_register_toolchains(
 
 http_archive(
     name = "v8",
-    integrity = "sha256-2jQHW96t3jpEsjOlv9yyjgUem3kKNnpDAIDR4PPFSnw=",
+    integrity = "sha256-s+oY+fAG0cXTGmKDxbioUudjUciK1dU2reu7lZ+uB1w=",
     patch_args = ["-p1"],
     patches = [
         "//:patches/v8/0001-Allow-manually-setting-ValueDeserializer-format-vers.patch",
         "//:patches/v8/0002-Allow-manually-setting-ValueSerializer-format-versio.patch",
-        "//:patches/v8/0003-Add-ArrayBuffer-MaybeNew.patch",
-        "//:patches/v8/0004-Allow-Windows-builds-under-Bazel.patch",
-        "//:patches/v8/0005-Disable-bazel-whole-archive-build.patch",
-        "//:patches/v8/0006-Speed-up-V8-bazel-build-by-always-using-target-cfg.patch",
-        "//:patches/v8/0007-Implement-Promise-Context-Tagging.patch",
-        "//:patches/v8/0008-Enable-V8-shared-linkage.patch",
-        "//:patches/v8/0009-Randomize-the-initial-ExecutionContextId-used-by-the.patch",
-        "//:patches/v8/0010-increase-visibility-of-virtual-method.patch",
-        "//:patches/v8/0011-Add-ValueSerializer-SetTreatFunctionsAsHostObjects.patch",
-        "//:patches/v8/0012-Set-torque-generator-path-to-external-v8.-This-allow.patch",
-        "//:patches/v8/0013-Modify-where-to-look-for-fp16-dependency.-This-depen.patch",
-        "//:patches/v8/0014-Expose-v8-Symbol-GetDispose.patch",
-        "//:patches/v8/0015-Rename-V8_COMPRESS_POINTERS_IN_ISOLATE_CAGE-V8_COMPR.patch",
-        "//:patches/v8/0016-Revert-TracedReference-deref-API-removal.patch",
-        "//:patches/v8/0017-Revert-heap-Add-masm-specific-unwinding-annotations-.patch",
-        "//:patches/v8/0018-Update-illegal-invocation-error-message-in-v8.patch",
-        "//:patches/v8/0019-Implement-cross-request-context-promise-resolve-hand.patch",
-        "//:patches/v8/0020-Modify-where-to-look-for-fast_float-dependency.patch",
+        "//:patches/v8/0003-Allow-Windows-builds-under-Bazel.patch",
+        "//:patches/v8/0004-Disable-bazel-whole-archive-build.patch",
+        "//:patches/v8/0005-Speed-up-V8-bazel-build-by-always-using-target-cfg.patch",
+        "//:patches/v8/0006-Implement-Promise-Context-Tagging.patch",
+        "//:patches/v8/0007-Randomize-the-initial-ExecutionContextId-used-by-the.patch",
+        "//:patches/v8/0008-increase-visibility-of-virtual-method.patch",
+        "//:patches/v8/0009-Add-ValueSerializer-SetTreatFunctionsAsHostObjects.patch",
+        "//:patches/v8/0010-Set-torque-generator-path-to-external-v8.-This-allow.patch",
+        "//:patches/v8/0011-Modify-where-to-look-for-fp16-dependency.-This-depen.patch",
+        "//:patches/v8/0012-Expose-v8-Symbol-GetDispose.patch",
+        "//:patches/v8/0013-Revert-TracedReference-deref-API-removal.patch",
+        "//:patches/v8/0014-Revert-heap-Add-masm-specific-unwinding-annotations-.patch",
+        "//:patches/v8/0015-Update-illegal-invocation-error-message-in-v8.patch",
+        "//:patches/v8/0016-Implement-cross-request-context-promise-resolve-hand.patch",
+        "//:patches/v8/0017-Modify-where-to-look-for-fast_float-dependency.patch",
+        "//:patches/v8/0018-Return-rejected-promise-from-WebAssembly.compile-if-.patch",
+        "//:patches/v8/0019-codegen-Don-t-pass-a-nullptr-in-InitUnwindingRecord-.patch",
+        "//:patches/v8/0020-Add-another-slot-in-the-isolate-for-embedder.patch",
     ],
-    strip_prefix = "v8-13.0.245.16",
-    url = "https://github.com/v8/v8/archive/refs/tags/13.0.245.16.tar.gz",
+    strip_prefix = "v8-13.1.201.8",
+    url = "https://github.com/v8/v8/archive/refs/tags/13.1.201.8.tar.gz",
 )
 
 git_repository(
@@ -357,13 +337,13 @@ new_local_repository(
 )
 
 python_register_toolchains(
-    name = "python3_12",
+    name = "python3_13",
     ignore_root_user_error = True,
     # https://github.com/bazelbuild/rules_python/blob/main/python/versions.bzl
-    python_version = "3.12",
+    python_version = "3.13",
 )
 
-load("@python3_12//:defs.bzl", "interpreter")
+load("@python3_13//:defs.bzl", "interpreter")
 load("@rules_python//python:pip.bzl", "pip_parse")
 
 pip_parse(
@@ -418,44 +398,11 @@ new_local_repository(
 )
 
 # Dev tools
-http_file(
-    name = "buildifier-darwin-arm64",
-    executable = True,
-    integrity = "sha256-Wmr8asegn1RVuguJvZnVriO0F03F3J1sDtXOjKrD+BM=",
-    url = "https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-darwin-arm64",
-)
-
-http_file(
-    name = "buildifier-darwin-amd64",
-    executable = True,
-    integrity = "sha256-Wmr8asegn1RVuguJvZnVriO0F03F3J1sDtXOjKrD+BM=",
-    url = "https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-darwin-arm64",
-)
-
-http_file(
-    name = "buildifier-linux-arm64",
-    executable = True,
-    integrity = "sha256-C/hsS//69PCO7Xe95bIILkrlA5oR4uiwOYTBc8NKVhw=",
-    url = "https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-arm64",
-)
-
-http_file(
-    name = "buildifier-linux-amd64",
-    executable = True,
-    integrity = "sha256-VHTMUSinToBng9VAgfWBZixL6K5lAi9VfpKB7V3IgAk=",
-    url = "https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-amd64",
-)
-
-http_file(
-    name = "buildifier-windows-amd64",
-    executable = True,
-    integrity = "sha256-NwzVdgda0pkwqC9d4TLxod5AhMeEqCUUvU2oDIWs9Kg=",
-    url = "https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-windows-amd64.exe",
-)
 
 FILE_GROUP = """filegroup(
 	name="file",
-	srcs=["**/*"])"""
+	srcs=glob(["**"])
+)"""
 
 http_archive(
     name = "ruff-darwin-arm64",
@@ -525,4 +472,15 @@ http_file(
     executable = True,
     integrity = "sha256-4V2KXVoX5Ny1J7ABfVRx0nAHpAGegykhzac7zW3nK0k=",
     url = "https://github.com/npaun/bins/releases/download/llvm-18.1.8/llvm-18.1.8-windows-amd64-clang-format.exe",
+)
+
+# ========================================================================================
+# Web Platform Tests
+
+http_archive(
+    name = "wpt",
+    build_file = "//:build/BUILD.wpt",
+    integrity = "sha256-Hxn/D6x6lI9ISlCQFq620sb8x9iXplVzXPV6zumX84A=",
+    strip_prefix = "wpt-merge_pr_48695",
+    url = "https://github.com/web-platform-tests/wpt/archive/refs/tags/merge_pr_48695.tar.gz",
 )

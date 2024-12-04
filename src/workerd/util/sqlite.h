@@ -23,7 +23,7 @@ using kj::uint;
 
 // Used to collect periodic metrics about queries and size of sqlite db
 class SqliteObserver {
-public:
+ public:
   virtual void addQueryStats(uint64_t rowsRead, uint64_t rowsWritten) {}
   // The method is not used by the SqliteDatabase, it is added here for convenience
   virtual void setSqliteStoredBytes(uint64_t sqliteStoredBytes) {}
@@ -39,7 +39,7 @@ public:
 // representing a true disk directory, the real SQLite disk implementation will be used with
 // all of its features.
 class SqliteDatabase {
-public:
+ public:
   class Vfs;
   class Query;
   class Statement;
@@ -72,7 +72,7 @@ public:
   // of returning false. If they do, this exception will pass through to the caller in place of
   // a generic "not authorized" exception.
   class Regulator {
-  public:
+   public:
     // Returns whether the given name (which may be a table, index, view, etc.) is allowed to be
     // accessed. Typically, this is used to deny access to names containing special prefixes
     // indicating that they are privileged, like `_cf_`.
@@ -123,8 +123,20 @@ public:
   static constexpr Regulator TRUSTED;
 
   // Prepares the given SQL code as a persistent statement that can be used across several queries.
-  // Don't use this for one-off queries; pass the code to the Query constructor.
+  // Don't use this for one-off queries; use run() instead.
   Statement prepare(const Regulator& regulator, kj::StringPtr sqlCode);
+
+  // Prepares a statement that may acutally be multiple statements (separated by semicolons).
+  // In this case, the code is not actually parsed until first executed (this implies
+  // `prepareMulti()` will never throw since it doesn't actually do anything). This lazy-parsing
+  // behavior is necessary in the case that later statements depend on the effects of earlier ones.
+  // For example, the first statement might create a table, and the next statement insert into that
+  // table. SQLite will refuse to parse the insertion statement until the table has been created,
+  // so each statement must be executed before the next can be parsed.
+  //
+  // As with exec(), the result of executing a batch of multiple statements is always the result
+  // of the last statement. The results of all other statements are discarded.
+  Statement prepareMulti(const Regulator& regulator, kj::String sqlCode);
 
   // Convenience method to start a query. This is equivalent to `prepare(sqlCode).run(bindings...)`
   // except:
@@ -190,7 +202,7 @@ public:
 
   // Objects that need to be notified when reset() is called may inherit `ResetListener`.
   class ResetListener {
-  public:
+   public:
     ResetListener(SqliteDatabase& db): db(db) {
       db.resetListeners.add(*this);
     }
@@ -206,10 +218,10 @@ public:
     // called before actually resetting the database.
     virtual void beforeSqliteReset() = 0;
 
-  protected:  // so that subclasess don't have to store their own copy of the `db` reference
+   protected:  // so that subclasess don't have to store their own copy of the `db` reference
     SqliteDatabase& db;
 
-  private:
+   private:
     kj::ListLink<ResetListener> link;
 
     friend class SqliteDatabase;
@@ -244,7 +256,7 @@ public:
     }
   }
 
-private:
+ private:
   const Vfs& vfs;
   kj::Path path;
   bool readOnly;
@@ -321,8 +333,14 @@ private:
   //
   // In MULTI mode, if `sqlCode` contains multiple statements, each statement before the last one
   // is executed immediately. The returned object represents the last statement.
-  StatementAndEffect prepareSql(
-      const Regulator& regulator, kj::StringPtr sqlCode, uint prepFlags, Multi multi);
+  //
+  // If `prelude` is provided, then, in MULTI mode, all statements which are executed immediately
+  // are also appended to `prelude`.
+  StatementAndEffect prepareSql(const Regulator& regulator,
+      kj::StringPtr sqlCode,
+      uint prepFlags,
+      Multi multi,
+      kj::Maybe<kj::Vector<Statement>&> prelude = kj::none);
 
   // Implements SQLite authorizer callback, see sqlite3_set_authorizer().
   bool isAuthorized(int actionCode,
@@ -352,7 +370,7 @@ private:
 
 // Represents a prepared SQL statement, which can be executed many times.
 class SqliteDatabase::Statement final: private ResetListener {
-public:
+ public:
   // Convenience method to start a query. This is equivalent to:
   //
   //     SqliteDatabase::Query(db, statement, bindings...);
@@ -367,23 +385,30 @@ public:
   template <typename... Params>
   Query run(Params&&... bindings);
 
-  // Convert to sqlite3_stmt, creating it on-demand if needed.
-  operator sqlite3_stmt*() {
-    return getStatementAndEffect().statement;
-  }
-
-private:
+ private:
   const Regulator& regulator;
   kj::OneOf<kj::String, StatementAndEffect> stmt;
+
+  // List of statements to execute before this one. Only non-empty if this Statement was created
+  // by prepareMulti().
+  kj::Vector<Statement> prelude;
 
   Statement(SqliteDatabase& db, const Regulator& regulator, StatementAndEffect stmt)
       : ResetListener(db),
         regulator(regulator),
         stmt(kj::mv(stmt)) {}
 
+  // Lazily-parsed statement -- used by `prepareMulti()`.
+  Statement(SqliteDatabase& db, const Regulator& regulator, kj::String sqlCode)
+      : ResetListener(db),
+        regulator(regulator),
+        stmt(kj::mv(sqlCode)) {}
+
   void beforeSqliteReset() override;
 
-  StatementAndEffect& getStatementAndEffect();
+  // Get the underlying StatementAndEffect, which the caller will then execute. If `prelude` is
+  // non-empty, prepareForExecution() actually executes the prelude.
+  StatementAndEffect& prepareForExecution();
 
   friend class SqliteDatabase;
 };
@@ -393,7 +418,7 @@ private:
 // Only one Query can exist at a time, for a given database. It should probably be allocated on
 // the stack.
 class SqliteDatabase::Query final: private ResetListener {
-public:
+ public:
   using ValuePtr =
       kj::OneOf<kj::ArrayPtr<const byte>, kj::StringPtr, int64_t, double, decltype(nullptr)>;
 
@@ -487,7 +512,7 @@ public:
     }
   }
 
-private:
+ private:
   const Regulator& regulator;
   StatementAndEffect ownStatement;                // for one-off queries
   kj::Maybe<StatementAndEffect&> maybeStatement;  // null if database was reset
@@ -513,7 +538,7 @@ private:
   Query(SqliteDatabase& db, const Regulator& regulator, Statement& statement, Params&&... bindings)
       : ResetListener(db),
         regulator(regulator),
-        maybeStatement(statement.getStatementAndEffect()) {
+        maybeStatement(statement.prepareForExecution()) {
     // If we throw from the constructor, the destructor won't run. Need to call destroy()
     // explicitly.
     KJ_ON_SCOPE_FAILURE(destroy());
@@ -608,7 +633,7 @@ struct SqliteDatabase::VfsOptions {
 //
 // An instance of `Vfs` can safely be used across multiple threads.
 class SqliteDatabase::Vfs {
-public:
+ public:
   // Pretend `Options` is declared nested here. Due to a C++ quirk, we cannot actually declare it
   // nested while having default-initialized parameters of this type.
   using Options = VfsOptions;
@@ -650,7 +675,7 @@ public:
 
   KJ_DISALLOW_COPY_AND_MOVE(Vfs);
 
-private:
+ private:
   const kj::Directory& directory;
   kj::Own<LockManager> ownLockManager;
   const LockManager& lockManager;
@@ -695,7 +720,7 @@ private:
 };
 
 class SqliteDatabase::LockManager {
-public:
+ public:
   // Obtain a lock for the given database path. The main database file is also provided in case
   // it is useful. This method only creates the `Lock` object; it's level starts out as UNLOCKED,
   // meaning no actual lock is held yet.
@@ -719,7 +744,7 @@ public:
 // native implementation kicks in, which is based on advisory file locks at the OS level, as well
 // as mmapped shared memory from a file next to the database with suffix `-shm`.
 class SqliteDatabase::Lock {
-public:
+ public:
   // The main database can be locked at one of these levels.
   //
   // See the SQLite documentation for an explanation of lock levels:
@@ -834,6 +859,11 @@ template <size_t size>
 SqliteDatabase::Statement SqliteDatabase::prepare(
     const Regulator& regulator, const char (&sqlCode)[size]) {
   return prepare(regulator, kj::StringPtr(sqlCode, size - 1));
+}
+
+inline SqliteDatabase::Statement SqliteDatabase::prepareMulti(
+    const Regulator& regulator, kj::String sqlCode) {
+  return Statement(*this, regulator, kj::mv(sqlCode));
 }
 
 }  // namespace workerd

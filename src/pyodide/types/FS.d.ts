@@ -12,7 +12,7 @@ interface TarFSInfo {
   name: string;
   parts: string[];
   contentsOffset?: number;
-  reader?: Reader;
+  reader: Reader | null;
 }
 
 declare type MetadataDirInfo = Map<string, MetadataDirInfo>;
@@ -29,7 +29,7 @@ interface FS {
     mode: number
   ): FSNode<Info>;
   isFile: (mode: number) => boolean;
-  readdir: (path: string) => Array<string>;
+  readdir: (path: string) => string[];
   genericErrors: Error[];
 }
 

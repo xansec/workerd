@@ -20,17 +20,17 @@
 namespace workerd::jsg {
 
 bool getCaptureThrowsAsRejections(v8::Isolate* isolate) {
-  auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(0));
+  auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(SET_DATA_ISOLATE_BASE));
   return jsgIsolate.getCaptureThrowsAsRejections();
 }
 
 bool getCommonJsExportDefault(v8::Isolate* isolate) {
-  auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(0));
+  auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(SET_DATA_ISOLATE_BASE));
   return jsgIsolate.getCommonJsExportDefault();
 }
 
 bool getShouldSetToStringTag(v8::Isolate* isolate) {
-  auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(0));
+  auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(SET_DATA_ISOLATE_BASE));
   return jsgIsolate.shouldSetToStringTag();
 }
 
@@ -474,7 +474,7 @@ void throwTunneledException(v8::Isolate* isolate, v8::Local<v8::Value> exception
 }
 
 kj::Exception createTunneledException(v8::Isolate* isolate, v8::Local<v8::Value> exception) {
-  auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(0));
+  auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(SET_DATA_ISOLATE_BASE));
   return jsgIsolate.unwrapException(isolate->GetCurrentContext(), exception);
 }
 
@@ -621,7 +621,7 @@ class ExternString: public Type {
   // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
   // IN THE SOFTWARE.
 
-public:
+ public:
   inline const Data* data() const override {
     return buf.begin();
   }
@@ -665,7 +665,7 @@ public:
     return str;
   }
 
-private:
+ private:
   v8::Isolate* isolate;
   kj::ArrayPtr<const Data> buf;
 

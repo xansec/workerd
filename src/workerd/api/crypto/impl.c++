@@ -218,6 +218,10 @@ bool CryptoKey::Impl::equals(const kj::Array<kj::byte>& other) const {
   KJ_FAIL_REQUIRE("Unable to compare raw key material for this key");
 }
 
+bool CryptoKey::Impl::equals(const jsg::BufferSource& other) const {
+  KJ_FAIL_REQUIRE("Unable to compare raw key material for this key");
+}
+
 kj::Own<CryptoKey::Impl> CryptoKey::Impl::from(kj::Own<EVP_PKEY> key) {
   switch (EVP_PKEY_id(key.get())) {
     case EVP_PKEY_RSA:
@@ -273,6 +277,29 @@ kj::Maybe<kj::Array<kj::byte>> bignumToArrayPadded(const BIGNUM& n, size_t padde
     return kj::none;
   }
   return kj::mv(result);
+}
+
+kj::Maybe<jsg::BufferSource> bignumToArray(jsg::Lock& js, const BIGNUM& n) {
+  auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, BN_num_bytes(&n));
+  if (BN_bn2bin(&n, backing.asArrayPtr().begin()) != backing.size()) return kj::none;
+  return jsg::BufferSource(js, kj::mv(backing));
+}
+
+kj::Maybe<jsg::BufferSource> bignumToArrayPadded(jsg::Lock& js, const BIGNUM& n) {
+  auto result = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, BN_num_bytes(&n));
+  if (BN_bn2binpad(&n, result.asArrayPtr().begin(), result.size()) != result.size()) {
+    return kj::none;
+  }
+  return jsg::BufferSource(js, kj::mv(result));
+}
+
+kj::Maybe<jsg::BufferSource> bignumToArrayPadded(
+    jsg::Lock& js, const BIGNUM& n, size_t paddedLength) {
+  auto result = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, paddedLength);
+  if (BN_bn2bin_padded(result.asArrayPtr().begin(), paddedLength, &n) == 0) {
+    return kj::none;
+  }
+  return jsg::BufferSource(js, kj::mv(result));
 }
 
 kj::Own<BIGNUM> newBignum() {

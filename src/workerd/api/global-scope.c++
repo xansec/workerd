@@ -471,16 +471,17 @@ kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(kj:
             !jsg::isDoNotLogException(desc) && context.isOutputGateBroken()) {
           LOG_NOSENTRY(ERROR, "output lock broke during alarm execution", actorId, e);
         } else if (context.isOutputGateBroken()) {
-          // We don't usually log these messages, but it's useful to know the real reason we failed
-          // to correctly investigate stuck alarms.
-          LOG_NOSENTRY(ERROR,
-              "output lock broke during alarm execution without an interesting error description",
-              actorId, e);
           if (e.getDetail(jsg::EXCEPTION_IS_USER_ERROR) != kj::none) {
             // The handler failed because the user overloaded the object. It's their fault, we'll not
             // retry forever.
             shouldRetryCountsAgainstLimits = true;
           }
+
+          // We don't usually log these messages, but it's useful to know the real reason we failed
+          // to correctly investigate stuck alarms.
+          LOG_NOSENTRY(ERROR,
+              "output lock broke during alarm execution without an interesting error description",
+              actorId, e, shouldRetryCountsAgainstLimits);
         }
         return WorkerInterface::AlarmResult{.retry = true,
           .retryCountsAgainstLimit = shouldRetryCountsAgainstLimits,
@@ -511,16 +512,16 @@ kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(kj:
               LOG_NOSENTRY(ERROR, "output lock broke after executing alarm", actorId, e);
             }
           } else {
-            // We don't usually log these messages, but it's useful to know the real reason we failed
-            // to correctly investigate stuck alarms.
-            LOG_NOSENTRY(ERROR,
-                "output lock broke after executing alarm without an interesting error description",
-                actorId, e);
             if (e.getDetail(jsg::EXCEPTION_IS_USER_ERROR) != kj::none) {
               // The handler failed because the user overloaded the object. It's their fault, we'll not
               // retry forever.
               shouldRetryCountsAgainstLimits = true;
             }
+            // We don't usually log these messages, but it's useful to know the real reason we failed
+            // to correctly investigate stuck alarms.
+            LOG_NOSENTRY(ERROR,
+                "output lock broke after executing alarm without an interesting error description",
+                actorId, e, shouldRetryCountsAgainstLimits);
           }
           return WorkerInterface::AlarmResult{.retry = true,
             .retryCountsAgainstLimit = shouldRetryCountsAgainstLimits,
@@ -849,15 +850,8 @@ jsg::JsValue resolveFromRegistry(jsg::Lock& js, kj::StringPtr specifier) {
   auto& info = JSG_REQUIRE_NONNULL(
       moduleRegistry->resolve(js, spec), Error, kj::str("No such module: ", specifier));
   auto module = info.module.getHandle(js);
-  jsg::instantiateModule(js, module);
 
-  auto handle = jsg::check(module->Evaluate(js.v8Context()));
-  KJ_ASSERT(handle->IsPromise());
-  auto prom = handle.As<v8::Promise>();
-  KJ_ASSERT(prom->State() != v8::Promise::PromiseState::kPending);
-  if (module->GetStatus() == v8::Module::kErrored) {
-    jsg::throwTunneledException(js.v8Isolate, module->GetException());
-  }
+  jsg::instantiateModule(js, module);
   return jsg::JsValue(js.v8Get(module->GetModuleNamespace().As<v8::Object>(), "default"_kj));
 }
 }  // namespace

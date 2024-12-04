@@ -73,6 +73,11 @@
       "downloaded_file_path": "downloaded.exe"
     },
     {
+      "name": "cxxbridge-cmd",
+      "type": "crate",
+      "build_file": "//deps/rust:BUILD.cxxbridge-cmd"
+    },
+    {
       "name": "aspect_rules_esbuild",
       "type": "github_release",
       "owner": "aspect-build",
@@ -86,6 +91,15 @@
       "type": "github_release",
       "owner": "bazelbuild",
       "repo": "rules_pkg",
+      "file_regex": "\\.tar\\.gz$"
+    },
+    {
+      // Needed for running the latest Node.js due to aspect_rules_js using older
+      // version by default
+      "name": "rules_nodejs",
+      "type": "github_release",
+      "owner": "bazel-contrib",
+      "repo": "rules_nodejs",
       "file_regex": "\\.tar\\.gz$"
     },
     {
@@ -113,9 +127,48 @@
       "type": "github_release",
       "owner": "aspect-build",
       "repo": "rules_ts",
-      "file_regex": "^rules_ts-",
-      // TODO(cleanup): Unpinning causes http-test@ts_project_typecheck_test to fail on Windows
-      "freeze_version": "v3.1.0"
+      "file_regex": "^rules_ts-"
+    },
+    //buildifier
+    {
+      "name": "buildifier-linux-amd64",
+      "type": "github_release",
+      "owner": "bazelbuild",
+      "repo": "buildtools",
+      "file_regex": "^buildifier-linux-amd64$",
+      "file_type": "executable"
+    },
+    {
+      "name": "buildifier-linux-arm64",
+      "type": "github_release",
+      "owner": "bazelbuild",
+      "repo": "buildtools",
+      "file_regex": "^buildifier-linux-arm64$",
+      "file_type": "executable"
+    },
+    {
+      "name": "buildifier-darwin-amd64",
+      "type": "github_release",
+      "owner": "bazelbuild",
+      "repo": "buildtools",
+      "file_regex": "^buildifier-darwin-amd64$",
+      "file_type": "executable"
+    },
+    {
+      "name": "buildifier-darwin-arm64",
+      "type": "github_release",
+      "owner": "bazelbuild",
+      "repo": "buildtools",
+      "file_regex": "^buildifier-darwin-arm64$",
+      "file_type": "executable"
+    },
+    {
+      "name": "buildifier-windows-amd64",
+      "type": "github_release",
+      "owner": "bazelbuild",
+      "repo": "buildtools",
+      "file_regex": "^buildifier-windows-amd64.exe$",
+      "file_type": "executable"
     }
   ]
 }

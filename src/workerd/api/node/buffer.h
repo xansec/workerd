@@ -11,7 +11,7 @@ namespace workerd::api::node {
 
 // Implements utilities in support of the Node.js Buffer
 class BufferUtil final: public jsg::Object {
-public:
+ public:
   BufferUtil() = default;
   BufferUtil(jsg::Lock&, const jsg::Url&) {}
 
@@ -31,9 +31,9 @@ public:
       kj::Array<kj::byte> two,
       jsg::Optional<CompareOptions> maybeOptions);
 
-  kj::Array<kj::byte> concat(jsg::Lock& js, kj::Array<kj::Array<kj::byte>> list, uint32_t length);
+  jsg::BufferSource concat(jsg::Lock& js, kj::Array<kj::Array<kj::byte>> list, uint32_t length);
 
-  kj::Array<kj::byte> decodeString(jsg::Lock& js, jsg::JsString string, EncodingValue encoding);
+  jsg::BufferSource decodeString(jsg::Lock& js, jsg::JsString string, EncodingValue encoding);
 
   void fillImpl(jsg::Lock& js,
       kj::Array<kj::byte> buffer,
@@ -77,8 +77,10 @@ public:
   jsg::JsString flush(jsg::Lock& js, kj::Array<kj::byte> state);
   bool isAscii(kj::Array<kj::byte> bytes);
   bool isUtf8(kj::Array<kj::byte> bytes);
-  kj::Array<kj::byte> transcode(
-      kj::Array<kj::byte> source, EncodingValue rawFromEncoding, EncodingValue rawToEncoding);
+  jsg::BufferSource transcode(jsg::Lock& js,
+      kj::Array<kj::byte> source,
+      EncodingValue rawFromEncoding,
+      EncodingValue rawToEncoding);
 
   JSG_RESOURCE_TYPE(BufferUtil) {
     JSG_METHOD(byteLength);

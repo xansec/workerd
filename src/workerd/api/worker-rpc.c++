@@ -23,7 +23,7 @@ using StreamSinkFulfiller = kj::Own<kj::PromiseFulfiller<rpc::JsValue::StreamSin
 // provide the appropriate destination capability. This class is designed to allow these two
 // calls to happen in either order for each slot.
 class StreamSinkImpl final: public rpc::JsValue::StreamSink::Server, public kj::Refcounted {
-public:
+ public:
   ~StreamSinkImpl() noexcept(false) {
     for (auto& slot: table) {
       KJ_IF_SOME(f, slot.tryGet<StreamFulfiller>()) {
@@ -80,7 +80,7 @@ public:
     return kj::READY_NOW;
   }
 
-private:
+ private:
   using StreamFulfiller = kj::Own<kj::PromiseFulfiller<capnp::Capability::Client>>;
   struct Consumed {};
 
@@ -261,7 +261,7 @@ jsg::JsValue deserializeRpcReturnValue(
 //
 // TODO(cleanup): This is generally useful, should it be part of capnp?
 class CompletionMembrane final: public capnp::MembranePolicy, public kj::Refcounted {
-public:
+ public:
   explicit CompletionMembrane(kj::Own<kj::PromiseFulfiller<void>> doneFulfiller)
       : doneFulfiller(kj::mv(doneFulfiller)) {}
   ~CompletionMembrane() noexcept(false) {
@@ -282,7 +282,7 @@ public:
     return kj::addRef(*this);
   }
 
-private:
+ private:
   kj::Own<kj::PromiseFulfiller<void>> doneFulfiller;
 };
 
@@ -290,7 +290,7 @@ private:
 //
 // TODO(cleanup): This is generally useful, should it be part of capnp?
 class RevokerMembrane final: public capnp::MembranePolicy, public kj::Refcounted {
-public:
+ public:
   explicit RevokerMembrane(kj::Promise<void> promise): promise(promise.fork()) {}
 
   kj::Maybe<capnp::Capability::Client> inboundCall(
@@ -311,7 +311,7 @@ public:
     return promise.addBranch();
   }
 
-private:
+ private:
   kj::ForkedPromise<void> promise;
 };
 
@@ -924,7 +924,7 @@ static MakeCallPipeline::Result makeCallPipeline(jsg::Lock& js, jsg::JsValue val
 // of a top-level entrypoint vs. a transient object introduced by a previous RPC in the same
 // session.
 class JsRpcTargetBase: public rpc::JsRpcTarget::Server {
-public:
+ public:
   JsRpcTargetBase(IoContext& ctx): weakIoContext(ctx.getWeakRef()) {}
 
   struct EnvCtx {
@@ -951,6 +951,8 @@ public:
   kj::Promise<void> call(CallContext callContext) override {
     IoContext& ctx = JSG_REQUIRE_NONNULL(
         weakIoContext->tryGet(), Error, "The destination object for this RPC no longer exists.");
+
+    ctx.getLimitEnforcer().topUpActor();
 
     // HACK: Cap'n Proto call contexts are documented as being pointer-like types where the backing
     // object's lifetime is that of the RPC call, but in reality they are refcounted under the
@@ -1144,10 +1146,10 @@ public:
 
   KJ_DISALLOW_COPY_AND_MOVE(JsRpcTargetBase);
 
-protected:
+ protected:
   kj::Own<IoContext::WeakRef> weakIoContext;
 
-private:
+ private:
   // Returns true if the given name cannot be used as a method on this type.
   virtual bool isReservedName(kj::StringPtr name) = 0;
 
@@ -1401,7 +1403,7 @@ private:
 };
 
 class TransientJsRpcTarget final: public JsRpcTargetBase {
-public:
+ public:
   TransientJsRpcTarget(
       jsg::Lock& js, IoContext& ioCtx, jsg::JsObject object, bool allowInstanceProperties = false)
       : JsRpcTargetBase(ioCtx),
@@ -1449,7 +1451,7 @@ public:
     };
   }
 
-private:
+ private:
   struct Handles {
     jsg::JsRef<jsg::JsObject> object;
     kj::Maybe<jsg::V8Ref<v8::Function>> dispose;
@@ -1601,7 +1603,7 @@ void RpcSerializerExternalHander::serializeFunction(
 // JsRpcTarget implementation specific to entrypoints. This is used to deliver the first, top-level
 // call of an RPC session.
 class EntrypointJsRpcTarget final: public JsRpcTargetBase {
-public:
+ public:
   EntrypointJsRpcTarget(IoContext& ioCtx,
       kj::Maybe<kj::StringPtr> entrypointName,
       kj::Maybe<kj::Own<WorkerTracer>> tracer)
@@ -1645,7 +1647,7 @@ public:
     return targetInfo;
   }
 
-private:
+ private:
   kj::Maybe<kj::String> entrypointName;
   kj::Maybe<kj::Own<WorkerTracer>> tracer;
 
@@ -1671,7 +1673,7 @@ private:
 
   void addTrace(jsg::Lock& js, IoContext& ioctx, kj::StringPtr methodName) override {
     KJ_IF_SOME(t, tracer) {
-      t->setEventInfo(ioctx.now(), Trace::JsRpcEventInfo(kj::str(methodName)));
+      t->setEventInfo(ioctx.now(), tracing::JsRpcEventInfo(kj::str(methodName)));
     }
   }
 };
@@ -1685,7 +1687,7 @@ private:
 // would create a cycle.
 class JsRpcSessionCustomEventImpl::ServerTopLevelMembrane final: public capnp::MembranePolicy,
                                                                  public kj::Refcounted {
-public:
+ public:
   explicit ServerTopLevelMembrane(kj::Own<kj::PromiseFulfiller<void>> doneFulfiller)
       : doneFulfiller(kj::mv(doneFulfiller)) {}
   ~ServerTopLevelMembrane() noexcept(false) {
@@ -1712,7 +1714,7 @@ public:
     return kj::addRef(*this);
   }
 
-private:
+ private:
   kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> doneFulfiller;
 };
 

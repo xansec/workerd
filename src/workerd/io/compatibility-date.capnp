@@ -430,7 +430,7 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   pythonWorkers @43 :Bool
       $compatEnableFlag("python_workers")
       $pythonSnapshotRelease(pyodide = "0.26.0a2", pyodideRevision = "2024-03-01",
-          packages = "2024-03-01", backport = 3,
+          packages = "2024-03-01", backport = 10,
           baselineSnapshotHash = "d13ce2f4a0ade2e09047b469874dacf4d071ed3558fec4c26f8d0b99d95f77b5")
       $impliedByAfterDate(name = "pythonWorkersDevPyodide", date = "2000-01-01");
   # Enables Python Workers. Access to this flag is not restricted, instead bundles containing
@@ -500,8 +500,7 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
 
   globalFetchStrictlyPublic @51 :Bool
       $compatEnableFlag("global_fetch_strictly_public")
-      $compatDisableFlag("global_fetch_private_origin")
-      $experimental;
+      $compatDisableFlag("global_fetch_private_origin");
   # Controls what happens when a Worker hosted on Cloudflare uses the global `fetch()` function to
   # request a hostname that is within the Worker's own Cloudflare zone (domain).
   #
@@ -547,8 +546,8 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   cacheOptionEnabled @53 :Bool
     $compatEnableFlag("cache_option_enabled")
     $compatDisableFlag("cache_option_disabled")
-    $experimental;
-  # Enables the use of no-cache and no-store headers from requests
+    $compatEnableDate("2024-11-11");
+  # Enables the use of no-store headers from requests
 
   kvDirectBinding @54 :Bool
       $compatEnableFlag("kv_direct_binding")
@@ -623,13 +622,8 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # compatibility flag we arrange to have such promise continuations scheduled to run
   # in the correct IoContext if it is still alive, or dropped on the floor with a warning
   # if the correct IoContext is not still alive.
-  pythonExternalBundle @63 :Bool
-      $compatEnableFlag("python_external_bundle")
+  obsolete63 @63 :Bool
       $experimental;
-  # Temporary flag to load Python from external capnproto bundle loaded at runtime.
-  # We plan to turn this on always quite soon. It would be an autogate but we need to test
-  # our logic both at upload time and at runtime, and this seemed like the easiest way to
-  # make sure we keep things in sync.
 
   setToStringTag @64 :Bool
       $compatEnableFlag("set_tostring_tag")
@@ -651,4 +645,27 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # accepted). This is a bit restrictive, even if it is in the spec. This flag modifies
   # the behavior to uppercase all methods prior to parsing to that the method is always
   # recognized if it is a known method.
+
+  pythonExternalPackages @66 :Bool
+      $compatEnableFlag("python_external_packages");
+  # Temporary flag to load Python packages from external bundle loaded at runtime.
+  #
+  # This is a compat flag so that we can opt in our test workers into it before rolling out to
+  # everyone.
+
+  noTopLevelAwaitInRequire @67 :Bool
+      $compatEnableFlag("disable_top_level_await_in_require")
+      $compatDisableFlag("enable_top_level_await_in_require")
+      $compatEnableDate("2024-12-02");
+  # When enabled, use of top-level await syntax in require() calls will be disallowed.
+  # The ecosystem and runtimes are moving to a state where top level await in modules
+  # is being strongly discouraged.
+
+  fixupTransformStreamBackpressure @68 :Bool
+      $compatEnableFlag("fixup-transform-stream-backpressure")
+      $compatDisableFlag("original-transform-stream-backpressure")
+      $compatEnableDate("2024-12-16");
+  # A bug in the original implementation of TransformStream failed to apply backpressure
+  # correctly. The fix, however, can break existing implementations that don't account
+  # for the bug so we need to put the fix behind a compat flag.
 }

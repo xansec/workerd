@@ -157,12 +157,11 @@ const win32 = {
     let resolvedDevice = '';
     let resolvedTail = '';
     let resolvedAbsolute = false;
-    let slashCheck = false;
 
     for (let i = args.length - 1; i >= -1; i--) {
-      let path: string;
+      let path;
       if (i >= 0) {
-        path = args[i] as string;
+        path = args[i];
         validateString(path, `paths[${i}]`);
 
         // Skip empty entries
@@ -189,12 +188,6 @@ const win32 = {
         }
       }
 
-      if (
-        i === args.length - 1 &&
-        isPathSeparator(path.charCodeAt(path.length - 1))
-      ) {
-        slashCheck = true;
-      }
       const len = path.length;
       let rootEnd = 0;
       let device = '';
@@ -239,15 +232,9 @@ const win32 = {
                 j++;
               }
               if (j === len || j !== last) {
-                if (firstPart !== '.' && firstPart !== '?') {
-                  // We matched a UNC root
-                  device = `\\\\${firstPart}\\${path.slice(last, j)}`;
-                  rootEnd = j;
-                } else {
-                  // We matched a device root (e.g. \\\\.\\PHYSICALDRIVE0)
-                  device = `\\\\${firstPart}`;
-                  rootEnd = 4;
-                }
+                // We matched a UNC root
+                device = `\\\\${firstPart}\\${path.slice(last, j)}`;
+                rootEnd = j;
               }
             }
           }
@@ -302,21 +289,9 @@ const win32 = {
       isPathSeparator
     );
 
-    if (!resolvedAbsolute) {
-      return `${resolvedDevice}${resolvedTail}` || '.';
-    }
-
-    if (resolvedTail.length === 0) {
-      return slashCheck ? `${resolvedDevice}\\` : resolvedDevice;
-    }
-
-    if (slashCheck) {
-      return resolvedTail === '\\'
-        ? `${resolvedDevice}\\`
-        : `${resolvedDevice}\\${resolvedTail}\\`;
-    }
-
-    return `${resolvedDevice}\\${resolvedTail}`;
+    return resolvedAbsolute
+      ? `${resolvedDevice}\\${resolvedTail}`
+      : `${resolvedDevice}${resolvedTail}` || '.';
   },
 
   normalize(path: string): string {
@@ -364,21 +339,16 @@ const win32 = {
             while (j < len && !isPathSeparator(path.charCodeAt(j))) {
               j++;
             }
-            if (j === len || j !== last) {
-              if (firstPart === '.' || firstPart === '?') {
-                // We matched a device root (e.g. \\\\.\\PHYSICALDRIVE0)
-                device = `\\\\${firstPart}`;
-                rootEnd = 4;
-              } else if (j === len) {
-                // We matched a UNC root only
-                // Return the normalized version of the UNC root since there
-                // is nothing left to process
-                return `\\\\${firstPart}\\${path.slice(last)}\\`;
-              } else {
-                // We matched a UNC root with leftovers
-                device = `\\\\${firstPart}\\${path.slice(last, j)}`;
-                rootEnd = j;
-              }
+            if (j === len) {
+              // We matched a UNC root only
+              // Return the normalized version of the UNC root since there
+              // is nothing left to process
+              return `\\\\${firstPart}\\${path.slice(last)}\\`;
+            }
+            if (j !== last) {
+              // We matched a UNC root with leftovers
+              device = `\\\\${firstPart}\\${path.slice(last, j)}`;
+              rootEnd = j;
             }
           }
         }
@@ -1072,10 +1042,9 @@ const posix = {
     let resolvedPath = '';
     let resolvedAbsolute = false;
 
-    for (let i = args.length - 1; i >= -1 && !resolvedAbsolute; i--) {
-      const path = i >= 0 ? args[i] : '/';
-
-      validateString(path, 'path');
+    for (let i = args.length - 1; i >= 0 && !resolvedAbsolute; i--) {
+      const path = args[i];
+      validateString(path, `paths[${i}]`);
 
       // Skip empty entries
       if (path.length === 0) {
@@ -1084,6 +1053,12 @@ const posix = {
 
       resolvedPath = `${path}/${resolvedPath}`;
       resolvedAbsolute = path.charCodeAt(0) === CHAR_FORWARD_SLASH;
+    }
+
+    if (!resolvedAbsolute) {
+      const cwd = '/';
+      resolvedPath = `${cwd}/${resolvedPath}`;
+      resolvedAbsolute = true;
     }
 
     // At this point the path should be resolved to a full absolute path, but
@@ -1097,6 +1072,7 @@ const posix = {
       isPosixPathSeparator
     );
 
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     if (resolvedAbsolute) {
       return `/${resolvedPath}`;
     }
@@ -1173,11 +1149,41 @@ const posix = {
 
     if (from === to) return '';
 
-    const fromStart = 1;
-    const fromEnd = from.length;
+    // Trim any leading slashes
+    let fromStart = 0;
+    while (
+      fromStart < from.length &&
+      from.charCodeAt(fromStart) === CHAR_FORWARD_SLASH
+    ) {
+      fromStart++;
+    }
+    // Trim trailing slashes
+    let fromEnd = from.length;
+    while (
+      fromEnd - 1 > fromStart &&
+      from.charCodeAt(fromEnd - 1) === CHAR_FORWARD_SLASH
+    ) {
+      fromEnd--;
+    }
     const fromLen = fromEnd - fromStart;
-    const toStart = 1;
-    const toLen = to.length - toStart;
+
+    // Trim any leading slashes
+    let toStart = 0;
+    while (
+      toStart < to.length &&
+      to.charCodeAt(toStart) === CHAR_FORWARD_SLASH
+    ) {
+      toStart++;
+    }
+    // Trim trailing slashes
+    let toEnd = to.length;
+    while (
+      toEnd - 1 > toStart &&
+      to.charCodeAt(toEnd - 1) === CHAR_FORWARD_SLASH
+    ) {
+      toEnd--;
+    }
+    const toLen = toEnd - toStart;
 
     // Compare paths to find the longest common path from root
     const length = fromLen < toLen ? fromLen : toLen;

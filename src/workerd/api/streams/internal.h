@@ -8,6 +8,7 @@
 #include "writable.h"
 
 #include <workerd/io/io-context.h>
+#include <workerd/io/observer.h>
 
 #include <deque>
 
@@ -35,7 +36,7 @@ namespace workerd::api {
 class WritableStreamInternalController;
 
 class ReadableStreamInternalController: public ReadableStreamController {
-public:
+ public:
   using Readable = IoOwn<ReadableStreamSource>;
 
   explicit ReadableStreamInternalController(StreamStates::Closed closed): state(closed) {}
@@ -95,7 +96,7 @@ public:
 
   void visitForGc(jsg::GcVisitor& visitor) override;
 
-  jsg::Promise<kj::Array<byte>> readAllBytes(jsg::Lock& js, uint64_t limit) override;
+  jsg::Promise<jsg::BufferSource> readAllBytes(jsg::Lock& js, uint64_t limit) override;
   jsg::Promise<kj::String> readAllText(jsg::Lock& js, uint64_t limit) override;
 
   kj::Maybe<uint64_t> tryGetLength(StreamEncoding encoding) override;
@@ -115,13 +116,13 @@ public:
   size_t jsgGetMemorySelfSize() const override;
   void jsgGetMemoryInfo(jsg::MemoryTracker& info) const override;
 
-private:
+ private:
   void doCancel(jsg::Lock& js, jsg::Optional<v8::Local<v8::Value>> reason);
   void doClose(jsg::Lock& js);
   void doError(jsg::Lock& js, v8::Local<v8::Value> reason);
 
   class PipeLocked: public PipeController {
-  public:
+   public:
     PipeLocked(ReadableStreamInternalController& inner, jsg::Ref<WritableStream> ref)
         : inner(inner),
           ref(kj::mv(ref)) {}
@@ -150,7 +151,7 @@ private:
     size_t jsgGetMemorySelfSize() const;
     void jsgGetMemoryInfo(jsg::MemoryTracker& info) const;
 
-  private:
+   private:
     ReadableStreamInternalController& inner;
     jsg::Ref<WritableStream> ref;
   };
@@ -171,7 +172,7 @@ private:
 };
 
 class WritableStreamInternalController: public WritableStreamController {
-public:
+ public:
   struct Writable {
     kj::Own<WritableStreamSink> sink;
     kj::Canceler canceler;
@@ -183,9 +184,11 @@ public:
   explicit WritableStreamInternalController(StreamStates::Errored errored)
       : state(kj::mv(errored)) {}
   explicit WritableStreamInternalController(kj::Own<WritableStreamSink> writable,
+      kj::Maybe<kj::Own<ByteStreamObserver>> observer,
       kj::Maybe<uint64_t> maybeHighWaterMark = kj::none,
       kj::Maybe<jsg::Promise<void>> maybeClosureWaitable = kj::none)
       : state(IoContext::current().addObject(kj::heap<Writable>(kj::mv(writable)))),
+        observer(kj::mv(observer)),
         maybeHighWaterMark(maybeHighWaterMark),
         maybeClosureWaitable(kj::mv(maybeClosureWaitable)) {}
 
@@ -251,7 +254,7 @@ public:
   size_t jsgGetMemorySelfSize() const override;
   void jsgGetMemoryInfo(jsg::MemoryTracker& info) const override;
 
-private:
+ private:
   struct AbortOptions {
     bool reject = false;
     bool handled = false;
@@ -278,6 +281,8 @@ private:
   kj::Maybe<WritableStream&> owner;
   kj::OneOf<StreamStates::Closed, StreamStates::Errored, IoOwn<Writable>> state;
   kj::OneOf<Unlocked, Locked, PipeLocked, WriterLocked> writeState = Unlocked();
+
+  kj::Maybe<kj::Own<ByteStreamObserver>> observer;
 
   kj::Maybe<PendingAbort> maybePendingAbort;
 
@@ -385,7 +390,7 @@ class IdentityTransformStreamImpl: public kj::Refcounted,
                                    public WritableStreamSink {
   // TODO(soon): Reimplement this in terms of kj::OneWayPipe, so we can optimize pumpTo().
 
-public:
+ public:
   explicit IdentityTransformStreamImpl(kj::Maybe<uint64_t> limit = kj::none): limit(limit) {}
 
   ~IdentityTransformStreamImpl() noexcept(false) {
@@ -420,7 +425,7 @@ public:
 
   void abort(kj::Exception reason) override;
 
-private:
+ private:
   kj::Promise<size_t> readHelper(kj::ArrayPtr<kj::byte> bytes);
 
   kj::Promise<void> writeHelper(kj::ArrayPtr<const kj::byte> bytes);

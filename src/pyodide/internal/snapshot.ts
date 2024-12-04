@@ -5,7 +5,7 @@ import {
   SITE_PACKAGES,
   getSitePackagesPath,
 } from 'pyodide-internal:setupPackages';
-import { default as TarReader } from 'pyodide-internal:packages_tar_reader';
+import { default as EmbeddedPackagesTarReader } from 'pyodide-internal:packages_tar_reader';
 import {
   SHOULD_SNAPSHOT_TO_DISK,
   IS_CREATING_BASELINE_SNAPSHOT,
@@ -118,21 +118,7 @@ const PRELOADED_SO_FILES: string[] = [];
  */
 export function preloadDynamicLibs(Module: Module): void {
   let SO_FILES_TO_LOAD = SITE_PACKAGES.soFiles;
-  if (LOADED_BASELINE_SNAPSHOT && LOADED_SNAPSHOT_VERSION === 1) {
-    // Ideally this should be just
-    // [[ '_lzma.so' ], [ '_ssl.so' ]]
-    // but we put a few more because we messed up the memory snapshot...
-    SO_FILES_TO_LOAD = [
-      ['_hashlib.so'],
-      ['_lzma.so'],
-      ['_sqlite3.so'],
-      ['_ssl.so'],
-    ];
-  }
-  if (
-    IS_CREATING_BASELINE_SNAPSHOT ||
-    (LOADED_BASELINE_SNAPSHOT && LOADED_SNAPSHOT_VERSION === 2)
-  ) {
+  if (IS_CREATING_BASELINE_SNAPSHOT || LOADED_BASELINE_SNAPSHOT) {
     SO_FILES_TO_LOAD = [['_lzma.so'], ['_ssl.so']];
   }
   try {
@@ -150,7 +136,10 @@ export function preloadDynamicLibs(Module: Module): void {
         throw Error('contentsOffset not defined for ' + soFile);
       }
       const wasmModuleData = new Uint8Array(size);
-      TarReader.read(contentsOffset, wasmModuleData);
+      (node.reader ?? EmbeddedPackagesTarReader).read(
+        contentsOffset,
+        wasmModuleData
+      );
       const path = sitePackages + '/' + soFile.join('/');
       PRELOADED_SO_FILES.push(path);
       loadDynlib(Module, path, wasmModuleData);
@@ -199,7 +188,6 @@ function recordDsoHandles(Module: Module): DylinkInfo {
 // whose importer is not FrozenImporter or BuiltinImporter.
 //
 const SNAPSHOT_IMPORTS: string[] =
-  // @ts-ignore getSnapshotImports is a static method.
   ArtifactBundler.constructor.getSnapshotImports();
 
 /**
@@ -220,7 +208,7 @@ const SNAPSHOT_IMPORTS: string[] =
  *
  * This function returns a list of modules that have been imported.
  */
-function memorySnapshotDoImports(Module: Module): Array<string> {
+function memorySnapshotDoImports(Module: Module): string[] {
   const toImport = SNAPSHOT_IMPORTS.join(',');
   const toDelete = Array.from(
     new Set(SNAPSHOT_IMPORTS.map((x) => x.split('.', 1)[0]))
@@ -244,13 +232,12 @@ function memorySnapshotDoImports(Module: Module): Array<string> {
   // The `importedModules` list will contain all modules that have been imported, including local
   // modules, the usual `js` and other stdlib modules. We want to filter out local imports, so we
   // grab them and put them into a set for fast filtering.
-  const importedModules: Array<string> =
-    // @ts-ignore filterPythonScriptImportsJs is a static method.
+  const importedModules: string[] =
     ArtifactBundler.constructor.filterPythonScriptImportsJs(
       MetadataReader.getNames(),
-      ArtifactBundler.constructor
-        // @ts-ignore parsePythonScriptImports is a static method.
-        .parsePythonScriptImports(MetadataReader.getWorkerFiles('py'))
+      ArtifactBundler.constructor.parsePythonScriptImports(
+        MetadataReader.getWorkerFiles('py')
+      )
     );
 
   const deduplicatedModules = [...new Set(importedModules)];
@@ -299,7 +286,7 @@ function makeLinearMemorySnapshot(
 
 function setUploadFunction(
   snapshot: Uint8Array,
-  importedModulesList: Array<string>
+  importedModulesList: string[]
 ): void {
   if (snapshot.constructor.name !== 'Uint8Array') {
     throw new TypeError('Expected TO_UPLOAD to be a Uint8Array');
@@ -420,14 +407,6 @@ let TEST_SNAPSHOT: Uint8Array | undefined = undefined;
 })();
 
 export function finishSnapshotSetup(pyodide: Pyodide): void {
-  if (LOADED_SNAPSHOT_VERSION !== undefined) {
-    // Invalidate caches if we have a snapshot because the contents of site-packages may have changed.
-    simpleRunPython(
-      pyodide._module,
-      'from importlib import invalidate_caches as f; f(); del f'
-    );
-  }
-
   // This is just here for our test suite. Ugly but just about the only way to test this.
   if (TEST_SNAPSHOT) {
     const snapshotString = new TextDecoder().decode(TEST_SNAPSHOT);

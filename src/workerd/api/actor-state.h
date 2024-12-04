@@ -31,7 +31,7 @@ jsg::JsValue deserializeV8Value(
 // Common implementation of DurableObjectStorage and DurableObjectTransaction. This class is
 // designed to be used as a mixin.
 class DurableObjectStorageOperations {
-public:
+ public:
   struct GetOptions {
     jsg::Optional<bool> allowConcurrency;
     jsg::Optional<bool> noCache;
@@ -121,7 +121,7 @@ public:
       jsg::Lock& js, kj::Date scheduledTime, jsg::Optional<SetAlarmOptions> options);
   jsg::Promise<void> deleteAlarm(jsg::Lock& js, jsg::Optional<SetAlarmOptions> options);
 
-protected:
+ protected:
   typedef kj::StringPtr OpName;
   static constexpr OpName OP_GET = "get()"_kj;
   static constexpr OpName OP_GET_ALARM = "getAlarm()"_kj;
@@ -153,7 +153,7 @@ protected:
     return kj::mv(options);
   }
 
-private:
+ private:
   jsg::Promise<jsg::JsRef<jsg::JsValue>> getOne(
       jsg::Lock& js, kj::String key, const GetOptions& options);
   jsg::Promise<jsg::JsRef<jsg::JsValue>> getMultiple(
@@ -172,7 +172,7 @@ private:
 class DurableObjectTransaction;
 
 class DurableObjectStorage: public jsg::Object, public DurableObjectStorageOperations {
-public:
+ public:
   DurableObjectStorage(IoPtr<ActorCacheInterface> cache, bool enableSql)
       : cache(kj::mv(cache)),
         enableSql(enableSql) {}
@@ -227,6 +227,20 @@ public:
   // by calling state.abort() or by throwing from a blockConcurrencyWhile() callback.
   kj::Promise<kj::String> onNextSessionRestoreBookmark(kj::String bookmark);
 
+  // Wait until the database has been updated to the state represented by `bookmark`.
+  //
+  // `waitForBookmark` is useful synchronizing requests across replicas of the same database.  On
+  // primary databases, `waitForBookmark` will resolve immediately.  On replica databases,
+  // `waitForBookmark` will resolve when the replica has been updated to a point at or after
+  // `bookmark`.
+  kj::Promise<void> waitForBookmark(kj::String bookmark);
+
+  // Arrange to create replicas for this Durable Object.
+  //
+  // Once a Durable Object instance calls `ensureReplicas`, all subsequent calls will be no-ops,
+  // thus it is idempotent.
+  void ensureReplicas();
+
   JSG_RESOURCE_TYPE(DurableObjectStorage, CompatibilityFlags::Reader flags) {
     JSG_METHOD(get);
     JSG_METHOD(list);
@@ -246,6 +260,14 @@ public:
     JSG_METHOD(getBookmarkForTime);
     JSG_METHOD(onNextSessionRestoreBookmark);
 
+    if (flags.getWorkerdExperimental()) {
+      JSG_METHOD(waitForBookmark);
+    }
+
+    if (flags.getReplicaRouting()) {
+      JSG_METHOD(ensureReplicas);
+    }
+
     JSG_TS_OVERRIDE({
       get<T = unknown>(key: string, options?: DurableObjectGetOptions): Promise<T | undefined>;
       get<T = unknown>(keys: string[], options?: DurableObjectGetOptions): Promise<Map<string, T>>;
@@ -263,21 +285,21 @@ public:
     });
   }
 
-protected:
+ protected:
   ActorCacheOps& getCache(kj::StringPtr op) override;
 
   bool useDirectIo() override {
     return false;
   }
 
-private:
+ private:
   IoPtr<ActorCacheInterface> cache;
   bool enableSql;
   uint transactionSyncDepth = 0;
 };
 
 class DurableObjectTransaction final: public jsg::Object, public DurableObjectStorageOperations {
-public:
+ public:
   DurableObjectTransaction(IoOwn<ActorCacheInterface::Transaction> cacheTxn)
       : cacheTxn(kj::mv(cacheTxn)) {}
 
@@ -321,14 +343,14 @@ public:
     });
   }
 
-protected:
+ protected:
   ActorCacheOps& getCache(kj::StringPtr op) override;
 
   bool useDirectIo() override {
     return false;
   }
 
-private:
+ private:
   // Becomes null when committed or rolled back.
   kj::Maybe<IoOwn<ActorCacheInterface::Transaction>> cacheTxn;
 
@@ -342,7 +364,7 @@ private:
 // used for colo-local namespaces.
 class ActorState: public jsg::Object {
   // TODO(cleanup): Remove getPersistent method that isn't supported for colo-local actors anymore.
-public:
+ public:
   ActorState(Worker::Actor::Id actorId,
       kj::Maybe<jsg::JsRef<jsg::JsValue>> transient,
       kj::Maybe<jsg::Ref<DurableObjectStorage>> persistent);
@@ -380,14 +402,14 @@ public:
     tracker.trackField("persistent", persistent);
   }
 
-private:
+ private:
   Worker::Actor::Id id;
   kj::Maybe<jsg::JsRef<jsg::JsValue>> transient;
   kj::Maybe<jsg::Ref<DurableObjectStorage>> persistent;
 };
 
 class WebSocketRequestResponsePair: public jsg::Object {
-public:
+ public:
   WebSocketRequestResponsePair(kj::String request, kj::String response)
       : request(kj::mv(request)),
         response(kj::mv(response)) {};
@@ -414,14 +436,14 @@ public:
     tracker.trackField("response", response);
   }
 
-private:
+ private:
   kj::String request;
   kj::String response;
 };
 
 // The type passed as the first parameter to durable object class's constructor.
 class DurableObjectState: public jsg::Object {
-public:
+ public:
   DurableObjectState(Worker::Actor::Id actorId, kj::Maybe<jsg::Ref<DurableObjectStorage>> storage);
 
   void waitUntil(kj::Promise<void> promise);
@@ -531,7 +553,7 @@ public:
     tracker.trackField("storage", storage);
   }
 
-private:
+ private:
   Worker::Actor::Id id;
   kj::Maybe<jsg::Ref<DurableObjectStorage>> storage;
 

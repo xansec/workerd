@@ -122,7 +122,7 @@ static constexpr kj::StringPtr mainModuleName = "main"_kj;
 static constexpr kj::StringPtr scriptId = "script"_kj;
 
 class MockEntropySource final: public kj::EntropySource {
-public:
+ public:
   ~MockEntropySource() {}
   void generate(kj::ArrayPtr<kj::byte> buffer) override {
     for (kj::byte& b: buffer) {
@@ -137,7 +137,7 @@ public:
     return r;
   }
 
-private:
+ private:
   kj::byte counter = 0;
 };
 
@@ -282,7 +282,7 @@ struct MockResponse final: public kj::HttpService::Response {
 };
 
 class MockActorLoopback: public Worker::Actor::Loopback, public kj::Refcounted {
-public:
+ public:
   virtual kj::Own<WorkerInterface> getWorker(IoChannelFactory::SubrequestMetadata metadata) {
     return kj::Own<WorkerInterface>();
   };
@@ -319,21 +319,17 @@ TestFixture::TestFixture(SetupParams&& params)
           httpOverCapnpFactory,
           byteStreamFactory,
           false),
-      isolateLimitEnforcer(kj::heap<MockIsolateLimitEnforcer>()),
       errorReporter(kj::heap<MockErrorReporter>()),
       memoryCacheProvider(kj::heap<api::MemoryCacheProvider>(*timer)),
       api(kj::heap<server::WorkerdApi>(testV8System,
           params.featureFlags.orDefault(CompatibilityFlags::Reader()),
-          *isolateLimitEnforcer,
+          kj::heap<MockIsolateLimitEnforcer>(),
           kj::atomicRefcounted<IsolateObserver>(),
           *memoryCacheProvider,
           defaultPythonConfig,
           kj::none)),
-      workerIsolate(kj::atomicRefcounted<Worker::Isolate>(kj::mv(api),
-          kj::atomicRefcounted<IsolateObserver>(),
-          scriptId,
-          kj::mv(isolateLimitEnforcer),
-          Worker::Isolate::InspectorPolicy::DISALLOW)),
+      workerIsolate(kj::atomicRefcounted<Worker::Isolate>(
+          kj::mv(api), scriptId, Worker::Isolate::InspectorPolicy::DISALLOW)),
       workerScript(kj::atomicRefcounted<Worker::Script>(kj::atomicAddRef(*workerIsolate),
           scriptId,
           server::WorkerdApi::extractSource(mainModuleName,
@@ -349,7 +345,7 @@ TestFixture::TestFixture(SetupParams&& params)
             // no bindings, nothing to do
           },
           IsolateObserver::StartType::COLD,
-          nullptr /* parentSpan */,
+          TraceParentContext(nullptr, nullptr), /* spans */
           Worker::LockType(Worker::Lock::TakeSynchronously(kj::none)))),
       errorHandler(kj::heap<DummyErrorHandler>()),
       waitUntilTasks(*errorHandler),
@@ -359,7 +355,7 @@ TestFixture::TestFixture(SetupParams&& params)
       auto makeActorCache = [](const ActorCache::SharedLru& sharedLru, OutputGate& outputGate,
                                 ActorCache::Hooks& hooks, SqliteObserver& sqliteObserver) {
         return kj::heap<ActorCache>(
-            kj::heap<server::EmptyReadOnlyActorStorageImpl>(), sharedLru, outputGate, hooks);
+            server::newEmptyReadOnlyActorStorage(), sharedLru, outputGate, hooks);
       };
       auto makeStorage =
           [](jsg::Lock& js, const Worker::Api& api,
@@ -409,8 +405,10 @@ void TestFixture::runInIoContext(kj::Function<kj::Promise<void>(const Environmen
 kj::Own<IoContext::IncomingRequest> TestFixture::createIncomingRequest() {
   auto context = kj::refcounted<IoContext>(
       threadContext, kj::atomicAddRef(*worker), actor, kj::heap<MockLimitEnforcer>());
+  auto invocationSpanContext = tracing::InvocationSpanContext::newForInvocation(kj::none, kj::none);
   auto incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::addRef(*context),
-      kj::heap<DummyIoChannelFactory>(*timerChannel), kj::refcounted<RequestObserver>(), nullptr);
+      kj::heap<DummyIoChannelFactory>(*timerChannel), kj::refcounted<RequestObserver>(), nullptr,
+      kj::mv(invocationSpanContext));
   incomingRequest->delivered();
   return incomingRequest;
 }

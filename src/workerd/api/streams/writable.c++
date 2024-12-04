@@ -216,10 +216,14 @@ void WritableStreamDefaultWriter::visitForGc(jsg::GcVisitor& visitor) {
 
 WritableStream::WritableStream(IoContext& ioContext,
     kj::Own<WritableStreamSink> sink,
+    kj::Maybe<kj::Own<ByteStreamObserver>> maybeObserver,
     kj::Maybe<uint64_t> maybeHighWaterMark,
     kj::Maybe<jsg::Promise<void>> maybeClosureWaitable)
-    : WritableStream(newWritableStreamInternalController(
-          ioContext, kj::mv(sink), maybeHighWaterMark, kj::mv(maybeClosureWaitable))) {}
+    : WritableStream(newWritableStreamInternalController(ioContext,
+          kj::mv(sink),
+          kj::mv(maybeObserver),
+          maybeHighWaterMark,
+          kj::mv(maybeClosureWaitable))) {}
 
 WritableStream::WritableStream(kj::Own<WritableStreamController> controller)
     : ioContext(tryGetIoContext()),
@@ -297,7 +301,7 @@ namespace {
 
 // Wrapper around `WritableStreamSink` that makes it suitable for passing off to capnp RPC.
 class WritableStreamRpcAdapter final: public capnp::ExplicitEndOutputStream {
-public:
+ public:
   WritableStreamRpcAdapter(kj::Own<WritableStreamSink> inner): inner(kj::mv(inner)) {}
   ~WritableStreamRpcAdapter() noexcept(false) {
     weakRef->invalidate();
@@ -342,7 +346,7 @@ public:
     return canceler.wrap(getInner().end());
   }
 
-private:
+ private:
   kj::Maybe<kj::Own<WritableStreamSink>> inner;
   kj::Canceler canceler;
   kj::Own<kj::PromiseFulfiller<void>> doneFulfiller;
@@ -367,7 +371,7 @@ private:
 // directly on the WritableStreamController. Note that this approach is necessarily
 // a lot slower
 class WritableStreamJsRpcAdapter final: public capnp::ExplicitEndOutputStream {
-public:
+ public:
   WritableStreamJsRpcAdapter(IoContext& context, jsg::Ref<WritableStreamDefaultWriter> writer)
       : context(context),
         writer(kj::mv(writer)) {}
@@ -509,7 +513,7 @@ public:
     }));
   }
 
-private:
+ private:
   IoContext& context;
   kj::Maybe<jsg::Ref<WritableStreamDefaultWriter>> writer;
   kj::Canceler canceler;
@@ -611,7 +615,8 @@ jsg::Ref<WritableStream> WritableStream::deserialize(
   auto stream = ioctx.getByteStreamFactory().capnpToKjExplicitEnd(ws.getByteStream());
   auto sink = newSystemStream(kj::mv(stream), encoding, ioctx);
 
-  return jsg::alloc<WritableStream>(ioctx, kj::mv(sink));
+  return jsg::alloc<WritableStream>(
+      ioctx, kj::mv(sink), ioctx.getMetrics().tryCreateWritableByteStreamObserver());
 }
 
 void WritableStreamDefaultWriter::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {

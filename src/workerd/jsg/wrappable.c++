@@ -73,7 +73,7 @@ void HeapTracer::clearWrappers() {
 // major GC occurs, the freelist is cleared, since any unreachable CppgcShim objects are likely
 // condemned after that point and will be deleted shortly thereafter.
 class Wrappable::CppgcShim final: public cppgc::GarbageCollected<CppgcShim> {
-public:
+ public:
   CppgcShim(Wrappable& wrappable): state(Active{kj::addRef(wrappable)}) {
     KJ_DASSERT(wrappable.cppgcShim == kj::none);
     wrappable.cppgcShim = *this;
@@ -299,7 +299,7 @@ void Wrappable::maybeDeferDestruction(bool strong, kj::Own<void> ownSelf, Wrappa
     auto drop = kj::mv(item);
   } else {
     // Otherwise, we have a wrapper and we don't have the isolate locked.
-    auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(0));
+    auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(SET_DATA_ISOLATE_BASE));
     jsgIsolate.deferDestruction(kj::mv(item));
   }
 }

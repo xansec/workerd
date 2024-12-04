@@ -10,7 +10,7 @@
 namespace workerd::api {
 
 class Ec final {
-public:
+ public:
   static kj::Maybe<Ec> tryGetEc(const EVP_PKEY* key);
   Ec(EC_KEY* key);
 
@@ -36,11 +36,11 @@ public:
   SubtleCrypto::JsonWebKey toJwk(
       KeyType keyType, kj::StringPtr curveName) const KJ_WARN_UNUSED_RESULT;
 
-  kj::Array<kj::byte> getRawPublicKey() const KJ_WARN_UNUSED_RESULT;
+  jsg::BufferSource getRawPublicKey(jsg::Lock& js) const KJ_WARN_UNUSED_RESULT;
 
   CryptoKey::AsymmetricKeyDetails getAsymmetricKeyDetail() const;
 
-private:
+ private:
   EC_KEY* key;
   const EC_GROUP* group = nullptr;
   kj::Own<BIGNUM> x;

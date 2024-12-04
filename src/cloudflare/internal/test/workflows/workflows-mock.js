@@ -10,7 +10,7 @@ export default {
       return Response.json(
         {
           result: {
-            instanceId: data.id,
+            id: data.id,
           },
         },
         {
@@ -26,7 +26,7 @@ export default {
       return Response.json(
         {
           result: {
-            instanceId: data.id,
+            id: data.id,
           },
         },
         {

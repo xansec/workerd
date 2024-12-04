@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 #include "pyodide.h"
 
+#include <workerd/api/pyodide/setup-emscripten.h>
 #include <workerd/util/string-buffer.h>
 #include <workerd/util/strings.h>
 
@@ -25,16 +26,19 @@ void PyodideBundleManager::setPyodideBundleData(
     kj::String version, kj::Array<unsigned char> data) const {
   auto wordArray = kj::arrayPtr(
       reinterpret_cast<const capnp::word*>(data.begin()), data.size() / sizeof(capnp::word));
-  auto messageReader = kj::heap<capnp::FlatArrayMessageReader>(wordArray).attach(kj::mv(data));
+  // We're going to reuse this in the ModuleRegistry for every Python isolate, so set the traversal
+  // limit to infinity or else eventually a new Python isolate will fail.
+  auto messageReader = kj::heap<capnp::FlatArrayMessageReader>(
+      wordArray, capnp::ReaderOptions{.traversalLimitInWords = kj::maxValue})
+                           .attach(kj::mv(data));
   auto bundle = messageReader->getRoot<jsg::Bundle>();
   bundles.lockExclusive()->insert(
       kj::mv(version), {.messageReader = kj::mv(messageReader), .bundle = bundle});
 }
 
-const kj::Maybe<kj::ArrayPtr<const unsigned char>> PyodidePackageManager::getPyodidePackage(
+const kj::Maybe<const kj::Array<unsigned char>&> PyodidePackageManager::getPyodidePackage(
     kj::StringPtr id) const {
-  return packages.lockShared()->find(id).map(
-      [](const kj::Array<unsigned char>& t) { return t.asPtr(); });
+  return packages.lockShared()->find(id);
 }
 
 void PyodidePackageManager::setPyodidePackageData(
@@ -56,7 +60,7 @@ static int readToTarget(
   return toCopy;
 }
 
-int PackagesTarReader::read(jsg::Lock& js, int offset, kj::Array<kj::byte> buf) {
+int ReadOnlyBuffer::read(jsg::Lock& js, int offset, kj::Array<kj::byte> buf) {
   return readToTarget(source, offset, buf);
 }
 
@@ -268,6 +272,9 @@ kj::Array<kj::String> ArtifactBundler::parsePythonScriptImports(kj::Array<kj::St
             i += 3;  // skip start quotes.
             // skip until terminating quotes.
             while (i + 2 < file.size() && file[i + 1] != quote && file[i + 2] != quote) {
+              if (file[i] == quote) {
+                i++;
+              }
               i += skipUntil(file, {quote}, i);
             }
             i += 3;  // skip terminating quotes.
@@ -277,6 +284,9 @@ kj::Array<kj::String> ArtifactBundler::parsePythonScriptImports(kj::Array<kj::St
             i += 3;  // skip `"\<NL>`
             // skip until quote, but ignore `\"`.
             while (file[i] != quote && file[i - 1] != '\\') {
+              if (file[i] == quote) {
+                i++;
+              }
               i += skipUntil(file, {quote}, i);
             }
             i += 1;  // skip quote.
@@ -472,6 +482,15 @@ void DiskCache::put(jsg::Lock& js, kj::String key, kj::Array<kj::byte> data) {
   } else {
     return;
   }
+}
+
+jsg::JsValue SetupEmscripten::getModule(jsg::Lock& js) {
+  js.v8Context()->SetSecurityToken(emscriptenRuntime.contextToken.getHandle(js));
+  return emscriptenRuntime.emscriptenRuntime.getHandle(js);
+}
+
+void SetupEmscripten::visitForGc(jsg::GcVisitor& visitor) {
+  visitor.visit(emscriptenRuntime.emscriptenRuntime);
 }
 
 bool hasPythonModules(capnp::List<server::config::Worker::Module>::Reader modules) {

@@ -1,4 +1,3 @@
-load("@aspect_rules_ts//ts:defs.bzl", "ts_project")
 load("//:build/kj_test.bzl", "kj_test")
 load("//:build/wd_capnp_library.bzl", "wd_capnp_library")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
@@ -14,8 +13,10 @@ filegroup(
             "encoding.c++",
             "html-rewriter.c++",
             "hyperdrive.c++",
-            "pyodide.c++",
             "pyodide/pyodide.c++",
+            "pyodide/setup-emscripten.c++",
+            "memory-cache.c++",
+            "r2*.c++",
             "rtti.c++",
             "url.c++",
             "util.c++",
@@ -35,13 +36,44 @@ filegroup(
             "encoding.h",
             "html-rewriter.h",
             "hyperdrive.h",
+            "memory-cache.h",
+            "pyodide/pyodide.h",
+            "pyodide/setup-emscripten.h",
             "modules.h",
+            "r2*.h",
             "rtti.h",
             "url.h",
             "util.h",
         ],
     ),
     visibility = ["//visibility:public"],
+)
+
+wd_cc_library(
+    name = "r2",
+    srcs = glob(["r2*.c++"]),
+    hdrs = glob(["r2*.h"]),
+    implementation_deps = [
+        "//src/workerd/api:r2-api_capnp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/workerd/io",
+    ],
+)
+
+wd_cc_library(
+    name = "memory-cache",
+    srcs = ["memory-cache.c++"],
+    hdrs = ["memory-cache.h"],
+    implementation_deps = [
+        "//src/workerd/io",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/workerd/jsg",
+        "//src/workerd/util:uuid",
+    ],
 )
 
 wd_cc_library(
@@ -57,6 +89,9 @@ wd_cc_library(
     deps = [
         ":html-rewriter",
         ":hyperdrive",
+        ":memory-cache",
+        ":pyodide",
+        ":r2",
         "//src/pyodide",
         "//src/pyodide:pyodide_extra_capnp",
         "//src/workerd/api/node",
@@ -93,15 +128,16 @@ wd_cc_library(
     name = "pyodide",
     srcs = [
         "pyodide/pyodide.c++",
+        "pyodide/setup-emscripten.c++",
     ],
     hdrs = [
         "pyodide/pyodide.h",
+        "pyodide/setup-emscripten.h",
         "//src/pyodide:generated/pyodide_extra.capnp.h",
     ],
     implementation_deps = ["//src/workerd/util:string-buffer"],
     visibility = ["//visibility:public"],
     deps = [
-        "//src/pyodide",
         "//src/pyodide:pyodide_extra_capnp",
         "//src/workerd/io",
         "//src/workerd/jsg",
@@ -113,7 +149,6 @@ kj_test(
     src = "pyodide/pyodide-test.c++",
     deps = [
         ":pyodide",
-        "//src/workerd/tests:test-fixture",
     ],
 )
 
@@ -288,6 +323,12 @@ wd_test(
     src = "queue-test.wd-test",
     args = ["--experimental"],
     data = ["queue-test.js"],
+)
+
+wd_test(
+    src = "r2-test.wd-test",
+    args = ["--experimental"],
+    data = ["r2-test.js"],
 )
 
 wd_test(
@@ -517,20 +558,10 @@ wd_test(
     data = ["tests/js-rpc-test.js"],
 )
 
-ts_project(
-    name = "http-test@ts_project",
-    srcs = ["http-test-ts.ts"],
-    allow_js = True,
-    composite = True,
-    source_map = True,
-    tsconfig = "tsconfig.json",
-    deps = ["//src/node:node.capnp@tsproject"],
-)
-
 wd_test(
     src = "http-test-ts.ts-wd-test",
     args = ["--experimental"],
-    data = ["http-test-ts.js"],
+    data = ["http-test-ts.ts"],
 )
 
 wd_test(

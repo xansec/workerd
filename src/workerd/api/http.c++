@@ -586,7 +586,7 @@ jsg::Ref<Headers> Headers::deserialize(
 namespace {
 
 class BodyBufferInputStream final: public ReadableStreamSource {
-public:
+ public:
   BodyBufferInputStream(Body::Buffer buffer)
       : unread(buffer.view),
         ownBytes(kj::mv(buffer.ownBytes)) {}
@@ -618,7 +618,7 @@ public:
     co_return;
   }
 
-private:
+ private:
   kj::ArrayPtr<const byte> unread;
   kj::OneOf<kj::Own<Body::RefcountedBytes>, jsg::Ref<Blob>> ownBytes;
 };
@@ -704,6 +704,12 @@ Body::ExtractedBody Body::extractBody(jsg::Lock& js, Initializer init) {
       contentType = type.toString();
       buffer = searchParams->toString();
     }
+    KJ_CASE_ONEOF(searchParams, jsg::Ref<url::URLSearchParams>) {
+      auto type = MimeType::FORM_URLENCODED.clone();
+      type.addParam("charset"_kj, "UTF-8"_kj);
+      contentType = type.toString();
+      buffer = searchParams->toString();
+    }
   }
 
   auto bodyStream = kj::heap<BodyBufferInputStream>(buffer.clone(js));
@@ -777,7 +783,7 @@ bool Body::getBodyUsed() {
   }
   return false;
 }
-jsg::Promise<kj::Array<byte>> Body::arrayBuffer(jsg::Lock& js) {
+jsg::Promise<jsg::BufferSource> Body::arrayBuffer(jsg::Lock& js) {
   KJ_IF_SOME(i, impl) {
     return js.evalNow([&] {
       JSG_REQUIRE(!i.stream->isDisturbed(), TypeError,
@@ -790,12 +796,13 @@ jsg::Promise<kj::Array<byte>> Body::arrayBuffer(jsg::Lock& js) {
 
   // If there's no body, we just return an empty array.
   // See https://fetch.spec.whatwg.org/#concept-body-consume-body
-  return js.resolvedPromise(kj::Array<byte>());
+  auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, 0);
+  return js.resolvedPromise(jsg::BufferSource(js, kj::mv(backing)));
 }
 
 jsg::Promise<jsg::BufferSource> Body::bytes(jsg::Lock& js) {
-  return arrayBuffer(js).then(
-      js, [](jsg::Lock& js, kj::Array<kj::byte> data) { return js.bytes(kj::mv(data)); });
+  return arrayBuffer(js).then(js,
+      [](jsg::Lock& js, jsg::BufferSource data) { return data.getTypedView<v8::Uint8Array>(js); });
 }
 
 jsg::Promise<kj::String> Body::text(jsg::Lock& js) {
@@ -864,7 +871,7 @@ jsg::Promise<jsg::Value> Body::json(jsg::Lock& js) {
 }
 
 jsg::Promise<jsg::Ref<Blob>> Body::blob(jsg::Lock& js) {
-  return arrayBuffer(js).then(js, [this](jsg::Lock& js, kj::Array<byte> buffer) {
+  return arrayBuffer(js).then(js, [this](jsg::Lock& js, jsg::BufferSource buffer) {
     kj::String contentType = headersRef.get(jsg::ByteString(kj::str("Content-Type")))
                                  .map([](jsg::ByteString&& b) -> kj::String {
       return kj::mv(b);
@@ -1203,7 +1210,7 @@ kj::Maybe<kj::String> Request::serializeCfBlobJson(jsg::Lock& js) {
   switch (cacheMode) {
     case CacheMode::NOSTORE:
       ttl = -1;
-      obj.set(js, "cf-cache-level", js.str("byc"_kjc));
+      obj.set(js, "cacheLevel", js.str("bypass"_kjc));
       break;
     case CacheMode::NOCACHE:
       ttl = 0;

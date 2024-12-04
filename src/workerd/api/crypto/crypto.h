@@ -26,7 +26,7 @@ class EllipticKey;
 //
 // https://w3c.github.io/webcrypto/#dfn-RecognizedKeyUsage
 class CryptoKeyUsageSet {
-public:
+ public:
   static constexpr CryptoKeyUsageSet encrypt() {
     return 1 << 0;
   }
@@ -125,7 +125,7 @@ public:
     return strings.finish();
   }
 
-private:
+ private:
   constexpr CryptoKeyUsageSet(uint8_t set): set(set) {}
   uint8_t set;
 };
@@ -137,7 +137,7 @@ private:
 // `importKey()`, `generateKey()`, or `deriveKey()` methods. The user can then use the object by
 // passing it as a parameter to other SubtleCrypto methods.
 class CryptoKey: public jsg::Object {
-public:
+ public:
   // KeyAlgorithm dictionaries
   //
   // These dictionaries implement CryptoKey's `algorithm` property. They allow user code to inspect
@@ -207,19 +207,28 @@ public:
       KJ_SWITCH_ONEOF(publicExponent) {
         KJ_CASE_ONEOF(array, BigInteger) {
           if (fixPublicExp) {
-            auto expCopy = kj::heapArray<kj::byte>(array.asPtr());
-            jsg::BackingStore expBack = jsg::BackingStore::from(kj::mv(expCopy));
+            // alloc will, by default create a Uint8Array
+            auto expBack = jsg::BackingStore::alloc(js, array.size());
+            expBack.asArrayPtr().copyFrom(array);
             return {name, modulusLength, jsg::BufferSource(js, kj::mv(expBack)), hash};
           } else {
-            return {name, modulusLength, kj::heapArray(array.asPtr()), hash};
+            auto expBack = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, array.size());
+            expBack.asArrayPtr().copyFrom(array);
+            return {name, modulusLength, jsg::BufferSource(js, kj::mv(expBack)), hash};
           }
         }
         KJ_CASE_ONEOF(source, jsg::BufferSource) {
           // Should only happen if the flag is enabled and an algorithm field is cloned twice.
-          KJ_ASSERT(fixPublicExp == true);
-          auto expCopy = kj::heapArray<kj::byte>(source.asArrayPtr());
-          jsg::BackingStore expBack = jsg::BackingStore::from(kj::mv(expCopy));
-          return {name, modulusLength, jsg::BufferSource(js, kj::mv(expBack)), hash};
+          if (fixPublicExp) {
+            // alloc will, by default create a Uint8Array
+            auto expBack = jsg::BackingStore::alloc(js, source.size());
+            expBack.asArrayPtr().copyFrom(source);
+            return {name, modulusLength, jsg::BufferSource(js, kj::mv(expBack)), hash};
+          } else {
+            auto expBack = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, source.size());
+            expBack.asArrayPtr().copyFrom(source);
+            return {name, modulusLength, jsg::BufferSource(js, kj::mv(expBack)), hash};
+          }
         }
       }
       KJ_UNREACHABLE;
@@ -322,7 +331,7 @@ public:
   bool verifyX509Public(const X509* x509) const;
   bool verifyX509Private(const X509* x509) const;
 
-private:
+ private:
   kj::Own<Impl> impl;
 
   friend class SubtleCrypto;
@@ -339,7 +348,7 @@ struct CryptoKeyPair {
 };
 
 class SubtleCrypto: public jsg::Object {
-public:
+ public:
   // Algorithm dictionaries
   //
   // Every method of SubtleCrypto except `exportKey()` takes an `algorithm` parameter, usually as the
@@ -526,18 +535,18 @@ public:
   };
 
   using ImportKeyData = kj::OneOf<kj::Array<kj::byte>, JsonWebKey>;
-  using ExportKeyData = kj::OneOf<kj::Array<kj::byte>, JsonWebKey>;
+  using ExportKeyData = kj::OneOf<jsg::BufferSource, JsonWebKey>;
 
-  jsg::Promise<kj::Array<kj::byte>> encrypt(jsg::Lock& js,
+  jsg::Promise<jsg::BufferSource> encrypt(jsg::Lock& js,
       kj::OneOf<kj::String, EncryptAlgorithm> algorithm,
       const CryptoKey& key,
       kj::Array<const kj::byte> plainText);
-  jsg::Promise<kj::Array<kj::byte>> decrypt(jsg::Lock& js,
+  jsg::Promise<jsg::BufferSource> decrypt(jsg::Lock& js,
       kj::OneOf<kj::String, EncryptAlgorithm> algorithm,
       const CryptoKey& key,
       kj::Array<const kj::byte> cipherText);
 
-  jsg::Promise<kj::Array<kj::byte>> sign(jsg::Lock& js,
+  jsg::Promise<jsg::BufferSource> sign(jsg::Lock& js,
       kj::OneOf<kj::String, SignAlgorithm> algorithm,
       const CryptoKey& key,
       kj::Array<const kj::byte> data);
@@ -547,7 +556,7 @@ public:
       kj::Array<const kj::byte> signature,
       kj::Array<const kj::byte> data);
 
-  jsg::Promise<kj::Array<kj::byte>> digest(jsg::Lock& js,
+  jsg::Promise<jsg::BufferSource> digest(jsg::Lock& js,
       kj::OneOf<kj::String, HashAlgorithm> algorithm,
       kj::Array<const kj::byte> data);
 
@@ -562,7 +571,7 @@ public:
       kj::OneOf<kj::String, ImportKeyAlgorithm> derivedKeyAlgorithm,
       bool extractable,
       kj::Array<kj::String> keyUsages);
-  jsg::Promise<kj::Array<kj::byte>> deriveBits(jsg::Lock& js,
+  jsg::Promise<jsg::BufferSource> deriveBits(jsg::Lock& js,
       kj::OneOf<kj::String, DeriveKeyAlgorithm> algorithm,
       const CryptoKey& baseKey,
       // The operation needs to be able to take both undefined and null
@@ -589,7 +598,7 @@ public:
 
   jsg::Promise<ExportKeyData> exportKey(jsg::Lock& js, kj::String format, const CryptoKey& key);
 
-  jsg::Promise<kj::Array<kj::byte>> wrapKey(jsg::Lock& js,
+  jsg::Promise<jsg::BufferSource> wrapKey(jsg::Lock& js,
       kj::String format,
       const CryptoKey& key,
       const CryptoKey& wrappingKey,
@@ -622,6 +631,34 @@ public:
     JSG_METHOD(wrapKey);
     JSG_METHOD(unwrapKey);
     JSG_METHOD(timingSafeEqual);
+
+    JSG_TS_OVERRIDE({
+      wrapKey(format: string,
+              key: CryptoKey,
+              wrappingKey: CryptoKey,
+              wrapAlgorithm: string | SubtleCryptoEncryptAlgorithm)
+              : Promise<ArrayBuffer>;
+      deriveBits(algorithm: string | SubtleCryptoDeriveKeyAlgorithm,
+                 baseKey : CryptoKey,
+                 length? : number | null)
+                 : Promise<ArrayBuffer>;
+      digest(algorithm: string | SubtleCryptoHashAlgorithm,
+             data: ArrayBuffer | ArrayBufferView)
+          : Promise<ArrayBuffer>;
+      sign(algorithm: string | SubtleCryptoSignAlgorithm,
+           key: CryptoKey,
+           data: ArrayBuffer | ArrayBufferView)
+           : Promise<ArrayBuffer>;
+      decrypt(algorithm: string | SubtleCryptoEncryptAlgorithm,
+              key: CryptoKey,
+              cipherText: ArrayBuffer | ArrayBufferView)
+              : Promise<ArrayBuffer>;
+      encrypt(algorithm: string | SubtleCryptoEncryptAlgorithm,
+              key: CryptoKey,
+              plainText: ArrayBuffer | ArrayBufferView)
+              : Promise<ArrayBuffer>;
+      exportKey(format: string, key: CryptoKey) : Promise<ArrayBuffer | JsonWebKey>;
+    });
   }
 };
 
@@ -630,7 +667,7 @@ public:
 // a hash digest from streaming data. It combines Web Crypto concepts into a
 // WritableStream and is compatible with both APIs.
 class DigestStream: public WritableStream {
-public:
+ public:
   using DigestContextPtr = kj::Own<EVP_MD_CTX>;
   using Algorithm = kj::OneOf<kj::String, SubtleCrypto::HashAlgorithm>;
 
@@ -664,7 +701,7 @@ public:
 
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
 
-private:
+ private:
   static DigestContextPtr initContext(SubtleCrypto::HashAlgorithm& algorithm);
 
   struct Ready {
@@ -694,7 +731,7 @@ private:
 // Implements the Crypto interface as prescribed by:
 // https://www.w3.org/TR/WebCryptoAPI/#crypto-interface
 class Crypto: public jsg::Object {
-public:
+ public:
   jsg::BufferSource getRandomValues(jsg::BufferSource buffer);
 
   kj::String randomUUID();
@@ -737,7 +774,7 @@ public:
     tracker.trackField("subtle", subtle);
   }
 
-private:
+ private:
   jsg::Ref<SubtleCrypto> subtle = jsg::alloc<SubtleCrypto>();
 };
 

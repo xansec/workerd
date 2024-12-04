@@ -3,13 +3,6 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 export class NonRetryableError extends Error {
-  // `__brand` is how engine validates that the user returned a `NonRetryableError`
-  // imported from "cloudflare:workflows"
-  // This enables them to extend NonRetryableError for their own Errors
-  // as well by overriding name
-  // Private fields are not serialized over RPC
-  public readonly __brand: string = 'NonRetryableError';
-
   public constructor(message: string, name = 'NonRetryableError') {
     super(message);
     this.name = name;
@@ -46,7 +39,7 @@ async function callFetcher<T>(
   }
 }
 
-class InstanceImpl implements Instance {
+class InstanceImpl implements WorkflowInstance {
   private readonly fetcher: Fetcher;
   public readonly id: string;
 
@@ -93,24 +86,22 @@ class WorkflowImpl {
     this.fetcher = fetcher;
   }
 
-  public async get(id: string): Promise<Instance> {
-    const result = await callFetcher<{ instanceId: string }>(
-      this.fetcher,
-      '/get',
-      { id }
-    );
+  public async get(id: string): Promise<WorkflowInstance> {
+    const result = await callFetcher<{
+      id: string;
+    }>(this.fetcher, '/get', { id });
 
-    return new InstanceImpl(result.instanceId, this.fetcher);
+    return new InstanceImpl(result.id, this.fetcher);
   }
 
-  public async create(id: string, params?: unknown): Promise<Instance> {
-    const result = await callFetcher<{ instanceId: string }>(
-      this.fetcher,
-      '/create',
-      { id, params }
-    );
+  public async create(
+    options?: WorkflowInstanceCreateOptions
+  ): Promise<WorkflowInstance> {
+    const result = await callFetcher<{
+      id: string;
+    }>(this.fetcher, '/create', options ?? {});
 
-    return new InstanceImpl(result.instanceId, this.fetcher);
+    return new InstanceImpl(result.id, this.fetcher);
   }
 }
 

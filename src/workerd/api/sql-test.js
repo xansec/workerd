@@ -19,6 +19,10 @@ async function test(state) {
   assert.equal(resultNumberRaw[0].length, 1);
   assert.equal(resultNumberRaw[0][0], 123);
 
+  sql.exec('SELECT 123');
+  sql.exec('SELECT 123');
+  sql.exec('SELECT 123');
+
   // Test string results
   const resultStr = [...sql.exec("SELECT 'hello'")];
   assert.equal(resultStr.length, 1);
@@ -294,14 +298,12 @@ async function test(state) {
   assert.equal(resultPrepared.length, 1);
   assert.equal(resultPrepared[0]['789'], 789);
 
-  // Running the same query twice invalidates the previous cursor.
+  // Running the same query twice, overlapping, works just fine.
   let result1 = prepared();
   let result2 = prepared();
+  // Iterate result2 before result1.
   assert.equal([...result2][0]['789'], 789);
-  assert.throws(
-    () => [...result1],
-    'SQL cursor was closed because the same statement was executed again.'
-  );
+  assert.equal([...result1][0]['789'], 789);
 
   // That said if a cursor was already done before the statement was re-run, it's not considered
   // canceled.
@@ -331,9 +333,7 @@ async function test(state) {
   }
 
   // Prepared statement with multiple statements
-  assert.throws(() => {
-    sql.prepare('SELECT 1; SELECT 2;');
-  }, /A prepared SQL statement must contain only one statement./);
+  assert.deepEqual([...sql.prepare('SELECT 1; SELECT 2;')()], [{ 2: 2 }]);
 
   // Accessing a hidden _cf_ table
   assert.throws(
@@ -831,15 +831,18 @@ async function test(state) {
     assert.deepEqual(rawResults[2], [4, 5, 6, 7, 8, 9]);
     assert.deepEqual(rawResults[3], [4, 5, 6, 1, 2, 3]);
 
-    // Once an iterator is consumed, it can no longer access the columnNames.
-    assert.throws(() => {
-      iterator.columnNames;
-    }, 'Error: Cannot call .getColumnNames after Cursor iterator has been consumed.');
+    // After an iterator is consumed, columnNames can still be accessed.
+    assert.deepEqual(iterator.columnNames, ['a', 'b', 'c', 'c', 'd', 'e']);
 
     // Also works with cursors returned from .exec
     const execIterator = sql.exec(`SELECT * FROM abc, cde`);
     assert.deepEqual(execIterator.columnNames, ['a', 'b', 'c', 'c', 'd', 'e']);
     assert.equal(Array.from(execIterator.raw())[0].length, 6);
+
+    // Execute some sort of statement that returns no results, check that we can read the column
+    // names (which is empty).
+    const oneIterator = sql.exec(`UPDATE abc SET a = 1 WHERE b = 123542`);
+    assert.deepEqual(oneIterator.columnNames, []);
   }
 
   await scheduler.wait(1);
@@ -1009,6 +1012,49 @@ async function test(state) {
   await state.blockConcurrencyWhile(async () => {
     sql.exec(`PRAGMA foreign_keys = ON;`);
   });
+
+  // Verify caching.
+  {
+    let isCached = (q) => {
+      let cursor = sql.exec(q);
+      cursor.toArray();
+      return cursor.reusedCachedQueryForTest;
+    };
+
+    // Query based on literal string is cached.
+    assert.equal(false, isCached('SELECT 179321'));
+    assert.equal(true, isCached('SELECT 179321'));
+    assert.equal(true, isCached('SELECT 179321'));
+
+    // Qeury based on computed string is cached.
+    assert.equal(false, isCached('SELECT "' + 'x'.repeat(4) + '"'));
+    assert.equal(true, isCached('SELECT "' + 'x'.repeat(4) + '"'));
+    assert.equal(true, isCached('SELECT "' + 'x'.repeat(4) + '"'));
+  }
+
+  // Verify that if we alter a table, cached statements continue to work.
+  {
+    sql.exec('CREATE TABLE alterTableTest (a INTEGER)');
+    sql.exec('INSERT INTO alterTableTest VALUES (?)', 1);
+    assert.deepStrictEqual(sql.exec('SELECT * FROM alterTableTest').toArray(), [
+      { a: 1 },
+    ]);
+    sql.exec('ALTER TABLE alterTableTest ADD COLUMN b INTEGER').toArray();
+    assert.deepStrictEqual(sql.exec('SELECT * FROM alterTableTest').toArray(), [
+      { a: 1, b: null },
+    ]);
+    sql.exec('INSERT INTO alterTableTest VALUES (?, ?)', 2, 2);
+    assert.deepStrictEqual(sql.exec('SELECT * FROM alterTableTest').toArray(), [
+      { a: 1, b: null },
+      { a: 2, b: 2 },
+    ]);
+    sql.exec('INSERT INTO alterTableTest VALUES (?, ?)', 3, 3);
+    assert.deepStrictEqual(sql.exec('SELECT * FROM alterTableTest').toArray(), [
+      { a: 1, b: null },
+      { a: 2, b: 2 },
+      { a: 3, b: 3 },
+    ]);
+  }
 }
 
 async function testIoStats(storage) {
@@ -1070,9 +1116,12 @@ async function testIoStats(storage) {
     while (true) {
       const result = resultsIterator.next();
       if (result.done) {
+        assert.equal(10, cursor.rowsRead);
         break;
       }
-      assert.equal(++rowsSeen, cursor.rowsRead);
+      // + 1 because the cursor is always one result ahead of what has been returned -- but there
+      // are only 10 rows total.
+      assert.equal(Math.min(++rowsSeen + 1, 10), cursor.rowsRead);
     }
   }
 
@@ -1379,7 +1428,7 @@ export default {
     // Test defer_foreign_keys (explodes the DO)
     await assert.rejects(async () => {
       await doReq('sql-test-foreign-keys');
-    }, /Error: internal error/);
+    }, /constraints were violated: FOREIGN KEY constraint failed: SQLITE_CONSTRAINT/);
 
     // Some increments.
     assert.equal(await doReq('increment'), 1);

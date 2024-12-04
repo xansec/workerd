@@ -630,6 +630,9 @@ struct Worker {
 
   moduleFallback @13 :Text;
 
+  tails @14 :List(ServiceDesignator);
+  # List of tail worker services that should receive tail events for this worker.
+  # See: https://developers.cloudflare.com/workers/observability/logs/tail-workers/
 }
 
 struct ExternalServer {

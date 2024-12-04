@@ -1,3 +1,4 @@
+load("@bazel_skylib//lib:selects.bzl", "selects")
 load("//:build/kj_test.bzl", "kj_test")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
 load("//:build/wd_test.bzl", "wd_test")
@@ -8,11 +9,13 @@ wd_cc_library(
         "crypto.c++",
         "crypto-keys.c++",
         "diagnostics-channel.c++",
+        "dns.c++",
         "zlib-util.c++",
     ],
     hdrs = [
         "crypto.h",
         "diagnostics-channel.h",
+        "dns.h",
         "node.h",
         "zlib-util.h",
     ],
@@ -213,4 +216,38 @@ wd_test(
     src = "tests/process-exit-test.wd-test",
     args = ["--experimental"],
     data = ["tests/process-exit-test.js"],
+)
+
+wd_test(
+    src = "tests/process-nodejs-test.wd-test",
+    args = ["--experimental"],
+    data = ["tests/process-nodejs-test.js"],
+)
+
+wd_test(
+    src = "tests/querystring-nodejs-test.wd-test",
+    args = ["--experimental"],
+    data = ["tests/querystring-nodejs-test.js"],
+)
+
+config_setting(
+    name = "debug_build",
+    values = {"compilation_mode": "dbg"},
+)
+
+wd_test(
+    size = "large",
+    src = "tests/legacy_url-nodejs-test.wd-test",
+    args = ["--experimental"],
+    data = ["tests/legacy_url-nodejs-test.js"],
+    target_compatible_with = select({
+        ":debug_build": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
+
+wd_test(
+    src = "tests/dns-nodejs-test.wd-test",
+    args = ["--experimental"],
+    data = ["tests/dns-nodejs-test.js"],
 )

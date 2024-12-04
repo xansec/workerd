@@ -45,7 +45,6 @@ wd_cc_binary(
     name = "workerd",
     srcs = ["workerd.c++"],
     malloc = ":malloc",
-    tags = ["no-arm64"],
     visibility = ["//visibility:public"],
     deps = [
         ":server",
@@ -53,13 +52,11 @@ wd_cc_binary(
         ":workerd-meta_capnp",
         ":workerd_capnp",
         "//src/pyodide:pyodide_extra_capnp",
+        "//src/rust/cxx-integration",
         "//src/workerd/util:autogate",
         "//src/workerd/util:perfetto",
         "@capnp-cpp//src/capnp:capnpc",
-    ] + select({
-        "@platforms//os:windows": [],
-        "//conditions:default": ["@workerd//src/workerd/util:symbolizer"],
-    }),
+    ],
 )
 
 wd_cc_library(
@@ -119,7 +116,9 @@ wd_cc_library(
         "//deps/rust:runtime",
         "//src/workerd/api:html-rewriter",
         "//src/workerd/api:hyperdrive",
+        "//src/workerd/api:memory-cache",
         "//src/workerd/api:pyodide",
+        "//src/workerd/api:r2",
         "//src/workerd/api:rtti",
         "//src/workerd/api/node",
         "//src/workerd/io",

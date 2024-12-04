@@ -100,6 +100,7 @@ export const test_path_zero_length_strings = {
   },
 };
 
+// Ref: https://github.com/nodejs/node/blob/4d6d7d644be4f10f90e5c9c66563736112fffbff/test/parallel/test-path-resolve.js
 export const test_path_resolve = {
   test(ctrl, env, ctx) {
     const failures = [];
@@ -124,6 +125,7 @@ export const test_path_resolve = {
   },
 };
 
+// Ref: https://github.com/nodejs/node/blob/4d6d7d644be4f10f90e5c9c66563736112fffbff/test/parallel/test-path-relative.js
 export const test_path_relative = {
   test(ctrl, env, ctx) {
     const failures = [];
@@ -303,6 +305,55 @@ export const test_path_parse_format = {
 
 export const test_path_normalize = {
   test(ctrl, env, ctx) {
+    strictEqual(
+      path.win32.normalize('./fixtures///b/../b/c.js'),
+      'fixtures\\b\\c.js'
+    );
+    strictEqual(path.win32.normalize('/foo/../../../bar'), '\\bar');
+    strictEqual(path.win32.normalize('a//b//../b'), 'a\\b');
+    strictEqual(path.win32.normalize('a//b//./c'), 'a\\b\\c');
+    strictEqual(path.win32.normalize('a//b//.'), 'a\\b');
+    strictEqual(
+      path.win32.normalize('//server/share/dir/file.ext'),
+      '\\\\server\\share\\dir\\file.ext'
+    );
+    strictEqual(path.win32.normalize('/a/b/c/../../../x/y/z'), '\\x\\y\\z');
+    strictEqual(path.win32.normalize('C:'), 'C:.');
+    strictEqual(path.win32.normalize('C:..\\abc'), 'C:..\\abc');
+    strictEqual(
+      path.win32.normalize('C:..\\..\\abc\\..\\def'),
+      'C:..\\..\\def'
+    );
+    strictEqual(path.win32.normalize('C:\\.'), 'C:\\');
+    strictEqual(path.win32.normalize('file:stream'), 'file:stream');
+    strictEqual(path.win32.normalize('bar\\foo..\\..\\'), 'bar\\');
+    strictEqual(path.win32.normalize('bar\\foo..\\..'), 'bar');
+    strictEqual(path.win32.normalize('bar\\foo..\\..\\baz'), 'bar\\baz');
+    strictEqual(path.win32.normalize('bar\\foo..\\'), 'bar\\foo..\\');
+    strictEqual(path.win32.normalize('bar\\foo..'), 'bar\\foo..');
+    strictEqual(path.win32.normalize('..\\foo..\\..\\..\\bar'), '..\\..\\bar');
+    strictEqual(
+      path.win32.normalize('..\\...\\..\\.\\...\\..\\..\\bar'),
+      '..\\..\\bar'
+    );
+    strictEqual(
+      path.win32.normalize('../../../foo/../../../bar'),
+      '..\\..\\..\\..\\..\\bar'
+    );
+    strictEqual(
+      path.win32.normalize('../../../foo/../../../bar/../../'),
+      '..\\..\\..\\..\\..\\..\\'
+    );
+    strictEqual(
+      path.win32.normalize('../foobar/barfoo/foo/../../../bar/../../'),
+      '..\\..\\'
+    );
+    strictEqual(
+      path.win32.normalize('../.../../foobar/../../../bar/../../baz'),
+      '..\\..\\..\\..\\baz'
+    );
+    strictEqual(path.win32.normalize('foo/bar\\baz'), 'foo\\bar\\baz');
+
     strictEqual(
       path.posix.normalize('./fixtures///b/../b/c.js'),
       'fixtures/b/c.js'
@@ -565,5 +616,26 @@ export const test_path_basename = {
       path.posix.basename(`/a/b/${controlCharFilename}`),
       controlCharFilename
     );
+  },
+};
+
+export const make_sure_posix_win32_works = {
+  async test() {
+    {
+      const pathModule = await import('node:path/win32');
+      strictEqual(typeof pathModule.default.resolve, 'function');
+      strictEqual(
+        typeof process.getBuiltinModule('node:path/win32').resolve,
+        'function'
+      );
+    }
+    {
+      const pathModule = await import('node:path/posix');
+      strictEqual(typeof pathModule.default.resolve, 'function');
+      strictEqual(
+        typeof process.getBuiltinModule('node:path/posix').resolve,
+        'function'
+      );
+    }
   },
 };

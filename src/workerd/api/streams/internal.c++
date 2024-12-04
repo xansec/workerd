@@ -51,7 +51,7 @@ kj::Promise<void> pumpTo(ReadableStreamSource& input, WritableStreamSink& output
 
 // Modified from AllReader in kj/async-io.c++.
 class AllReader final {
-public:
+ public:
   explicit AllReader(ReadableStreamSource& input, uint64_t limit): input(input), limit(limit) {
     JSG_REQUIRE(limit > 0, TypeError, "Memory limit exceeded before EOF.");
     KJ_IF_SOME(length, input.tryGetLength(StreamEncoding::IDENTITY)) {
@@ -70,7 +70,7 @@ public:
     co_return kj::String(kj::mv(data));
   }
 
-private:
+ private:
   ReadableStreamSource& input;
   uint64_t limit;
 
@@ -246,7 +246,7 @@ kj::Exception reasonToException(jsg::Lock& js,
 
 // Adapt ReadableStreamSource to kj::AsyncInputStream's interface for use with `kj::newTee()`.
 class TeeAdapter final: public kj::AsyncInputStream {
-public:
+ public:
   explicit TeeAdapter(kj::Own<ReadableStreamSource> inner): inner(kj::mv(inner)) {}
 
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
@@ -257,12 +257,12 @@ public:
     return inner->tryGetLength(StreamEncoding::IDENTITY);
   }
 
-private:
+ private:
   kj::Own<ReadableStreamSource> inner;
 };
 
 class TeeBranch final: public ReadableStreamSource {
-public:
+ public:
   explicit TeeBranch(kj::Own<kj::AsyncInputStream> inner): inner(kj::mv(inner)) {}
 
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
@@ -321,12 +321,12 @@ public:
     // TODO(someday): What to do?
   }
 
-private:
+ private:
   // Adapt WritableStreamSink to kj::AsyncOutputStream's interface for use in
   // `TeeBranch::pumpTo()`. If you squint, the write logic looks very similar to TeeAdapter's
   // read logic.
   class PumpAdapter final: public kj::AsyncOutputStream {
-  public:
+   public:
     explicit PumpAdapter(WritableStreamSink& inner): inner(inner) {}
 
     kj::Promise<void> write(kj::ArrayPtr<const byte> buffer) override {
@@ -350,9 +350,9 @@ private:
 static const WarningAggregator::Key unusedStreamBranchKey;
 
 class WarnIfUnusedStream final: public ReadableStreamSource {
-public:
+ public:
   class UnusedStreamWarningContext final: public WarningAggregator::WarningContext {
-  public:
+   public:
     UnusedStreamWarningContext(jsg::Lock& js): exception(jsg::JsRef(js, js.error(""_kjc))) {}
 
     kj::String toString(jsg::Lock& js) override {
@@ -362,7 +362,7 @@ public:
       return obj.get(js, "stack"_kjc).toString(js);
     }
 
-  private:
+   private:
     jsg::JsRef<jsg::JsValue> exception;
   };
 
@@ -442,7 +442,7 @@ public:
     }
   }
 
-private:
+ private:
   kj::Own<WarningAggregator> warningAggregator;
   kj::Own<UnusedStreamWarningContext> warningContext;
   kj::Own<ReadableStreamSource> inner;
@@ -779,7 +779,7 @@ kj::Maybe<kj::Own<ReadableStreamSource>> ReadableStreamInternalController::remov
   KJ_SWITCH_ONEOF(state) {
     KJ_CASE_ONEOF(closed, StreamStates::Closed) {
       class NullSource final: public ReadableStreamSource {
-      public:
+       public:
         kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
           return size_t(0);
         }
@@ -933,6 +933,9 @@ jsg::Promise<void> WritableStreamInternalController::write(
 
       auto prp = js.newPromiseAndResolver<void>();
       increaseCurrentWriteBufferSize(js, byteLength);
+      KJ_IF_SOME(o, observer) {
+        o->onChunkEnqueued(byteLength);
+      }
       auto ptr =
           kj::ArrayPtr<kj::byte>(static_cast<kj::byte*>(store->Data()) + byteOffset, byteLength);
       queue.push_back(
@@ -1017,8 +1020,7 @@ void WritableStreamInternalController::setHighWaterMark(uint64_t highWaterMark) 
 
 jsg::Promise<void> WritableStreamInternalController::closeImpl(jsg::Lock& js, bool markAsHandled) {
   if (isClosedOrClosing()) {
-    auto reason = js.v8TypeError("This WritableStream has been closed."_kj);
-    return rejectedMaybeHandledPromise<void>(js, reason, markAsHandled);
+    return js.resolvedPromise();
   }
   if (isPiping()) {
     auto reason = js.v8TypeError("This WritableStream is currently being piped to."_kj);
@@ -1598,6 +1600,9 @@ jsg::Promise<void> WritableStreamInternalController::writeLoopAfterFrontOutputLo
         auto& request = check();
         maybeResolvePromise(js, request.promise);
         decreaseCurrentWriteBufferSize(js, amountToWrite);
+        KJ_IF_SOME(o, observer) {
+          o->onChunkDequeued(amountToWrite);
+        }
         queue.pop_front();
         maybeAbort(js, request);
         return writeLoop(js, IoContext::current());
@@ -1610,6 +1615,9 @@ jsg::Promise<void> WritableStreamInternalController::writeLoopAfterFrontOutputLo
         auto& request = check();
         auto& writable = state.get<IoOwn<Writable>>();
         decreaseCurrentWriteBufferSize(js, amountToWrite);
+        KJ_IF_SOME(o, observer) {
+          o->onChunkDequeued(amountToWrite);
+        }
         maybeRejectPromise<void>(js, request.promise, handle);
         queue.pop_front();
         if (!maybeAbort(js, request)) {
@@ -2077,27 +2085,36 @@ jsg::Promise<ReadResult> ReadableStreamInternalController::PipeLocked::read(jsg:
   return KJ_ASSERT_NONNULL(inner.read(js, kj::none));
 }
 
-jsg::Promise<kj::Array<byte>> ReadableStreamInternalController::readAllBytes(
+jsg::Promise<jsg::BufferSource> ReadableStreamInternalController::readAllBytes(
     jsg::Lock& js, uint64_t limit) {
   if (isLockedToReader()) {
-    return js.rejectedPromise<kj::Array<byte>>(KJ_EXCEPTION(
+    return js.rejectedPromise<jsg::BufferSource>(KJ_EXCEPTION(
         FAILED, "jsg.TypeError: This ReadableStream is currently locked to a reader."));
   }
   if (isPendingClosure) {
-    return js.rejectedPromise<kj::Array<byte>>(
+    return js.rejectedPromise<jsg::BufferSource>(
         js.v8TypeError("This ReadableStream belongs to an object that is closing."_kj));
   }
   KJ_SWITCH_ONEOF(state) {
     KJ_CASE_ONEOF(closed, StreamStates::Closed) {
-      return js.resolvedPromise(kj::Array<byte>());
+      auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, 0);
+      return js.resolvedPromise(jsg::BufferSource(js, kj::mv(backing)));
     }
     KJ_CASE_ONEOF(errored, StreamStates::Errored) {
-      return js.rejectedPromise<kj::Array<byte>>(errored.addRef(js));
+      return js.rejectedPromise<jsg::BufferSource>(errored.addRef(js));
     }
     KJ_CASE_ONEOF(readable, Readable) {
       auto source = KJ_ASSERT_NONNULL(removeSource(js));
       auto& context = IoContext::current();
-      return context.awaitIoLegacy(js, source->readAllBytes(limit).attach(kj::mv(source)));
+      // TODO(perf): v8 sandboxing will require that backing stores are allocated within
+      // the sandbox. This will require a change to the API of ReadableStreamSource::readAllBytes.
+      // For now, we'll read and allocate into a proper backing store.
+      return context.awaitIoLegacy(js, source->readAllBytes(limit).attach(kj::mv(source)))
+          .then(js, [](jsg::Lock& js, kj::Array<kj::byte> bytes) -> jsg::BufferSource {
+        auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, bytes.size());
+        backing.asArrayPtr().copyFrom(bytes);
+        return jsg::BufferSource(js, kj::mv(backing));
+      });
     }
   }
   KJ_UNREACHABLE;
@@ -2468,10 +2485,11 @@ kj::Own<ReadableStreamController> newReadableStreamInternalController(
 
 kj::Own<WritableStreamController> newWritableStreamInternalController(IoContext& ioContext,
     kj::Own<WritableStreamSink> sink,
+    kj::Maybe<kj::Own<ByteStreamObserver>> observer,
     kj::Maybe<uint64_t> maybeHighWaterMark,
     kj::Maybe<jsg::Promise<void>> maybeClosureWaitable) {
   return kj::heap<WritableStreamInternalController>(
-      kj::mv(sink), maybeHighWaterMark, kj::mv(maybeClosureWaitable));
+      kj::mv(sink), kj::mv(observer), maybeHighWaterMark, kj::mv(maybeClosureWaitable));
 }
 
 kj::StringPtr WritableStreamInternalController::jsgGetMemoryName() const {

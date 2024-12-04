@@ -18,15 +18,15 @@
 namespace workerd {
 
 static thread_local IoContext* threadLocalRequest = nullptr;
-static thread_local void* threadId = nullptr;
+
+static const kj::EventLoopLocal<int> threadId;
 
 static void* getThreadId() {
-  if (threadId == nullptr) threadId = new int;
-  return threadId;
+  return threadId.get();
 }
 
 class IoContext::TimeoutManagerImpl final: public TimeoutManager {
-public:
+ public:
   class TimeoutState;
   using Map = std::map<TimeoutId, TimeoutState>;
   using Iterator = Map::iterator;
@@ -55,7 +55,7 @@ public:
     }
   }
 
-private:
+ private:
   struct IdAndIterator {
     TimeoutId id;
     Iterator it;
@@ -100,7 +100,7 @@ private:
 };
 
 class IoContext::TimeoutManagerImpl::TimeoutState {
-public:
+ public:
   TimeoutState(TimeoutManagerImpl& manager, TimeoutParameters params);
   ~TimeoutState();
 
@@ -201,11 +201,13 @@ IoContext::IoContext(ThreadContext& thread,
 IoContext::IncomingRequest::IoContext_IncomingRequest(kj::Own<IoContext> contextParam,
     kj::Own<IoChannelFactory> ioChannelFactoryParam,
     kj::Own<RequestObserver> metricsParam,
-    kj::Maybe<kj::Own<WorkerTracer>> workerTracer)
+    kj::Maybe<kj::Own<WorkerTracer>> workerTracer,
+    kj::Rc<tracing::InvocationSpanContext> invocationSpanContext)
     : context(kj::mv(contextParam)),
       metrics(kj::mv(metricsParam)),
       workerTracer(kj::mv(workerTracer)),
-      ioChannelFactory(kj::mv(ioChannelFactoryParam)) {}
+      ioChannelFactory(kj::mv(ioChannelFactoryParam)),
+      invocationSpanContext(kj::mv(invocationSpanContext)) {}
 
 // A call to delivered() implies a promise to call drain() later (or one of the other methods
 // that sets waitedForWaitUntil). So, we can now safely add the request to
@@ -400,9 +402,7 @@ void IoContext::addTask(kj::Promise<void> promise) {
     // changes.)
     auto& metrics = getMetrics();
     if (metrics.getSpan().isObserved()) {
-      metrics.addedContextTask();
-      promise = promise.attach(
-          kj::defer([metrics = kj::addRef(metrics)]() mutable { metrics->finishedContextTask(); }));
+      promise = promise.attach(metrics.addedContextTask());
     }
   }
 
@@ -415,9 +415,7 @@ void IoContext::addWaitUntil(kj::Promise<void> promise) {
     // are not tied to requests in actors. So we just skip it in actors.
     auto& metrics = getMetrics();
     if (metrics.getSpan().isObserved()) {
-      metrics.addedWaitUntilTask();
-      promise = promise.attach(kj::defer(
-          [metrics = kj::addRef(metrics)]() mutable { metrics->finishedWaitUntilTask(); }));
+      promise = promise.attach(metrics.addedWaitUntilTask());
     }
   }
 
@@ -480,7 +478,7 @@ kj::Promise<IoContext_IncomingRequest::FinishScheduledResult> IoContext::Incomin
 }
 
 class IoContext::PendingEvent: public kj::Refcounted {
-public:
+ public:
   explicit PendingEvent(IoContext& context): maybeContext(context) {}
   ~PendingEvent() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(PendingEvent);
@@ -837,6 +835,26 @@ kj::Own<WorkerInterface> IoContext::getSubrequestChannel(
       });
 }
 
+kj::Own<WorkerInterface> IoContext::getSubrequestChannelWithSpans(uint channel,
+    bool isInHouse,
+    kj::Maybe<kj::String> cfBlobJson,
+    kj::ConstString operationName,
+    std::initializer_list<SpanTagParams> tags) {
+  return getSubrequest(
+      [&](TraceContext& tracing, IoChannelFactory& channelFactory) {
+    for (const SpanTagParams& tag: tags) {
+      tracing.userSpan.setTag(kj::mv(tag.key), kj::str(tag.value));
+    }
+    return getSubrequestChannelImpl(
+        channel, isInHouse, kj::mv(cfBlobJson), tracing, channelFactory);
+  },
+      SubrequestOptions{
+        .inHouse = isInHouse,
+        .wrapMetrics = !isInHouse,
+        .operationName = kj::mv(operationName),
+      });
+}
+
 kj::Own<WorkerInterface> IoContext::getSubrequestChannelNoChecks(uint channel,
     bool isInHouse,
     kj::Maybe<kj::String> cfBlobJson,
@@ -873,6 +891,15 @@ kj::Own<kj::HttpClient> IoContext::getHttpClient(
     uint channel, bool isInHouse, kj::Maybe<kj::String> cfBlobJson, kj::ConstString operationName) {
   return asHttpClient(
       getSubrequestChannel(channel, isInHouse, kj::mv(cfBlobJson), kj::mv(operationName)));
+}
+
+kj::Own<kj::HttpClient> IoContext::getHttpClientWithSpans(uint channel,
+    bool isInHouse,
+    kj::Maybe<kj::String> cfBlobJson,
+    kj::ConstString operationName,
+    std::initializer_list<SpanTagParams> tags) {
+  return asHttpClient(getSubrequestChannelWithSpans(
+      channel, isInHouse, kj::mv(cfBlobJson), kj::mv(operationName), kj::mv(tags)));
 }
 
 kj::Own<kj::HttpClient> IoContext::getHttpClientNoChecks(uint channel,
@@ -1092,11 +1119,13 @@ void IoContext::runImpl(Runnable& runnable,
         // If we were terminated because abort() was called, then it's not an unknown
         // reason...
         if (!abortFulfiller->isWaiting()) {
-          // Nothing to do here. Do not log anything. The assumption is that we've
-          // terminated because the IoContext was aborted and isolate->TerminateExection()
-          // was called (likely because of someone using process.exit(...) in Node.js
-          // compat mode).
-          return;
+          // The assumption is that we've terminated because the IoContext was aborted and
+          // isolate->TerminateExection() was called (likely because of someone using
+          // process.exit(...) in Node.js compat mode).
+
+          // TODO(later): If this ends up being too spammy in sentry that we'll need to
+          // revisit, but for now... log the assert and move on.
+          KJ_FAIL_ASSERT("request terminated because it was aborted");
         }
 
         // That should have thrown, so we shouldn't get here.
@@ -1212,7 +1241,7 @@ void IoContext::runFinalizers(Worker::AsyncLock& asyncLock) {
 namespace {
 
 class CacheSerializedInputStream final: public kj::AsyncInputStream {
-public:
+ public:
   CacheSerializedInputStream(
       kj::Own<kj::AsyncInputStream> inner, kj::Own<kj::PromiseFulfiller<void>> fulfiller)
       : inner(kj::mv(inner)),
@@ -1234,7 +1263,7 @@ public:
     return inner->pumpTo(output, amount);
   }
 
-private:
+ private:
   kj::Own<kj::AsyncInputStream> inner;
   kj::Own<kj::PromiseFulfiller<void>> fulfiller;
 };

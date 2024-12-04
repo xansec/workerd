@@ -22,7 +22,7 @@ const unitTests :Workerd.Config = (
           (name = "{}", pythonRequirement = ""),
         ],
         compatibilityDate = "2024-05-02",
-        compatibilityFlags = ["python_workers_development", "python_external_bundle"],
+        compatibilityFlags = ["python_workers_development"],
       )
     ),
   ]
@@ -51,6 +51,5 @@ def gen_import_tests(to_test):
             src = wd_test_fname,
             args = ["--experimental", "--pyodide-package-disk-cache-dir", "../all_pyodide_wheels"],
             data = [worker_py_fname, "@all_pyodide_wheels//:whls"],
-            tags = ["slow"],
             size = "enormous",
         )

@@ -13,7 +13,8 @@ class ReadableStream;
 
 // An implementation of the Web Platform Standard Blob API
 class Blob: public jsg::Object {
-public:
+ public:
+  Blob(jsg::Lock& js, jsg::BufferSource data, kj::String type);
   Blob(jsg::Lock& js, kj::Array<byte> data, kj::String type);
   Blob(jsg::Ref<Blob> parent, kj::ArrayPtr<const byte> data, kj::String type);
 
@@ -44,7 +45,7 @@ public:
   jsg::Ref<Blob> slice(
       jsg::Optional<int> start, jsg::Optional<int> end, jsg::Optional<kj::String> type);
 
-  jsg::Promise<kj::Array<kj::byte>> arrayBuffer(jsg::Lock& js);
+  jsg::Promise<jsg::BufferSource> arrayBuffer(jsg::Lock& js);
   jsg::Promise<jsg::BufferSource> bytes(jsg::Lock& js);
   jsg::Promise<kj::String> text(jsg::Lock& js);
   jsg::Ref<ReadableStream> stream();
@@ -66,6 +67,7 @@ public:
 
     JSG_TS_OVERRIDE({
       bytes(): Promise<Uint8Array>;
+      arrayBuffer(): Promise<ArrayBuffer>;
     });
   }
 
@@ -84,7 +86,7 @@ public:
     tracker.trackField("type", type);
   }
 
-private:
+ private:
   Blob(kj::Array<byte> data, kj::String type);
 
   // Using a jsg::BufferSource to store the ownData allows the associated isolate
@@ -114,7 +116,7 @@ private:
 
 // An implementation of the Web Platform Standard File API
 class File: public Blob {
-public:
+ public:
   // This constructor variation is used when a File is created outside of the isolate
   // lock. This is currently only the case when parsing FormData outside of running
   // JavaScript (such as in the internal fiddle service).
@@ -159,7 +161,7 @@ public:
     tracker.trackField("name", name);
   }
 
-private:
+ private:
   kj::String name;
   double lastModified;
 };

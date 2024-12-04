@@ -18,7 +18,7 @@ namespace workerd::jsg {
 class CommonJsModuleContext;
 
 class CommonJsModuleObject: public jsg::Object {
-public:
+ public:
   CommonJsModuleObject(jsg::Lock& js): exports(js.v8Isolate, v8::Object::New(js.v8Isolate)) {}
 
   v8::Local<v8::Value> getExports(jsg::Lock& js) {
@@ -36,12 +36,12 @@ public:
     tracker.trackField("exports", exports);
   }
 
-private:
+ private:
   jsg::Value exports;
 };
 
 class CommonJsModuleContext: public jsg::Object {
-public:
+ public:
   CommonJsModuleContext(jsg::Lock& js, kj::Path path)
       : module(jsg::alloc<CommonJsModuleObject>(js)),
         path(kj::mv(path)),
@@ -73,7 +73,7 @@ public:
     tracker.trackFieldWithSize("path", path.size());
   }
 
-private:
+ private:
   kj::Path path;
   jsg::Value exports;
 };
@@ -88,8 +88,10 @@ private:
 // expected within the global scope of a Node.js compatible module (such as
 // Buffer and process).
 
+// TODO(cleanup): There's a fair amount of duplicated code between the CommonJsModule
+// and NodeJsModule types... should be deduplicated.
 class NodeJsModuleObject: public jsg::Object {
-public:
+ public:
   NodeJsModuleObject(jsg::Lock& js, kj::String path);
 
   v8::Local<v8::Value> getExports(jsg::Lock& js);
@@ -117,7 +119,7 @@ public:
     tracker.trackField("path", path);
   }
 
-private:
+ private:
   jsg::Value exports;
   kj::String path;
 };
@@ -130,7 +132,7 @@ private:
 // (b) The common Node.js globals that we implement are exposed. For instance, `process`
 //     and `Buffer` will be found at the global scope.
 class NodeJsModuleContext: public jsg::Object {
-public:
+ public:
   NodeJsModuleContext(jsg::Lock& js, kj::Path path);
 
   v8::Local<v8::Value> require(jsg::Lock& js, kj::String specifier);
@@ -164,14 +166,14 @@ public:
     tracker.trackFieldWithSize("path", path.size());
   }
 
-private:
+ private:
   kj::Path path;
   jsg::Value exports;
 };
 
 // jsg::NonModuleScript wraps a v8::UnboundScript.
 class NonModuleScript {
-public:
+ public:
   NonModuleScript(jsg::Lock& js, v8::Local<v8::UnboundScript> script)
       : unboundScript(js.v8Isolate, script) {}
 
@@ -187,11 +189,21 @@ public:
   static jsg::NonModuleScript compile(
       kj::StringPtr code, jsg::Lock& js, kj::StringPtr name = "worker.js");
 
-private:
+ private:
   v8::Global<v8::UnboundScript> unboundScript;
 };
 
-void instantiateModule(jsg::Lock& js, v8::Local<v8::Module>& module);
+enum class InstantiateModuleOptions {
+  // Allows pending top-level await in the module when evaluated. Will cause
+  // the microtask queue to be drained once in an attempt to resolve those.
+  DEFAULT,
+  // Throws if the module evaluation results in a pending promise.
+  NO_TOP_LEVEL_AWAIT,
+};
+
+void instantiateModule(jsg::Lock& js,
+    v8::Local<v8::Module>& module,
+    InstantiateModuleOptions options = InstantiateModuleOptions::DEFAULT);
 
 enum class ModuleInfoCompileOption {
   // The BUNDLE options tells the compile operation to treat the content as coming
@@ -211,7 +223,7 @@ v8::Local<v8::WasmModuleObject> compileWasmModule(
 // The ModuleRegistry maintains the collection of modules known to a script that can be
 // required or imported.
 class ModuleRegistry {
-public:
+ public:
   KJ_DISALLOW_COPY_AND_MOVE(ModuleRegistry);
 
   ModuleRegistry() {}
@@ -245,7 +257,7 @@ public:
   };
 
   struct NodeJsModuleInfo {
-    jsg::Ref<jsg::Object> moduleContext;
+    jsg::Ref<NodeJsModuleContext> moduleContext;
     jsg::Function<void()> evalFunc;
 
     NodeJsModuleInfo(auto& lock, kj::StringPtr name, kj::StringPtr content)
@@ -255,7 +267,7 @@ public:
     NodeJsModuleInfo(NodeJsModuleInfo&&) = default;
     NodeJsModuleInfo& operator=(NodeJsModuleInfo&&) = default;
 
-    static jsg::Ref<jsg::Object> initModuleContext(jsg::Lock& js, kj::StringPtr name);
+    static jsg::Ref<NodeJsModuleContext> initModuleContext(jsg::Lock& js, kj::StringPtr name);
 
     static v8::MaybeLocal<v8::Value> evaluate(jsg::Lock& js,
         NodeJsModuleInfo& info,
@@ -263,7 +275,7 @@ public:
         const kj::Maybe<kj::Array<kj::String>>& maybeExports);
 
     jsg::Function<void()> initEvalFunc(auto& lock,
-        jsg::Ref<jsg::Object>& moduleContext,
+        jsg::Ref<jsg::NodeJsModuleContext>& moduleContext,
         kj::StringPtr name,
         kj::StringPtr content) {
       v8::ScriptOrigin origin(v8StrIntern(lock.v8Isolate, name));
@@ -340,6 +352,7 @@ public:
     ModuleInfo(jsg::Lock& js,
         kj::StringPtr name,
         kj::ArrayPtr<const char> content,
+        kj::ArrayPtr<const kj::byte> compileCache,
         ModuleInfoCompileOption flags,
         const CompilationObserver& observer);
 
@@ -394,6 +407,16 @@ public:
   using DynamicImportCallback = Promise<Value>(jsg::Lock& js, kj::Function<Value()> handler);
 
   virtual void setDynamicImportCallback(kj::Function<DynamicImportCallback> func) = 0;
+
+  enum class RequireImplOptions {
+    // Require returns the module namespace.
+    DEFAULT,
+    // Require returns the default export.
+    EXPORT_DEFAULT,
+  };
+
+  static JsValue requireImpl(
+      Lock& js, ModuleInfo& info, RequireImplOptions options = RequireImplOptions::DEFAULT);
 };
 
 template <typename TypeWrapper>
@@ -412,7 +435,7 @@ kj::Maybe<kj::OneOf<kj::String, ModuleRegistry::ModuleInfo>> tryResolveFromFallb
 
 template <typename TypeWrapper>
 class ModuleRegistryImpl final: public ModuleRegistry {
-public:
+ public:
   KJ_DISALLOW_COPY_AND_MOVE(ModuleRegistryImpl);
 
   ModuleRegistryImpl(CompilationObserver& observer): observer(observer) {}
@@ -484,7 +507,8 @@ public:
       }
     }
     // TODO: asChars() might be wrong for wide characters
-    addBuiltinModule(module.getName(), module.getSrc().asChars(), module.getType());
+    addBuiltinModule(module.getName(), module.getSrc().asChars(), module.getType(),
+        module.getCompileCache().asBytes());
   }
 
   void addBuiltinBundle(Bundle::Reader bundle, kj::Maybe<Type> maybeFilter = kj::none) {
@@ -499,11 +523,13 @@ public:
   // sourceCode has to exist while this ModuleRegistry exists.
   // The expectation is for this method to be called during the assembly of worker global context
   // after registering all user modules.
-  void addBuiltinModule(
-      kj::StringPtr specifier, kj::ArrayPtr<const char> sourceCode, Type type = Type::BUILTIN) {
+  void addBuiltinModule(kj::StringPtr specifier,
+      kj::ArrayPtr<const char> sourceCode,
+      Type type = Type::BUILTIN,
+      kj::ArrayPtr<const kj::byte> compileCache = {}) {
     KJ_ASSERT(type != Type::BUNDLE);
     auto path = kj::Path::parse(specifier);
-    entries.insert(kj::heap<Entry>(path, type, sourceCode));
+    entries.insert(kj::heap<Entry>(path, type, sourceCode, compileCache));
   }
 
   void addBuiltinModule(
@@ -515,11 +541,16 @@ public:
 
   template <typename T>
   void addBuiltinModule(kj::StringPtr specifier, Type type = Type::BUILTIN) {
+    addBuiltinModule(specifier, alloc<T>(), type);
+  }
+
+  template <typename T>
+  void addBuiltinModule(kj::StringPtr specifier, Ref<T> object, Type type = Type::BUILTIN) {
     addBuiltinModule(specifier,
-        [specifier = kj::str(specifier)](
-            Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) -> kj::Maybe<ModuleInfo> {
+        [specifier = kj::str(specifier), object = kj::mv(object)](
+            Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) mutable -> kj::Maybe<ModuleInfo> {
       auto& wrapper = TypeWrapper::from(js.v8Isolate);
-      auto wrap = wrapper.wrap(js.v8Context(), kj::none, alloc<T>());
+      auto wrap = wrapper.wrap(js.v8Context(), kj::none, kj::mv(object));
       return kj::Maybe(ModuleInfo(js, specifier, kj::none, ObjectModuleInfo(js, wrap)));
     },
         type);
@@ -673,7 +704,7 @@ public:
     return observer;
   }
 
-private:
+ private:
   CompilationObserver& observer;
   kj::Maybe<kj::Function<DynamicImportCallback>> dynamicImportHandler;
 
@@ -706,15 +737,22 @@ private:
     // Either instantiated module or module source code.
     Info info;
 
+    // Optional compileCache.
+    kj::ArrayPtr<const kj::byte> compileCache;
+
     Entry(const kj::Path& specifier, Type type, ModuleInfo info)
         : specifier(specifier.clone()),
           type(type),
           info(kj::mv(info)) {}
 
-    Entry(const kj::Path& specifier, Type type, kj::ArrayPtr<const char> src)
+    Entry(const kj::Path& specifier,
+        Type type,
+        kj::ArrayPtr<const char> src,
+        kj::ArrayPtr<const kj::byte> compileCache)
         : specifier(specifier.clone()),
           type(type),
-          info(src) {}
+          info(src),
+          compileCache(compileCache) {}
 
     Entry(const kj::Path& specifier, Type type, ModuleCallback factory)
         : specifier(specifier.clone()),
@@ -734,8 +772,8 @@ private:
           return kj::Maybe<ModuleInfo&>(moduleInfo);
         }
         KJ_CASE_ONEOF(src, kj::ArrayPtr<const char>) {
-          info =
-              ModuleInfo(js, specifier.toString(), src, ModuleInfoCompileOption::BUILTIN, observer);
+          info = ModuleInfo(js, specifier.toString(), src, compileCache,
+              ModuleInfoCompileOption::BUILTIN, observer);
           return info.tryGet<ModuleInfo>();
         }
         KJ_CASE_ONEOF(src, ModuleCallback) {

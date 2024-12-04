@@ -7,6 +7,7 @@
 #include "readable.h"
 #include "writable.h"
 
+#include <workerd/io/features.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/util/weak-refs.h>
 
@@ -43,7 +44,7 @@ namespace {
 // for implementing the reader lock in a consistent way (without duplicating any code).
 template <typename Controller>
 class ReadableLockImpl {
-public:
+ public:
   using PipeController = ReadableStreamController::PipeController;
   using Reader = ReadableStreamController::Reader;
 
@@ -84,9 +85,9 @@ public:
     }
   }
 
-private:
+ private:
   class PipeLocked final: public PipeController {
-  public:
+   public:
     explicit PipeLocked(Controller& inner, jsg::Ref<WritableStream> ref)
         : inner(inner),
           writableStreamRef(kj::mv(ref)) {}
@@ -133,7 +134,7 @@ private:
       tracker.trackField("writableStreamRef", writableStreamRef);
     }
 
-  private:
+   private:
     Controller& inner;
     jsg::Ref<WritableStream> writableStreamRef;
 
@@ -149,7 +150,7 @@ private:
 // eventually allow it to be shared also with WritableStreamInternalController.
 template <typename Controller>
 class WritableLockImpl {
-public:
+ public:
   using Writer = WritableStreamController::Writer;
 
   bool isLockedToWriter() const;
@@ -177,7 +178,7 @@ public:
     }
   }
 
-private:
+ private:
   struct PipeLocked {
     ReadableStreamController::PipeController& source;
     jsg::Ref<ReadableStream> readableStreamRef;
@@ -631,7 +632,7 @@ jsg::Promise<ReadResult> deferControllerStateChange(jsg::Lock& js,
 // These are the objects that are actually passed on to the user-code's Underlying Source
 // implementation.
 class ReadableStreamJsController final: public ReadableStreamController {
-public:
+ public:
   using ReadableLockImpl = ReadableLockImpl<ReadableStreamJsController>;
 
   KJ_DISALLOW_COPY_AND_MOVE(ReadableStreamJsController);
@@ -702,7 +703,7 @@ public:
 
   kj::Maybe<kj::OneOf<DefaultController, ByobController>> getController();
 
-  jsg::Promise<kj::Array<byte>> readAllBytes(jsg::Lock& js, uint64_t limit) override;
+  jsg::Promise<jsg::BufferSource> readAllBytes(jsg::Lock& js, uint64_t limit) override;
   jsg::Promise<kj::String> readAllText(jsg::Lock& js, uint64_t limit) override;
 
   kj::Maybe<uint64_t> tryGetLength(StreamEncoding encoding) override;
@@ -717,7 +718,7 @@ public:
   size_t jsgGetMemorySelfSize() const override;
   void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const override;
 
-private:
+ private:
   // If the stream was created within the scope of a request, we want to treat it as I/O
   // and make sure it is not advanced from the scope of a different request.
   kj::Maybe<IoContext&> ioContext;
@@ -764,7 +765,7 @@ private:
 // WritableStream's backed by a user-code provided Underlying Sink. The implementation
 // is fairly complicated and defined entirely by the streams specification.
 class WritableStreamJsController final: public WritableStreamController {
-public:
+ public:
   using WritableLockImpl = WritableLockImpl<WritableStreamJsController>;
 
   using Controller = jsg::Ref<WritableStreamDefaultController>;
@@ -848,7 +849,7 @@ public:
   size_t jsgGetMemorySelfSize() const override;
   void jsgGetMemoryInfo(jsg::MemoryTracker& info) const override;
 
-private:
+ private:
   jsg::Promise<void> pipeLoop(jsg::Lock& js);
 
   kj::Maybe<IoContext&> ioContext;
@@ -2637,17 +2638,17 @@ namespace {
 // Consumes all bytes from a stream, buffering in memory, with the purpose
 // of producing either a single concatenated kj::Array<byte> or kj::String.
 class AllReader {
-public:
+ public:
   using PartList = kj::Array<kj::ArrayPtr<byte>>;
 
   AllReader(jsg::Ref<ReadableStream> stream, uint64_t limit): state(kj::mv(stream)), limit(limit) {}
   KJ_DISALLOW_COPY_AND_MOVE(AllReader);
 
-  jsg::Promise<kj::Array<byte>> allBytes(jsg::Lock& js) {
-    return loop(js).then(js, [this](auto& js, PartList&& partPtrs) {
-      auto out = kj::heapArray<byte>(runningTotal);
-      copyInto(out, kj::mv(partPtrs));
-      return kj::mv(out);
+  jsg::Promise<jsg::BufferSource> allBytes(jsg::Lock& js) {
+    return loop(js).then(js, [this](auto& js, PartList&& partPtrs) -> jsg::BufferSource {
+      auto out = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, runningTotal);
+      copyInto(out.asArrayPtr(), kj::mv(partPtrs));
+      return jsg::BufferSource(js, kj::mv(out));
     });
   }
 
@@ -2672,7 +2673,7 @@ public:
     }
   }
 
-private:
+ private:
   kj::OneOf<StreamStates::Closed, StreamStates::Errored, jsg::Ref<ReadableStream>> state;
   uint64_t limit;
   kj::Vector<jsg::BufferSource> parts;
@@ -2757,7 +2758,7 @@ private:
 };
 
 class PumpToReader {
-public:
+ public:
   PumpToReader(jsg::Ref<ReadableStream> stream, kj::Own<WritableStreamSink> sink, bool end)
       : ioContext(IoContext::current()),
         state(kj::mv(stream)),
@@ -2805,7 +2806,7 @@ public:
     KJ_UNREACHABLE;
   }
 
-private:
+ private:
   struct Pumping {};
   IoContext& ioContext;
   kj::OneOf<Pumping, StreamStates::Closed, kj::Exception, jsg::Ref<ReadableStream>> state;
@@ -3037,10 +3038,10 @@ jsg::Promise<T> ReadableStreamJsController::readAll(jsg::Lock& js, uint64_t limi
     KJ_ASSERT(lock.lock());
     // The AllReader will hold a traceable reference to the ReadableStream.
     auto reader = kj::heap<AllReader>(addRef(), limit);
-    auto promise = ([&js, &reader] {
-      if constexpr (kj::isSameType<T, kj::Array<byte>>()) {
+    auto promise = ([&js, &reader]() -> jsg::Promise<T> {
+      if constexpr (kj::isSameType<T, jsg::BufferSource>()) {
         return reader->allBytes(js);
-      } else if constexpr (kj::isSameType<T, kj::String>()) {
+      } else {
         return reader->allText(js);
       }
     })();
@@ -3061,7 +3062,12 @@ jsg::Promise<T> ReadableStreamJsController::readAll(jsg::Lock& js, uint64_t limi
 
   KJ_SWITCH_ONEOF(state) {
     KJ_CASE_ONEOF(closed, StreamStates::Closed) {
-      return js.resolvedPromise(T());
+      if constexpr (kj::isSameType<T, jsg::BufferSource>()) {
+        auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, 0);
+        return js.resolvedPromise(jsg::BufferSource(js, kj::mv(backing)));
+      } else {
+        return js.resolvedPromise(T());
+      }
     }
     KJ_CASE_ONEOF(errored, StreamStates::Errored) {
       return js.rejectedPromise<T>(errored.addRef(js));
@@ -3076,9 +3082,9 @@ jsg::Promise<T> ReadableStreamJsController::readAll(jsg::Lock& js, uint64_t limi
   KJ_UNREACHABLE;
 }
 
-jsg::Promise<kj::Array<byte>> ReadableStreamJsController::readAllBytes(
+jsg::Promise<jsg::BufferSource> ReadableStreamJsController::readAllBytes(
     jsg::Lock& js, uint64_t limit) {
-  return readAll<kj::Array<byte>>(js, limit);
+  return readAll<jsg::BufferSource>(js, limit);
 }
 
 jsg::Promise<kj::String> ReadableStreamJsController::readAllText(jsg::Lock& js, uint64_t limit) {
@@ -3629,6 +3635,13 @@ void TransformStreamDefaultController::enqueue(jsg::Lock& js, v8::Local<v8::Valu
   bool newBackpressure = readableController.hasBackpressure();
   if (newBackpressure != backpressure) {
     KJ_ASSERT(newBackpressure);
+    // Unfortunately the original implementation forgot to actually set the backpressure
+    // here so the backpressure signaling failed to work correctly. This is unfortunate
+    // because applying the backpressure here could break existing code, so we need to
+    // put the fix behind a compat flag. Doh!
+    if (FeatureFlags::get(js).getFixupTransformStreamBackpressure()) {
+      setBackpressure(js, true);
+    }
   }
 }
 
