@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <workerd/io/frankenvalue.capnp.h>
 #include <workerd/io/worker.h>
 
 namespace workerd {
@@ -30,6 +31,7 @@ class InvocationSpanContext;
 kj::Own<WorkerInterface> newWorkerEntrypoint(ThreadContext& threadContext,
     kj::Own<const Worker> worker,
     kj::Maybe<kj::StringPtr> entrypointName,
+    Frankenvalue props,
     kj::Maybe<kj::Own<Worker::Actor>> actor,
     kj::Own<LimitEnforcer> limitEnforcer,
     kj::Own<void> ioContextDependency,
@@ -43,6 +45,6 @@ kj::Own<WorkerInterface> newWorkerEntrypoint(ThreadContext& threadContext,
     // the implication is that this worker entrypoint is being created as a subrequest or
     // subtask of another request. If it is kj::none, then this invocation is a top-level
     // invocation.
-    kj::Maybe<kj::Rc<tracing::InvocationSpanContext>> maybeTriggerInvocationSpan = kj::none);
+    kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan = kj::none);
 
 }  // namespace workerd

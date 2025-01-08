@@ -22,7 +22,7 @@ const unitTests :Workerd.Config = (
           (name = "{}", pythonRequirement = ""),
         ],
         compatibilityDate = "2024-05-02",
-        compatibilityFlags = ["python_workers_development"],
+        compatibilityFlags = [%PYTHON_FEATURE_FLAGS],
       )
     ),
   ]
@@ -34,8 +34,9 @@ def generate_wd_test_file(requirement):
 # to_test is a dictionary from library name to list of imports
 def gen_import_tests(to_test):
     for lib in to_test.keys():
-        worker_py_fname = "import/{}/worker.py".format(lib)
-        wd_test_fname = "import/{}/import.wd-test".format(lib)
+        prefix = "import/" + lib
+        worker_py_fname = prefix + "/worker.py"
+        wd_test_fname = prefix + "/import.wd-test"
         write_file(
             name = worker_py_fname + "@rule",
             out = worker_py_fname,
@@ -48,6 +49,8 @@ def gen_import_tests(to_test):
         )
 
         py_wd_test(
+            name = prefix,
+            directory = lib,
             src = wd_test_fname,
             args = ["--experimental", "--pyodide-package-disk-cache-dir", "../all_pyodide_wheels"],
             data = [worker_py_fname, "@all_pyodide_wheels//:whls"],

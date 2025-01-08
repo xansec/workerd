@@ -11,12 +11,14 @@
 #include <workerd/io/cdp.capnp.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/features.h>
+#include <workerd/io/frankenvalue.h>
 #include <workerd/io/promise-wrapper.h>
 #include <workerd/io/worker.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/inspector.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/modules-new.h>
+#include <workerd/jsg/script.h>
 #include <workerd/jsg/util.h>
 #include <workerd/util/batch-queue.h>
 #include <workerd/util/color-util.h>
@@ -672,6 +674,8 @@ struct Worker::Isolate::Impl {
         actorCacheLru(limitEnforcer.getActorCacheLruOptions()) {
     jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
       auto lock = api.lock(stackScope);
+
+      limitEnforcer.customizeIsolate(lock->v8Isolate);
       if (inspectorPolicy != InspectorPolicy::DISALLOW) {
         // We just created our isolate, so we don't need to use Isolate::Impl::Lock.
         KJ_ASSERT(!isMultiTenantProcess(), "inspector is not safe in multi-tenant processes");
@@ -969,18 +973,21 @@ const HeapSnapshotDeleter HeapSnapshotDeleter::INSTANCE;
 }  // namespace
 
 Worker::Isolate::Isolate(kj::Own<Api> apiParam,
+    kj::Own<IsolateObserver> metricsParam,
     kj::StringPtr id,
+    kj::Own<IsolateLimitEnforcer> limitEnforcerParam,
     InspectorPolicy inspectorPolicy,
     ConsoleMode consoleMode)
-    : metrics(kj::atomicAddRef(apiParam->getMetrics())),
+    : metrics(kj::mv(metricsParam)),
       id(kj::str(id)),
+      limitEnforcer(kj::mv(limitEnforcerParam)),
       api(kj::mv(apiParam)),
-      limitEnforcer(api->getLimitEnforcer()),
       consoleMode(consoleMode),
       featureFlagsForFl(makeCompatJson(decompileCompatibilityFlagsForFl(api->getFeatureFlags()))),
-      impl(kj::heap<Impl>(*api, *metrics, limitEnforcer, inspectorPolicy)),
+      impl(kj::heap<Impl>(*api, *metrics, *limitEnforcer, inspectorPolicy)),
       weakIsolateRef(WeakIsolateRef::wrap(this)),
       traceAsyncContextKey(kj::refcounted<jsg::AsyncContextFrame::StorageKey>()) {
+  api->setIsolateObserver(*metrics);
   metrics->created();
   // We just created our isolate, so we don't need to use Isolate::Impl::Lock (nor an async lock).
   jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
@@ -1279,6 +1286,10 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
         // (Undocumented, as usual.)
         context =
             v8::Context::New(lock.v8Isolate, nullptr, v8::ObjectTemplate::New(lock.v8Isolate));
+        // We need to set the highest used index in every context we create to be a nullptr
+        // This is because we might later on call GetAlignedPointerFromEmbedderData which fails with
+        // a fatal error if the array is smaller than the given index.
+        context->SetAlignedPointerInEmbedderData(3, nullptr);
       }
 
       JSG_WITHIN_CONTEXT_SCOPE(lock, context, [&](jsg::Lock& js) {
@@ -1325,7 +1336,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
             KJ_SWITCH_ONEOF(source) {
               KJ_CASE_ONEOF(script, ScriptSource) {
                 impl->globals =
-                    script.compileGlobals(lock, isolate->getApi(), isolate->impl->metrics);
+                    script.compileGlobals(lock, isolate->getApi(), isolate->getApi().getObserver());
 
                 {
                   // It's unclear to me if CompileUnboundScript() can get trapped in any infinite loops or
@@ -1334,7 +1345,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
                   auto limitScope =
                       isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
                   impl->unboundScriptOrMainModule =
-                      jsg::NonModuleScript::compile(script.mainScript, lock, script.mainScriptName);
+                      jsg::NonModuleScript::compile(lock, script.mainScript, script.mainScriptName);
                 }
 
                 break;
@@ -1383,7 +1394,7 @@ Worker::Isolate::~Isolate() noexcept(false) {
 
   // Update the isolate stats one last time to make sure we're accurate for cleanup in
   // `evicted()`.
-  limitEnforcer.reportMetrics(*metrics);
+  limitEnforcer->reportMetrics(*metrics);
 
   metrics->evicted();
   weakIsolateRef->invalidate();
@@ -1651,7 +1662,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
               KJ_CASE_ONEOF(unboundScript, jsg::NonModuleScript) {
                 auto limitScope =
                     script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
-                unboundScript.run(lock.v8Context());
+                unboundScript.run(lock);
               }
               KJ_CASE_ONEOF(mainModule, kj::Path) {
                 KJ_IF_SOME(ns,
@@ -1666,7 +1677,12 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                     KJ_SWITCH_ONEOF(handler.value) {
                       KJ_CASE_ONEOF(obj, api::ExportedHandler) {
                         obj.env = lock.v8Ref(bindingsScope.As<v8::Value>());
-                        obj.ctx = jsg::alloc<api::ExecutionContext>();
+                        // TODO(cleanup): Unfortunately, for non-class-based handlers, we have
+                        //   always created only a single `ctx` object and reused it for all
+                        //   requests. This is weird and obviously wrong but changing it probably
+                        //   requires a compat flag. Until then, connection properties will not be
+                        //   available for non-class handlers.
+                        obj.ctx = jsg::alloc<api::ExecutionContext>(lock);
 
                         impl->namedHandlers.insert(kj::mv(handler.name), kj::mv(obj));
                       }
@@ -1847,7 +1863,7 @@ void Worker::handleLog(jsg::Lock& js,
     auto& ioContext = IoContext::current();
     KJ_IF_SOME(tracer, ioContext.getWorkerTracer()) {
       auto timestamp = ioContext.now();
-      tracer.addLog(timestamp, level, message(), false);
+      tracer.addLog(timestamp, level, message());
     }
   }
 
@@ -1955,7 +1971,7 @@ static inline kj::Own<T> fakeOwn(T& ref) {
 }
 
 kj::Maybe<kj::Own<api::ExportedHandler>> Worker::Lock::getExportedHandler(
-    kj::Maybe<kj::StringPtr> name, kj::Maybe<Worker::Actor&> actor) {
+    kj::Maybe<kj::StringPtr> name, Frankenvalue props, kj::Maybe<Worker::Actor&> actor) {
   KJ_IF_SOME(a, actor) {
     KJ_IF_SOME(h, a.getHandler()) {
       return fakeOwn(h);
@@ -1967,8 +1983,8 @@ kj::Maybe<kj::Own<api::ExportedHandler>> Worker::Lock::getExportedHandler(
     return fakeOwn(h);
   } else KJ_IF_SOME(cls, worker.impl->statelessClasses.find(n)) {
     jsg::Lock& js = *this;
-    auto handler = kj::heap(cls(
-        js, jsg::alloc<api::ExecutionContext>(), KJ_ASSERT_NONNULL(worker.impl->env).addRef(js)));
+    auto handler = kj::heap(cls(js, jsg::alloc<api::ExecutionContext>(js, props.toJs(js)),
+        KJ_ASSERT_NONNULL(worker.impl->env).addRef(js)));
 
     // HACK: We set handler.env and handler.ctx to undefined because we already passed the real
     //   env and ctx into the constructor, and we want the handler methods to act like they take
@@ -2594,6 +2610,10 @@ class Worker::Isolate::InspectorChannelImpl final: public v8_inspector::V8Inspec
           //   We don't know which contexts exist in this isolate, so I guess we have to
           //   create one. Ugh.
           auto dummyContext = v8::Context::New(lock->v8Isolate);
+          // We need to set the highest used index in every context we create to be a nullptr
+          // This is because we might later on call GetAlignedPointerFromEmbedderData which fails with
+          // a fatal error if the array is smaller than the given index.
+          dummyContext->SetAlignedPointerInEmbedderData(3, nullptr);
           auto& inspector = *KJ_ASSERT_NONNULL(isolate.impl->inspector);
           inspector.contextCreated(v8_inspector::V8ContextInfo(dummyContext, 1,
               v8_inspector::StringView(reinterpret_cast<const uint8_t*>("Worker"), 6)));
@@ -3800,7 +3820,7 @@ kj::Own<const Worker::Script> Worker::Isolate::newScript(kj::StringPtr scriptId,
 }
 
 void Worker::Isolate::completedRequest() const {
-  limitEnforcer.completedRequest(id);
+  limitEnforcer->completedRequest(id);
 }
 
 bool Worker::Isolate::isInspectorEnabled() const {

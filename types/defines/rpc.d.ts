@@ -190,7 +190,7 @@ declare module "cloudflare:workers" {
     constructor(ctx: DurableObjectState, env: Env);
 
     fetch?(request: Request): Response | Promise<Response>;
-    alarm?(): void | Promise<void>;
+    alarm?(alarmInfo?: AlarmInvocationInfo): void | Promise<void>;
     webSocketMessage?(
       ws: WebSocket,
       message: string | ArrayBuffer
@@ -235,6 +235,7 @@ declare module "cloudflare:workers" {
   export type WorkflowEvent<T> = {
     payload: Readonly<T>;
     timestamp: Date;
+    instanceId: string;
   };
 
   export abstract class WorkflowStep {
@@ -253,6 +254,8 @@ declare module "cloudflare:workers" {
 
     protected ctx: ExecutionContext;
     protected env: Env;
+
+    constructor(ctx: ExecutionContext, env: Env);
 
     run(event: Readonly<WorkflowEvent<T>>, step: WorkflowStep): Promise<unknown>;
   }

@@ -106,7 +106,7 @@ class DurableObject final: public Fetcher {
 
     JSG_TS_DEFINE(interface DurableObject {
       fetch(request: Request): Response | Promise<Response>;
-      alarm?(): void | Promise<void>;
+      alarm?(alarmInfo?: AlarmInvocationInfo): void | Promise<void>;
       webSocketMessage?(ws: WebSocket, message: string | ArrayBuffer): void | Promise<void>;
       webSocketClose?(ws: WebSocket, code: number, reason: string, wasClean: boolean): void | Promise<void>;
       webSocketError?(ws: WebSocket, error: unknown): void | Promise<void>;
@@ -133,6 +133,24 @@ class DurableObject final: public Fetcher {
   void visitForGc(jsg::GcVisitor& visitor) {
     visitor.visit(id);
   }
+};
+
+// Like `GlobalActorOutgoingFactory` in the source file, but only used for creating a stub to
+// primary DO so the stub can be given to a replica.
+//
+// The main distinction here is we already have the capability to the primary, so we don't need to
+// make an outgoing request to set things up.
+class ReplicaActorOutgoingFactory final: public Fetcher::OutgoingFactory {
+ public:
+  ReplicaActorOutgoingFactory(kj::Own<IoChannelFactory::ActorChannel> channel, kj::String actorId)
+      : actorChannel(kj::mv(channel)),
+        actorId(kj::mv(actorId)) {}
+
+  kj::Own<WorkerInterface> newSingleUseClient(kj::Maybe<kj::String> cfStr) override;
+
+ private:
+  kj::Own<IoChannelFactory::ActorChannel> actorChannel;
+  kj::String actorId;
 };
 
 // Global durable object class binding type.

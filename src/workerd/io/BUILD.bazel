@@ -37,6 +37,17 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "trace-stream",
+    srcs = ["trace-stream.c++"],
+    hdrs = ["trace-stream.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":io",
+        "//src/workerd/util:completion-membrane",
+    ],
+)
+
+wd_cc_library(
     name = "io",
     # HACK: Currently, the `io` and `api` packages are interdependent. We fold all the sources
     #   from `api` into `io`. In principle, it should be possible to pull them apart so `api`
@@ -46,6 +57,7 @@ wd_cc_library(
     srcs = [
         "compatibility-date.c++",
         "features.c++",
+        "frankenvalue.c++",
         "hibernation-manager.c++",
         "io-context.c++",
         "io-own.c++",
@@ -58,6 +70,7 @@ wd_cc_library(
     hdrs = [
         "compatibility-date.h",
         "features.h",
+        "frankenvalue.h",
         "hibernation-manager.h",
         "io-channels.h",
         "io-context.h",
@@ -87,6 +100,7 @@ wd_cc_library(
         ":actor-id",
         ":actor-storage_capnp",
         ":cdp_capnp",
+        ":frankenvalue_capnp",
         ":io-gate",
         ":io-helpers",
         ":limit-enforcer",
@@ -103,6 +117,7 @@ wd_cc_library(
         "//src/workerd/api:url",
         "//src/workerd/jsg",
         "//src/workerd/util:autogate",
+        "//src/workerd/util:completion-membrane",
         "//src/workerd/util:sqlite",
         "//src/workerd/util:thread-scopes",
         "//src/workerd/util:uuid",
@@ -153,6 +168,7 @@ wd_cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":trace_capnp",
         ":worker-interface_capnp",
         "//src/workerd/jsg:memory-tracker",
         "//src/workerd/util",
@@ -217,6 +233,7 @@ wd_cc_library(
     hdrs = ["worker-interface.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":frankenvalue_capnp",
         ":worker-interface_capnp",
         "@capnp-cpp//src/capnp:capnp-rpc",
         "@capnp-cpp//src/capnp:capnpc",
@@ -259,6 +276,7 @@ wd_capnp_library(
     deps = [
         ":outcome_capnp",
         ":script-version_capnp",
+        ":trace_capnp",
         "@capnp-cpp//src/capnp/compat:http-over-capnp_capnp",
     ],
 )
@@ -269,9 +287,13 @@ wd_capnp_library(src = "outcome.capnp")
 
 wd_capnp_library(src = "script-version.capnp")
 
+wd_capnp_library(src = "trace.capnp")
+
 wd_capnp_library(src = "compatibility-date.capnp")
 
 wd_capnp_library(src = "features.capnp")
+
+wd_capnp_library(src = "frankenvalue.capnp")
 
 kj_test(
     src = "io-gate-test.c++",
@@ -326,5 +348,12 @@ kj_test(
     deps = [
         ":trace",
         "//src/workerd/util:thread-scopes",
+    ],
+)
+
+kj_test(
+    src = "frankenvalue-test.c++",
+    deps = [
+        ":io",
     ],
 )

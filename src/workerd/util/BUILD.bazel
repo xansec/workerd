@@ -9,6 +9,17 @@ wd_cc_library(
         "perfetto-tracing.h",
         "use-perfetto-categories.h",
     ],
+    # HACK: We do not use the perfetto IPC system backend in any capacity. If perfetto-tracing.c++
+    # is able to inline and optimize its perfetto::Tracing::Initialize() call properly, there are no
+    # references to it anywhere in workerd and the linker can optimize it away, reducing binary
+    # sizes. Enable optimization unconditionally here so that the backend goes away.
+    # See perfetto's include/perfetto/tracing/tracing.h for more context.
+    # Alternatively, we could create an override for perfetto_build_flags.h to disable the
+    # PERFETTO_IPC and PERFETTO_SYSTEM_CONSUMER defines which also exist to facilitate link-time
+    # code elimination, but doing so results in a smaller size improvement than enabling
+    # optimization here, or no additional improvement when doing combined with enabling
+    # optimization.
+    copts = ["-O3"],
     defines = select({
         "@platforms//os:windows": [],
         "//conditions:default": ["WORKERD_USE_PERFETTO"],
@@ -52,6 +63,8 @@ wd_cc_library(
         ":duration-exceeded-logger",
         "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj:kj-async",
+        # TODO(cleanup): Only for abortable.h, factor out
+        "@capnp-cpp//src/kj/compat:kj-http",
     ],
 )
 
@@ -154,6 +167,9 @@ wd_cc_library(
     name = "sentry",
     hdrs = ["sentry.h"],
     visibility = ["//visibility:public"],
+    deps = [
+        "@capnp-cpp//src/kj",
+    ],
 )
 
 wd_cc_library(
@@ -185,6 +201,13 @@ wd_cc_library(
     hdrs = ["duration-exceeded-logger.h"],
     visibility = ["//visibility:public"],
     deps = ["@capnp-cpp//src/kj"],
+)
+
+wd_cc_library(
+    name = "completion-membrane",
+    hdrs = ["completion-membrane.h"],
+    visibility = ["//visibility:public"],
+    deps = ["@capnp-cpp//src/capnp"],
 )
 
 exports_files(["autogate.h"])

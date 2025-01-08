@@ -16,6 +16,8 @@ export const tests = {
         env.ai.lastRequestId,
         '3a1983d7-1ddd-453a-ab75-c4358c91b582'
       );
+      // Test request http status code is present
+      assert.deepStrictEqual(env.ai.lastRequestHttpStatusCode, 200);
     }
 
     {
@@ -55,6 +57,9 @@ export const tests = {
             message: '1001: prompt and messages are mutually exclusive',
           }
         );
+        // Test request internal status code is present
+        assert.deepEqual;
+        assert.deepStrictEqual(env.ai.lastRequestInternalStatusCode, 1001);
       }
     }
 
@@ -86,7 +91,11 @@ export const tests = {
       // Test raw input
       const resp = await env.ai.run('rawInputs', { prompt: 'test' });
 
-      assert.deepStrictEqual(resp, { inputs: { prompt: 'test' }, options: {} });
+      assert.deepStrictEqual(resp, {
+        inputs: { prompt: 'test' },
+        options: {},
+        requestUrl: 'https://workers-binding.ai/run?version=3',
+      });
     }
 
     {
@@ -100,6 +109,7 @@ export const tests = {
       assert.deepStrictEqual(resp, {
         inputs: { prompt: 'test' },
         options: { gateway: { id: 'my-gateway', skipCache: true } },
+        requestUrl: 'https://workers-binding.ai/ai-gateway/run?version=3',
       });
     }
 
@@ -121,6 +131,7 @@ export const tests = {
           example: 123,
           gateway: { id: 'my-gateway', metadata: { employee: 1233 } },
         },
+        requestUrl: 'https://workers-binding.ai/ai-gateway/run?version=3',
       });
     }
   },

@@ -204,6 +204,9 @@ class TestController: public jsg::Object {
 
 class ExecutionContext: public jsg::Object {
  public:
+  ExecutionContext(jsg::Lock& js): props(js, js.obj()) {}
+  ExecutionContext(jsg::Lock& js, jsg::JsValue props): props(js, props) {}
+
   void waitUntil(kj::Promise<void> promise);
   void passThroughOnException();
 
@@ -211,9 +214,14 @@ class ExecutionContext: public jsg::Object {
   // and throwing an error at the client.
   void abort(jsg::Lock& js, jsg::Optional<jsg::Value> reason);
 
+  jsg::JsValue getProps(jsg::Lock& js) {
+    return props.getHandle(js);
+  }
+
   JSG_RESOURCE_TYPE(ExecutionContext, CompatibilityFlags::Reader flags) {
     JSG_METHOD(waitUntil);
     JSG_METHOD(passThroughOnException);
+    JSG_LAZY_INSTANCE_PROPERTY(props, getProps);
 
     if (flags.getWorkerdExperimental()) {
       // TODO(soon): Before making this generally available we need to:
@@ -228,6 +236,17 @@ class ExecutionContext: public jsg::Object {
       //   consistent with each other.
       JSG_METHOD(abort);
     }
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("props", props);
+  }
+
+ private:
+  jsg::JsRef<jsg::JsValue> props;
+
+  void visitForGc(jsg::GcVisitor& visitor) {
+    visitor.visit(props);
   }
 };
 
@@ -269,6 +288,10 @@ struct ExportedHandler {
   jsg::LenientOptional<jsg::Function<TailHandler>> tail;
   jsg::LenientOptional<jsg::Function<TailHandler>> trace;
 
+  typedef kj::Promise<void> TailStreamHandler(
+      jsg::JsObject obj, jsg::Value env, jsg::Optional<jsg::Ref<ExecutionContext>> ctx);
+  jsg::LenientOptional<jsg::Function<TailStreamHandler>> tailStream;
+
   typedef kj::Promise<void> ScheduledHandler(jsg::Ref<ScheduledController> controller,
       jsg::Value env,
       jsg::Optional<jsg::Ref<ExecutionContext>> ctx);
@@ -300,6 +323,7 @@ struct ExportedHandler {
   JSG_STRUCT(fetch,
       tail,
       trace,
+      tailStream,
       scheduled,
       alarm,
       test,
@@ -316,6 +340,7 @@ struct ExportedHandler {
     type ExportedHandlerFetchHandler<Env = unknown, CfHostMetadata = unknown> = (request: Request<CfHostMetadata, IncomingRequestCfProperties<CfHostMetadata>>, env: Env, ctx: ExecutionContext) => Response | Promise<Response>;
     type ExportedHandlerTailHandler<Env = unknown> = (events: TraceItem[], env: Env, ctx: ExecutionContext) => void | Promise<void>;
     type ExportedHandlerTraceHandler<Env = unknown> = (traces: TraceItem[], env: Env, ctx: ExecutionContext) => void | Promise<void>;
+    type ExportedHandlerTailStreamHandler<Env = unknown> = (event : TailStream.TailEvent, env: Env, ctx: ExecutionContext) => TailStream.TailEventHandlerType | Promise<TailStream.TailEventHandlerType>;
     type ExportedHandlerScheduledHandler<Env = unknown> = (controller: ScheduledController, env: Env, ctx: ExecutionContext) => void | Promise<void>;
     type ExportedHandlerQueueHandler<Env = unknown, Message = unknown> = (batch: MessageBatch<Message>, env: Env, ctx: ExecutionContext) => void | Promise<void>;
     type ExportedHandlerTestHandler<Env = unknown> = (controller: TestController, env: Env, ctx: ExecutionContext) => void | Promise<void>;
@@ -325,6 +350,7 @@ struct ExportedHandler {
     fetch?: ExportedHandlerFetchHandler<Env, CfHostMetadata>;
     tail?: ExportedHandlerTailHandler<Env>;
     trace?: ExportedHandlerTraceHandler<Env>;
+    tailStream?: ExportedHandlerTailStreamHandler<Env>;
     scheduled?: ExportedHandlerScheduledHandler<Env>;
     alarm: never;
     webSocketMessage: never;

@@ -323,13 +323,16 @@ TestFixture::TestFixture(SetupParams&& params)
       memoryCacheProvider(kj::heap<api::MemoryCacheProvider>(*timer)),
       api(kj::heap<server::WorkerdApi>(testV8System,
           params.featureFlags.orDefault(CompatibilityFlags::Reader()),
-          kj::heap<MockIsolateLimitEnforcer>(),
-          kj::atomicRefcounted<IsolateObserver>(),
+          kj::heap<MockIsolateLimitEnforcer>()->getCreateParams(),
+          kj::atomicRefcounted<JsgIsolateObserver>(),
           *memoryCacheProvider,
           defaultPythonConfig,
           kj::none)),
-      workerIsolate(kj::atomicRefcounted<Worker::Isolate>(
-          kj::mv(api), scriptId, Worker::Isolate::InspectorPolicy::DISALLOW)),
+      workerIsolate(kj::atomicRefcounted<Worker::Isolate>(kj::mv(api),
+          kj::atomicRefcounted<IsolateObserver>(),
+          scriptId,
+          kj::heap<MockIsolateLimitEnforcer>(),
+          Worker::Isolate::InspectorPolicy::DISALLOW)),
       workerScript(kj::atomicRefcounted<Worker::Script>(kj::atomicAddRef(*workerIsolate),
           scriptId,
           server::WorkerdApi::extractSource(mainModuleName,
@@ -422,7 +425,7 @@ TestFixture::Response TestFixture::runRequest(
   runInIoContext([&](const TestFixture::Environment& env) {
     auto& globalScope = env.lock.getGlobalScope();
     return globalScope.request(method, url, requestHeaders, *requestBody, response, "{}"_kj,
-        env.lock, env.lock.getExportedHandler(kj::none, kj::none));
+        env.lock, env.lock.getExportedHandler(kj::none, {}, kj::none));
   });
 
   return {.statusCode = response.statusCode, .body = response.body->str()};

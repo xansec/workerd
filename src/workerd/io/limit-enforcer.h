@@ -17,7 +17,7 @@ static constexpr size_t DEFAULT_MAX_PBKDF2_ITERATIONS = 100'000;
 // Interface for an object that enforces resource limits on an Isolate level.
 //
 // See also LimitEnforcer, which enforces on a per-request level.
-class IsolateLimitEnforcer {
+class IsolateLimitEnforcer: public kj::Refcounted {
  public:
   // Get CreateParams to pass when constructing a new isolate.
   virtual v8::Isolate::CreateParams getCreateParams() = 0;
@@ -109,7 +109,7 @@ class LimitEnforcer {
   // external subrequests.
   virtual void newSubrequest(bool isInHouse) = 0;
 
-  enum class KvOpType { GET, PUT, LIST, DELETE };
+  enum class KvOpType { GET, GET_WITH, PUT, LIST, DELETE };
   // Called before starting a KV operation. Throws a JSG exception if the operation should be
   // blocked due to exceeding limits, such as the free tier daily operation limit.
   virtual void newKvRequest(KvOpType op) = 0;

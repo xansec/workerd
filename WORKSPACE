@@ -303,6 +303,8 @@ http_archive(
         "//:patches/v8/0018-Return-rejected-promise-from-WebAssembly.compile-if-.patch",
         "//:patches/v8/0019-codegen-Don-t-pass-a-nullptr-in-InitUnwindingRecord-.patch",
         "//:patches/v8/0020-Add-another-slot-in-the-isolate-for-embedder.patch",
+        "//:patches/v8/0021-Add-ValueSerializer-SetTreatProxiesAsHostObjects.patch",
+        "//:patches/v8/0022-Disable-memory-leak-assert-when-shutting-down-V8.patch",
     ],
     strip_prefix = "v8-13.1.201.8",
     url = "https://github.com/v8/v8/archive/refs/tags/13.1.201.8.tar.gz",
@@ -319,14 +321,9 @@ git_repository(
 
 http_archive(
     name = "perfetto",
-    patch_args = ["-p1"],
-    patches = [
-        "//:patches/perfetto/0001-Rename-ui-build-to-ui-build.sh-to-allow-bazel-build-.patch",
-    ],
-    repo_mapping = {"@perfetto_dep_zlib": "@zlib"},
-    sha256 = "9bbd38a0f074038bde6ccbcf5f2ff32587eb60faec254932268ecb6f17f18186",
-    strip_prefix = "perfetto-47.0",
-    url = "https://github.com/google/perfetto/archive/refs/tags/v47.0.tar.gz",
+    integrity = "sha256-jRxr9E8b2wmKtwzWDaPOa25zHk6yHdUrJSfL3PhdmE0=",
+    strip_prefix = "perfetto-48.1",
+    url = "https://github.com/google/perfetto/archive/refs/tags/v48.1.tar.gz",
 )
 
 # For use with perfetto
@@ -395,92 +392,4 @@ new_local_repository(
     name = "com_cloudflare_lol_html",
     build_file = "@workerd//deps/rust:BUILD.lolhtml",
     path = "empty",
-)
-
-# Dev tools
-
-FILE_GROUP = """filegroup(
-	name="file",
-	srcs=glob(["**"])
-)"""
-
-http_archive(
-    name = "ruff-darwin-arm64",
-    build_file_content = FILE_GROUP,
-    integrity = "sha256-KbGnLDXu1bIkD/Nl4fRdB7wMQLkzGhGcK1nMpEwPMi4=",
-    strip_prefix = "ruff-aarch64-apple-darwin",
-    url = "https://github.com/astral-sh/ruff/releases/download/0.6.7/ruff-aarch64-apple-darwin.tar.gz",
-)
-
-http_archive(
-    name = "ruff-darwin-amd64",
-    build_file_content = FILE_GROUP,
-    integrity = "sha256-W3JL0sldkm6kbaB9+mrFVoY32wR0CDhpi7SxkJ2Oug0=",
-    strip_prefix = "ruff-x86_64-apple-darwin",
-    url = "https://github.com/astral-sh/ruff/releases/download/0.6.7/ruff-x86_64-apple-darwin.tar.gz",
-)
-
-http_archive(
-    name = "ruff-linux-arm64",
-    build_file_content = FILE_GROUP,
-    integrity = "sha256-7nBZdr686PdPmCFa2EN65OHgmDCfqB3ygFaXVgUDRuM=",
-    strip_prefix = "ruff-aarch64-unknown-linux-gnu",
-    url = "https://github.com/astral-sh/ruff/releases/download/0.6.7/ruff-aarch64-unknown-linux-gnu.tar.gz",
-)
-
-http_archive(
-    name = "ruff-linux-amd64",
-    build_file_content = FILE_GROUP,
-    integrity = "sha256-Uu1+NMFYCfMT4/jtQoH+Uj5+XwZn57+ZWIhbfm8icKg=",
-    strip_prefix = "ruff-x86_64-unknown-linux-gnu",
-    url = "https://github.com/astral-sh/ruff/releases/download/0.6.7/ruff-x86_64-unknown-linux-gnu.tar.gz",
-)
-
-http_archive(
-    name = "ruff-windows-amd64",
-    build_file_content = FILE_GROUP,
-    integrity = "sha256-H2yX4kuLyNdBrkRPhTr61FQqJRyiKeLq4TnMmKE0t2A=",
-    url = "https://github.com/astral-sh/ruff/releases/download/0.6.7/ruff-x86_64-pc-windows-msvc.zip",
-)
-
-# clang-format static binary builds via GH Actions: https://github.com/npaun/bins/blob/master/.github/workflows/llvm.yml
-# TODO(soon): Move this workflow to a repo in the cloudflare GH organization
-
-http_file(
-    name = "clang-format-darwin-arm64",
-    executable = True,
-    integrity = "sha256-1hG7AcfgGL+IBrSCEhD9ed6pvIpZMdXMdhCDGkqzhpA=",
-    url = "https://github.com/npaun/bins/releases/download/llvm-18.1.8/llvm-18.1.8-darwin-arm64-clang-format",
-)
-
-http_file(
-    name = "clang-format-linux-arm64",
-    executable = True,
-    integrity = "sha256-No7G08x7VJ+CkjuhyohcTWymPPm0QUE4EZlkp9Of5jM=",
-    url = "https://github.com/npaun/bins/releases/download/llvm-18.1.8/llvm-18.1.8-linux-arm64-clang-format",
-)
-
-http_file(
-    name = "clang-format-linux-amd64",
-    executable = True,
-    integrity = "sha256-iCbaPg60x60eA9ZIWmSdFva/RD9xOBcJLUwSRK8Gxzk=",
-    url = "https://github.com/npaun/bins/releases/download/llvm-18.1.8/llvm-18.1.8-linux-amd64-clang-format",
-)
-
-http_file(
-    name = "clang-format-windows-amd64",
-    executable = True,
-    integrity = "sha256-4V2KXVoX5Ny1J7ABfVRx0nAHpAGegykhzac7zW3nK0k=",
-    url = "https://github.com/npaun/bins/releases/download/llvm-18.1.8/llvm-18.1.8-windows-amd64-clang-format.exe",
-)
-
-# ========================================================================================
-# Web Platform Tests
-
-http_archive(
-    name = "wpt",
-    build_file = "//:build/BUILD.wpt",
-    integrity = "sha256-Hxn/D6x6lI9ISlCQFq620sb8x9iXplVzXPV6zumX84A=",
-    strip_prefix = "wpt-merge_pr_48695",
-    url = "https://github.com/web-platform-tests/wpt/archive/refs/tags/merge_pr_48695.tar.gz",
 )

@@ -111,7 +111,7 @@ class IoContext_IncomingRequest final {
       kj::Own<IoChannelFactory> ioChannelFactory,
       kj::Own<RequestObserver> metrics,
       kj::Maybe<kj::Own<WorkerTracer>> workerTracer,
-      kj::Rc<tracing::InvocationSpanContext> invocationSpanContext);
+      tracing::InvocationSpanContext invocationSpanContext);
   KJ_DISALLOW_COPY_AND_MOVE(IoContext_IncomingRequest);
   ~IoContext_IncomingRequest() noexcept(false);
 
@@ -163,7 +163,7 @@ class IoContext_IncomingRequest final {
 
   // The invocation span context is a unique identifier for a specific
   // worker invocation.
-  kj::Rc<tracing::InvocationSpanContext>& getInvocationSpanContext() {
+  tracing::InvocationSpanContext& getInvocationSpanContext() {
     return invocationSpanContext;
   }
 
@@ -176,7 +176,7 @@ class IoContext_IncomingRequest final {
   // The invocation span context identifies the trace id, invocation id, and root
   // span for the current request. Every invocation of a worker function always
   // has a root span, even if it is not explicitly traced.
-  kj::Rc<tracing::InvocationSpanContext> invocationSpanContext;
+  tracing::InvocationSpanContext invocationSpanContext;
 
   bool wasDelivered = false;
 
@@ -710,19 +710,11 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
       kj::Maybe<kj::String> cfBlobJson,
       kj::ConstString operationName);
 
-  // As above, but with list of span tags to add.
-  // TODO(o11y): For now this only supports literal values based on initializer_list constraints.
-  // Add syntactic sugar to kj::vector so that we can pass in a vector more ergonomically and use
-  // that instead to support other value types.
-  struct SpanTagParams {
-    kj::LiteralStringConst key;
-    kj::LiteralStringConst value;
-  };
   kj::Own<WorkerInterface> getSubrequestChannelWithSpans(uint channel,
       bool isInHouse,
       kj::Maybe<kj::String> cfBlobJson,
       kj::ConstString operationName,
-      std::initializer_list<SpanTagParams> tags);
+      kj::Vector<Span::Tag> tags);
 
   // Like getSubrequestChannel() but doesn't enforce limits. Use for trusted paths only.
   kj::Own<WorkerInterface> getSubrequestChannelNoChecks(uint channel,
@@ -742,7 +734,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
       bool isInHouse,
       kj::Maybe<kj::String> cfBlobJson,
       kj::ConstString operationName,
-      std::initializer_list<SpanTagParams> tags);
+      kj::Vector<Span::Tag> tags);
 
   // Convenience methods that call getSubrequest*() and adapt the returned WorkerInterface objects
   // to HttpClient.
@@ -787,6 +779,10 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // information from the current async context, if available.
   SpanParent getCurrentTraceSpan();
   SpanParent getCurrentUserTraceSpan();
+
+  tracing::InvocationSpanContext& getInvocationSpanContext() {
+    return getCurrentIncomingRequest().invocationSpanContext;
+  }
 
   // Returns a builder for recording tracing spans (or a no-op builder if tracing is inactive).
   // If called while the JS lock is held, uses the trace information from the current async

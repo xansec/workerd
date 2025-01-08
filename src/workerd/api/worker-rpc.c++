@@ -1600,24 +1600,87 @@ void RpcSerializerExternalHander::serializeFunction(
   });
 }
 
+void RpcSerializerExternalHander::serializeProxy(
+    jsg::Lock& js, jsg::Serializer& serializer, v8::Local<v8::Proxy> proxy) {
+  js.withinHandleScope([&]() {
+    auto handle = jsg::JsObject(proxy);
+
+    // Proxies are only allowed to wrap objects that would normally be serialized by writing a
+    // stub, e.g. plain objects and RpcTargets. In such cases, we can write a stub pointing to the
+    // proxy.
+    //
+    // However, note that we don't actually want to test the Proxy's *target* directly, because
+    // it's possible the Proxy is trying to disguise the target as something else. Instead, we must
+    // determine the type by following the prototype chain. That way, if the Proxy overrides
+    // getPrototype(), we will honor that override.
+    //
+    // Note that we don't support functions. This is because our isFunctionForRpc() check is not
+    // prototype-based, and as such it's unclear how exactly we should go about checking for a
+    // function here. Luckily, you really don't need to use a `Proxy` to wrap a function... you
+    // can just use a function.
+
+    // TODO(perf): We should really cache `prototypeOfObject` somewhere so we don't have to create
+    //   an object to get it. (We do this other places in this file, too...)
+    auto prototypeOfObject = KJ_ASSERT_NONNULL(js.obj().getPrototype(js).tryCast<jsg::JsObject>());
+    auto prototypeOfRpcTarget = js.getPrototypeFor<JsRpcTarget>();
+    bool allowInstanceProperties = false;
+    auto proto = handle.getPrototype(js);
+    if (proto == prototypeOfObject) {
+      // A regular object. Allow access to instance properties.
+      allowInstanceProperties = true;
+    } else {
+      // Walk the prototype chain looking for RpcTarget.
+      for (;;) {
+        if (proto == prototypeOfRpcTarget) {
+          // An RpcTarget, don't allow instance properties.
+          allowInstanceProperties = false;
+          break;
+        }
+
+        KJ_IF_SOME(protoObj, proto.tryCast<jsg::JsObject>()) {
+          proto = protoObj.getPrototype(js);
+        } else {
+          // End of prototype chain, and didn't find RpcTarget.
+          JSG_FAIL_REQUIRE(DOMDataCloneError,
+              "Proxy could not be serialized because it is not a valid RPC receiver type. The "
+              "Proxy must emulate either a plain object or an RpcTarget, as indicated by the "
+              "Proxy's prototype chain.");
+        }
+      }
+    }
+
+    // Great, we've concluded we can indeed point a stub at this proxy.
+    serializer.writeRawUint32(static_cast<uint>(rpc::SerializationTag::JS_RPC_STUB));
+
+    rpc::JsRpcTarget::Client cap =
+        kj::heap<TransientJsRpcTarget>(js, IoContext::current(), handle, allowInstanceProperties);
+    write([cap = kj::mv(cap)](rpc::JsValue::External::Builder builder) mutable {
+      builder.setRpcTarget(kj::mv(cap));
+    });
+  });
+}
+
 // JsRpcTarget implementation specific to entrypoints. This is used to deliver the first, top-level
 // call of an RPC session.
 class EntrypointJsRpcTarget final: public JsRpcTargetBase {
  public:
   EntrypointJsRpcTarget(IoContext& ioCtx,
       kj::Maybe<kj::StringPtr> entrypointName,
+      Frankenvalue props,
       kj::Maybe<kj::Own<WorkerTracer>> tracer)
       : JsRpcTargetBase(ioCtx),
         // Most of the time we don't really have to clone this but it's hard to fully prove, so
         // let's be safe.
         entrypointName(entrypointName.map([](kj::StringPtr s) { return kj::str(s); })),
+        props(kj::mv(props)),
         tracer(kj::mv(tracer)) {}
 
   TargetInfo getTargetInfo(Worker::Lock& lock, IoContext& ioCtx) override {
     jsg::Lock& js = lock;
 
-    auto handler = KJ_REQUIRE_NONNULL(lock.getExportedHandler(entrypointName, ioCtx.getActor()),
-        "Failed to get handler to worker.");
+    auto handler =
+        KJ_REQUIRE_NONNULL(lock.getExportedHandler(entrypointName, kj::mv(props), ioCtx.getActor()),
+            "Failed to get handler to worker.");
 
     if (handler->missingSuperclass) {
       // JS RPC is not enabled on the server side, we cannot call any methods.
@@ -1649,6 +1712,7 @@ class EntrypointJsRpcTarget final: public JsRpcTargetBase {
 
  private:
   kj::Maybe<kj::String> entrypointName;
+  Frankenvalue props;
   kj::Maybe<kj::Own<WorkerTracer>> tracer;
 
   bool isReservedName(kj::StringPtr name) override {
@@ -1721,15 +1785,17 @@ class JsRpcSessionCustomEventImpl::ServerTopLevelMembrane final: public capnp::M
 kj::Promise<WorkerInterface::CustomEvent::Result> JsRpcSessionCustomEventImpl::run(
     kj::Own<IoContext::IncomingRequest> incomingRequest,
     kj::Maybe<kj::StringPtr> entrypointName,
+    Frankenvalue props,
     kj::TaskSet& waitUntilTasks) {
   IoContext& ioctx = incomingRequest->getContext();
 
   incomingRequest->delivered();
 
   auto [donePromise, doneFulfiller] = kj::newPromiseAndFulfiller<void>();
-  capFulfiller->fulfill(capnp::membrane(kj::heap<EntrypointJsRpcTarget>(ioctx, entrypointName,
-                                            mapAddRef(incomingRequest->getWorkerTracer())),
-      kj::refcounted<ServerTopLevelMembrane>(kj::mv(doneFulfiller))));
+  capFulfiller->fulfill(
+      capnp::membrane(kj::heap<EntrypointJsRpcTarget>(ioctx, entrypointName, kj::mv(props),
+                          mapAddRef(incomingRequest->getWorkerTracer())),
+          kj::refcounted<ServerTopLevelMembrane>(kj::mv(doneFulfiller))));
 
   KJ_DEFER({
     // waitUntil() should allow extending execution on the server side even when the client

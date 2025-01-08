@@ -52,10 +52,6 @@ build:ci-linux-common --action_env=CC=/usr/lib/llvm-16/bin/clang --action_env=CX
 build:ci-linux-common --host_action_env=CC=/usr/lib/llvm-16/bin/clang --host_action_env=CXX=/usr/lib/llvm-16/bin/clang++
 
 build:ci-linux --config=ci-linux-common
-# Some tests (like Python import tests) take a long time to run and don't benefit much
-# from multi-platform testing. For that reason, we only run them in a single configuration
-# to minimize effect on CI pipeline runtime.
-test:ci-linux --test_size_filters=small,medium,large,enormous
 
 build:ci-linux-debug --config=ci-linux-common --config=ci-limit-storage
 build:ci-linux-debug --config=debug --config=rust-debug
@@ -75,3 +71,10 @@ build:ci-macOS-debug --config=debug
 
 build:ci-windows --config=windows_no_dbg
 build:ci-windows-debug --config=debug
+
+# Some tests (like Python import tests) take a long time to run, especially when debug is enabled
+# For that reason, we only run them in the default configuration for each platform to minimize
+# effect on CI pipeline runtime.
+test:ci-linux --test_size_filters=
+test:ci-macOS --test_size_filters=
+test:ci-windows --test_size_filters=

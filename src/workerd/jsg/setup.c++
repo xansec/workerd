@@ -343,6 +343,7 @@ IsolateBase::IsolateBase(const V8System& system,
 
     ptr->SetModifyCodeGenerationFromStringsCallback(&modifyCodeGenCallback);
     ptr->SetAllowWasmCodeGenerationCallback(&allowWasmCallback);
+    ptr->SetWasmJSPIEnabledCallback(&jspiEnabledCallback);
 
     // We don't support SharedArrayBuffer so Atomics.wait() doesn't make sense, and might allow DoS
     // attacks.
@@ -405,7 +406,7 @@ v8::Local<v8::FunctionTemplate> IsolateBase::getOpaqueTemplate(v8::Isolate* isol
       ->opaqueTemplate.Get(isolate);
 }
 
-void IsolateBase::dropWrappers(kj::Own<void> typeWrapperInstance) {
+void IsolateBase::dropWrappers(kj::FunctionParam<void()> drop) {
   // Delete all wrappers.
   jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
     v8::Locker lock(ptr);
@@ -425,7 +426,7 @@ void IsolateBase::dropWrappers(kj::Own<void> typeWrapperInstance) {
 
     // Make sure the TypeWrapper is destroyed under lock by declaring a new copy of the variable
     // that is destroyed before the lock is released.
-    kj::Own<void> typeWrapperInstanceInner = kj::mv(typeWrapperInstance);
+    drop();
 
     // Destroy all wrappers.
     heapTracer.clearWrappers();
@@ -459,6 +460,12 @@ bool IsolateBase::allowWasmCallback(v8::Local<v8::Context> context, v8::Local<v8
   IsolateBase* self =
       static_cast<IsolateBase*>(context->GetIsolate()->GetData(SET_DATA_ISOLATE_BASE));
   return self->evalAllowed;
+}
+
+bool IsolateBase::jspiEnabledCallback(v8::Local<v8::Context> context) {
+  IsolateBase* self =
+      static_cast<IsolateBase*>(context->GetIsolate()->GetData(SET_DATA_ISOLATE_BASE));
+  return self->jspiEnabled;
 }
 
 void IsolateBase::jitCodeEvent(const v8::JitCodeEvent* event) noexcept {

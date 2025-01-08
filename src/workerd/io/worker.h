@@ -8,6 +8,7 @@
 #include <workerd/io/actor-cache.h>  // because we can't forward-declare ActorCache::SharedLru.
 #include <workerd/io/actor-id.h>
 #include <workerd/io/compatibility-date.capnp.h>
+#include <workerd/io/frankenvalue.h>
 #include <workerd/io/io-channels.h>
 #include <workerd/io/limit-enforcer.h>
 #include <workerd/io/outcome.capnp.h>
@@ -274,8 +275,13 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   // Usually it matches the script ID. An exception is preview isolates: there, each preview
   // session has one isolate which may load many iterations of the script (this allows the
   // inspector session to stay open across them).
+  // The Isolate object owns the Api object and outlives it in order to report teardown timing.
+  // The Api object is created before the Isolate object and does not strictly require
+  // request-specific information.
   explicit Isolate(kj::Own<Api> api,
+      kj::Own<IsolateObserver> metrics,
       kj::StringPtr id,
+      kj::Own<IsolateLimitEnforcer> limitEnforcer,
       InspectorPolicy inspectorPolicy,
       ConsoleMode consoleMode = ConsoleMode::INSPECTOR_ONLY);
 
@@ -305,11 +311,11 @@ class Worker::Isolate: public kj::AtomicRefcounted {
       kj::Maybe<ValidationErrorReporter&> errorReporter = kj::none) const;
 
   inline IsolateLimitEnforcer& getLimitEnforcer() {
-    return limitEnforcer;
+    return *limitEnforcer;
   }
 
   inline const IsolateLimitEnforcer& getLimitEnforcer() const {
-    return limitEnforcer;
+    return *limitEnforcer;
   }
 
   inline Api& getApi() {
@@ -408,8 +414,8 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   TeardownFinishedGuard<IsolateObserver&> teardownGuard{*metrics};
 
   kj::String id;
+  kj::Own<IsolateLimitEnforcer> limitEnforcer;
   kj::Own<Api> api;
-  IsolateLimitEnforcer& limitEnforcer;
   ConsoleMode consoleMode;
 
   // If non-null, a serialized JSON object with a single "flags" property, which is a list of
@@ -532,10 +538,8 @@ class Worker::Api {
   virtual jsg::JsObject wrapExecutionContext(
       jsg::Lock& lock, jsg::Ref<api::ExecutionContext> ref) const = 0;
 
-  virtual IsolateLimitEnforcer& getLimitEnforcer() = 0;
-  virtual const IsolateLimitEnforcer& getLimitEnforcer() const = 0;
-  virtual IsolateObserver& getMetrics() = 0;
-  virtual const IsolateObserver& getMetrics() const = 0;
+  virtual const jsg::IsolateObserver& getObserver() const = 0;
+  virtual void setIsolateObserver(IsolateObserver&) = 0;
 
   // Set the module fallback service callback, if any.
   using ModuleFallbackCallback = kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>>(
@@ -624,10 +628,12 @@ class Worker::Lock {
   // default handler. Returns null if this is not a modules-syntax worker (but `entrypointName`
   // must be null in that case).
   //
-  // If running in an actor, the name is ignored and the entrypoint originally used to construct
-  // the actor is returned.
+  // `props` is the value to place in `ctx.props`.
+  //
+  // If running in an actor, the name and props are ignored and the entrypoint originally used to
+  // construct the actor is returned.
   kj::Maybe<kj::Own<api::ExportedHandler>> getExportedHandler(
-      kj::Maybe<kj::StringPtr> entrypointName, kj::Maybe<Worker::Actor&> actor);
+      kj::Maybe<kj::StringPtr> entrypointName, Frankenvalue props, kj::Maybe<Worker::Actor&> actor);
 
   // Get the C++ object representing the global scope.
   api::ServiceWorkerGlobalScope& getGlobalScope();

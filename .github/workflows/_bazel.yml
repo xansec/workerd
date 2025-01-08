@@ -5,7 +5,7 @@ on:
       image:
         type: string
         required: false
-        default: "ubuntu-20.04"
+        default: "ubuntu-22.04"
       os_name:
         type: string
         required: false
@@ -67,7 +67,8 @@ jobs:
         run: |
           git config --global core.symlinks true
           git config --show-scope --show-origin core.symlinks
-          [System.IO.File]::WriteAllLines((Join-Path -Path $env:USERPROFILE -ChildPath '.bazelrc'), 'startup --output_user_root=C:/tmp')
+          git config --system core.longpaths true
+          [System.IO.File]::WriteAllLines((Join-Path -Path $env:USERPROFILE -ChildPath '.bazelrc'), 'startup --output_user_root=\\\\?\\C:\\tmp')
       - name: Configure download mirrors
         shell: bash
         run: |

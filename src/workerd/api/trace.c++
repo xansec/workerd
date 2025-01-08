@@ -15,6 +15,7 @@
 #include <workerd/util/uuid.h>
 
 #include <capnp/schema.h>
+#include <kj/encoding.h>
 
 namespace workerd::api {
 
@@ -74,15 +75,11 @@ jsg::V8Ref<v8::Object> getTraceLogMessage(jsg::Lock& js, const tracing::Log& log
 }
 
 kj::Array<jsg::Ref<TraceLog>> getTraceLogs(jsg::Lock& js, const Trace& trace) {
-  auto builder = kj::heapArrayBuilder<jsg::Ref<TraceLog>>(trace.logs.size() + trace.spans.size());
-  for (auto i: kj::indices(trace.logs)) {
-    builder.add(jsg::alloc<TraceLog>(js, trace, trace.logs[i]));
-  }
-  // Add spans represented as logs to the logs object.
-  for (auto i: kj::indices(trace.spans)) {
-    builder.add(jsg::alloc<TraceLog>(js, trace, trace.spans[i]));
-  }
-  return builder.finish();
+  return KJ_MAP(x, trace.logs) -> jsg::Ref<TraceLog> { return jsg::alloc<TraceLog>(js, trace, x); };
+}
+
+kj::Array<jsg::Ref<OTelSpan>> getTraceSpans(const Trace& trace) {
+  return KJ_MAP(x, trace.spans) -> jsg::Ref<OTelSpan> { return jsg::alloc<OTelSpan>(x); };
 }
 
 kj::Array<jsg::Ref<TraceDiagnosticChannelEvent>> getTraceDiagnosticChannelEvents(
@@ -184,6 +181,10 @@ kj::Maybe<TraceItem::EventInfo> getTraceEvent(jsg::Lock& js, const Trace& trace)
         }
         KJ_UNREACHABLE;
       }
+      KJ_CASE_ONEOF(resume, tracing::Resume) {
+        // Resume events are not used with legacy trace
+        KJ_UNREACHABLE;
+      }
       KJ_CASE_ONEOF(custom, tracing::CustomEventInfo) {
         return kj::Maybe(jsg::alloc<TraceItem::CustomEventInfo>(trace, custom));
       }
@@ -205,6 +206,7 @@ TraceItem::TraceItem(jsg::Lock& js, const Trace& trace)
       dispatchNamespace(trace.dispatchNamespace.map([](auto& ns) { return kj::str(ns); })),
       scriptTags(getTraceScriptTags(trace)),
       executionModel(enumToStr(trace.executionModel)),
+      spans(getTraceSpans(trace)),
       outcome(enumToStr(trace.outcome)),
       cpuTime(trace.cpuTime / kj::MILLISECONDS),
       wallTime(trace.wallTime / kj::MILLISECONDS),
@@ -284,6 +286,10 @@ jsg::Optional<kj::Array<kj::StringPtr>> TraceItem::getScriptTags() {
 
 kj::StringPtr TraceItem::getExecutionModel() {
   return executionModel;
+}
+
+kj::ArrayPtr<jsg::Ref<OTelSpan>> TraceItem::getSpans() {
+  return spans;
 }
 
 kj::StringPtr TraceItem::getOutcome() {
@@ -514,15 +520,15 @@ TraceItem::CustomEventInfo::CustomEventInfo(
     : eventInfo(eventInfo) {}
 
 TraceItem::HibernatableWebSocketEventInfo::HibernatableWebSocketEventInfo(
-    const Trace& trace, const tracing::HibernatableWebSocketEventInfo::Message& eventInfo)
+    const Trace& trace, const tracing::HibernatableWebSocketEventInfo::Message eventInfo)
     : eventType(jsg::alloc<TraceItem::HibernatableWebSocketEventInfo::Message>(trace, eventInfo)) {}
 
 TraceItem::HibernatableWebSocketEventInfo::HibernatableWebSocketEventInfo(
-    const Trace& trace, const tracing::HibernatableWebSocketEventInfo::Close& eventInfo)
+    const Trace& trace, const tracing::HibernatableWebSocketEventInfo::Close eventInfo)
     : eventType(jsg::alloc<TraceItem::HibernatableWebSocketEventInfo::Close>(trace, eventInfo)) {}
 
 TraceItem::HibernatableWebSocketEventInfo::HibernatableWebSocketEventInfo(
-    const Trace& trace, const tracing::HibernatableWebSocketEventInfo::Error& eventInfo)
+    const Trace& trace, const tracing::HibernatableWebSocketEventInfo::Error eventInfo)
     : eventType(jsg::alloc<TraceItem::HibernatableWebSocketEventInfo::Error>(trace, eventInfo)) {}
 
 TraceItem::HibernatableWebSocketEventInfo::Type TraceItem::HibernatableWebSocketEventInfo::
@@ -547,6 +553,47 @@ uint16_t TraceItem::HibernatableWebSocketEventInfo::Close::getCode() {
 
 bool TraceItem::HibernatableWebSocketEventInfo::Close::getWasClean() {
   return eventInfo.wasClean;
+}
+
+kj::StringPtr OTelSpan::getOperation() {
+  return operation;
+}
+
+kj::Date OTelSpan::getStartTime() {
+  return startTime;
+}
+
+kj::StringPtr OTelSpan::getSpanID() {
+  return spanId;
+}
+kj::StringPtr OTelSpan::getParentSpanID() {
+  return parentSpanId;
+}
+
+kj::Date OTelSpan::getEndTime() {
+  return endTime;
+}
+
+kj::ArrayPtr<OTelSpanTag> OTelSpan::getTags() {
+  return tags;
+}
+
+OTelSpan::OTelSpan(const CompleteSpan& span)
+    : operation(kj::str(span.operationName)),
+      startTime(span.startTime),
+      endTime(span.endTime),
+      tags(kj::heapArray<OTelSpanTag>(span.tags.size())) {
+  // IDs are represented as network-order hex strings.
+  uint64_t netSpanId = __builtin_bswap64(span.spanId);
+  uint64_t netParentSpanId = __builtin_bswap64(span.parentSpanId);
+  spanId = kj::encodeHex(kj::ArrayPtr<byte>((kj::byte*)&netSpanId, sizeof(uint64_t)));
+  parentSpanId = kj::encodeHex(kj::ArrayPtr<byte>((kj::byte*)&netParentSpanId, sizeof(uint64_t)));
+  uint32_t i = 0;
+  for (auto& tag: span.tags) {
+    tags[i].key = kj::str(tag.key);
+    tags[i].value = spanTagClone(tag.value);
+    i++;
+  }
 }
 
 TraceLog::TraceLog(jsg::Lock& js, const Trace& trace, const tracing::Log& log)
@@ -597,6 +644,7 @@ jsg::Ref<TraceMetrics> UnsafeTraceMetrics::fromTrace(jsg::Ref<TraceItem> item) {
 namespace {
 kj::Promise<void> sendTracesToExportedHandler(kj::Own<IoContext::IncomingRequest> incomingRequest,
     kj::Maybe<kj::StringPtr> entrypointNamePtr,
+    Frankenvalue props,
     kj::ArrayPtr<kj::Own<Trace>> traces) {
   // Mark the request as delivered because we're about to run some JS.
   incomingRequest->delivered();
@@ -611,7 +659,7 @@ kj::Promise<void> sendTracesToExportedHandler(kj::Own<IoContext::IncomingRequest
   auto nonEmptyTraces = kj::Vector<kj::Own<Trace>>(kj::size(traces));
   for (auto& trace: traces) {
     if (trace->eventInfo != kj::none) {
-      nonEmptyTraces.add(kj::mv(trace));
+      nonEmptyTraces.add(kj::addRef(*trace));
     }
   }
 
@@ -620,12 +668,13 @@ kj::Promise<void> sendTracesToExportedHandler(kj::Own<IoContext::IncomingRequest
   // and its members until this task completes.
   auto entrypointName = entrypointNamePtr.map([](auto s) { return kj::str(s); });
   try {
-    co_await context.run([&context, nonEmptyTraces = kj::mv(nonEmptyTraces),
-                             entrypointName = kj::mv(entrypointName)](Worker::Lock& lock) mutable {
+    co_await context.run(
+        [&context, nonEmptyTraces = nonEmptyTraces.asPtr(), entrypointName = kj::mv(entrypointName),
+            props = kj::mv(props)](Worker::Lock& lock) mutable {
       jsg::AsyncContextFrame::StorageScope traceScope = context.makeAsyncTraceScope(lock);
 
-      auto handler = lock.getExportedHandler(entrypointName, context.getActor());
-      return lock.getGlobalScope().sendTraces(nonEmptyTraces.asPtr(), lock, handler);
+      auto handler = lock.getExportedHandler(entrypointName, kj::mv(props), context.getActor());
+      return lock.getGlobalScope().sendTraces(nonEmptyTraces, lock, handler);
     });
   } catch (kj::Exception e) {
     // TODO(someday): We only report sendTraces() as failed for metrics/logging if the initial
@@ -648,10 +697,11 @@ kj::Promise<void> sendTracesToExportedHandler(kj::Own<IoContext::IncomingRequest
 
 auto TraceCustomEventImpl::run(kj::Own<IoContext::IncomingRequest> incomingRequest,
     kj::Maybe<kj::StringPtr> entrypointNamePtr,
+    Frankenvalue props,
     kj::TaskSet& waitUntilTasks) -> kj::Promise<Result> {
   // Don't bother to wait around for the handler to run, just hand it off to the waitUntil tasks.
-  waitUntilTasks.add(
-      sendTracesToExportedHandler(kj::mv(incomingRequest), entrypointNamePtr, traces));
+  waitUntilTasks.add(sendTracesToExportedHandler(
+      kj::mv(incomingRequest), entrypointNamePtr, kj::mv(props), traces));
 
   return Result{
     .outcome = EventOutcome::OK,

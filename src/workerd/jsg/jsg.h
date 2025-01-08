@@ -2528,6 +2528,9 @@ class Lock {
   // Use to enable/disable dynamic code evaluation (via eval(), new Function(), or WebAssembly).
   void setAllowEval(bool allow);
 
+  // Install JSPI on the current context. Currently used only for Python workers.
+  void installJspi();
+
   void setCaptureThrowsAsRejections(bool capture);
   void setCommonJsExportDefault(bool exportDefault);
 
@@ -2574,6 +2577,13 @@ class Lock {
   virtual Ref<DOMException> domException(
       kj::String name, kj::String message, kj::Maybe<kj::String> stackValue = kj::none) = 0;
 
+  // Get the prototype object for the given C++ type (which must be a JSG_RESOURCE_TYPE).
+  //
+  // WARNING: A malicious script can tamper with this by overwriting the `prototype` property
+  // of the class object.
+  template <typename T>
+  JsObject getPrototypeFor();
+
   // ====================================================================================
   JsObject global() KJ_WARN_UNUSED_RESULT;
   JsValue undefined() KJ_WARN_UNUSED_RESULT;
@@ -2601,6 +2611,8 @@ class Lock {
   JsSymbol symbolShared(kj::StringPtr) KJ_WARN_UNUSED_RESULT;
   JsSymbol symbolInternal(kj::StringPtr) KJ_WARN_UNUSED_RESULT;
   JsObject obj() KJ_WARN_UNUSED_RESULT;
+  JsObject obj(
+      kj::ArrayPtr<kj::StringPtr> keys, kj::ArrayPtr<jsg::JsValue> values) KJ_WARN_UNUSED_RESULT;
   JsObject objNoProto() KJ_WARN_UNUSED_RESULT;
   JsMap map() KJ_WARN_UNUSED_RESULT;
   JsValue external(void*) KJ_WARN_UNUSED_RESULT;
@@ -2688,6 +2700,7 @@ class Lock {
 
   friend class JsObject;
   virtual kj::Maybe<Object&> getInstance(v8::Local<v8::Object> obj, const std::type_info& type) = 0;
+  virtual v8::Local<v8::Object> getPrototypeFor(const std::type_info& type) = 0;
 };
 
 // Ensures that the given fn is run within both a handlescope and the context scope.

@@ -1,7 +1,4 @@
-import * as errorCodes from 'node-internal:internal_dns_constants';
+import * as dns from 'node-internal:internal_dns_promises';
 
-export * from 'node-internal:internal_dns_constants';
-
-export default {
-  ...errorCodes,
-};
+export * from 'node-internal:internal_dns_promises';
+export default dns;
