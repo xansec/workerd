@@ -6,7 +6,8 @@ RUN wget https://github.com/cloudflare/workerd/releases/download/v1.20241011.0/w
 RUN gunzip workerd-linux-64.gz
 RUN chmod +x workerd-linux-64
 
-COPY ./samples/helloworld /helloworld
+COPY ./samples/ /samples
+RUN chmod -R a+rw /samples
 
 CMD ["/workerd-linux-64",  "serve", "/helloworld/config.capnp"]
 

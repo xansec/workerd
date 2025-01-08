@@ -8,11 +8,12 @@ tasks:
   - name: behavior_testing
   - name: coverage_analysis
 cmds:
-  - cmd: /workerd-linux-64 serve /helloworld/config.capnp
+  - cmd: /workerd-linux-64 serve /samples/nodejs-compat-crypto/config.capnp
     network:
       url: 'tcp://localhost:8080'
-      timeout: 2
+      timeout: 20
       client: false
+    memory_limit: 16384
 
 
 
