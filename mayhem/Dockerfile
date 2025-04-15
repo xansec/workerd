@@ -1,6 +1,6 @@
 FROM ubuntu
 
-RUN apt update -y && DEBIAN_FRONTEND=noninteractive apt install -y wget gzip
+RUN apt update -y && DEBIAN_FRONTEND=noninteractive apt install -y wget gzip libc6-dbg
 
 RUN wget https://github.com/cloudflare/workerd/releases/download/v1.20241011.0/workerd-linux-64.gz
 RUN gunzip workerd-linux-64.gz

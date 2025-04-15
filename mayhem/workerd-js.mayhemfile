@@ -12,4 +12,5 @@ tasks:
 cmds:
   - cmd: /workerd-linux-64 serve /samples/unit-tests/config.capnp
     filepath: /samples/unit-tests/worker.js
-    memory_limit: 16384
+    memory_limit: 24576
+    timeout: 15

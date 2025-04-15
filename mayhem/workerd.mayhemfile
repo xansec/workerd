@@ -13,7 +13,7 @@ cmds:
       url: 'tcp://localhost:8080'
       timeout: 20
       client: false
-    memory_limit: 16384
+    memory_limit: 24576
 
 
 
