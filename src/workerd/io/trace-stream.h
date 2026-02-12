@@ -2,20 +2,29 @@
 
 #include <workerd/io/io-context.h>
 #include <workerd/io/trace.h>
+#include <workerd/io/tracer.h>
 #include <workerd/io/worker-interface.h>
+#include <workerd/util/checked-queue.h>
 
 namespace workerd::tracing {
 
 // A WorkerInterface::CustomEvent implementation used to deliver streaming tail
 // events to a tail worker.
-class TailStreamCustomEventImpl final: public WorkerInterface::CustomEvent {
+class TailStreamCustomEvent final: public WorkerInterface::CustomEvent {
  public:
-  TailStreamCustomEventImpl(uint16_t typeId = TYPE,
+  TailStreamCustomEvent(uint16_t typeId = TYPE,
       kj::PromiseFulfillerPair<rpc::TailStreamTarget::Client> paf =
           kj::newPromiseAndFulfiller<rpc::TailStreamTarget::Client>())
       : capFulfiller(kj::mv(paf.fulfiller)),
         clientCap(kj::mv(paf.promise)),
         typeId(typeId) {}
+
+  ~TailStreamCustomEvent() noexcept(false) {
+    if (capFulfiller->isWaiting()) {
+      capFulfiller->reject(
+          KJ_EXCEPTION(DISCONNECTED, "TailStreamCustomEvent was destroyed before completion"));
+    }
+  }
 
   kj::Promise<Result> run(kj::Own<IoContext::IncomingRequest> incomingRequest,
       kj::Maybe<kj::StringPtr> entrypointName,
@@ -34,9 +43,14 @@ class TailStreamCustomEventImpl final: public WorkerInterface::CustomEvent {
     return typeId;
   }
 
-  // TODO(streaming-tail-workers): Specify the correct type as specified in the
-  // internal capnp definition.
-  static constexpr uint16_t TYPE = 11;
+  tracing::EventInfo getEventInfo() const override;
+
+  void failed(const kj::Exception& e) override {
+    capFulfiller->reject(kj::cp(e));
+  }
+
+  // Specify same type as with TraceCustomEvent here by default.
+  static constexpr uint16_t TYPE = 2;
 
   rpc::TailStreamTarget::Client getCap() {
     auto result = kj::mv(KJ_ASSERT_NONNULL(clientCap, "can only call getCap() once"));
@@ -53,30 +67,62 @@ class TailStreamCustomEventImpl final: public WorkerInterface::CustomEvent {
 // A utility class that receives tracing events and generates/reports TailEvents.
 class TailStreamWriter final {
  public:
-  // If the Reporter returns false, then the writer should transition into a
-  // closed state.
-  using Reporter = kj::Function<bool(IoContext&, TailEvent&&)>;
+  // The maximum size of the queue, in bytes.
+  const size_t maxQueueSize = 2 * 1024 * 1024;
+  // The estimated overhead of TailEvent wrapping per message. This does not need to be very
+  // accurate, but should be enough to avoid allocating too much memory/hitting capnp RPC message
+  // size limits when sending many tiny events.
+  const size_t tailSerializationOverhead = 64;
 
-  TailStreamWriter(Reporter reporter);
+  // The initial state of our tail worker writer is that it is pending the first onset event. During
+  // this time we will only have a collection of WorkerInterface instances. When our first event is
+  // reported (the onset) we will arrange to acquire tailStream capabilities from each then use
+  // those to report the initial onset.
+  using Pending = kj::Array<kj::Own<WorkerInterface>>;
+  TailStreamWriter(Pending pending, kj::TaskSet& waitUntilTasks);
   KJ_DISALLOW_COPY_AND_MOVE(TailStreamWriter);
 
-  void report(IoContext& ioContext, TailEvent::Event&& event);
-  inline void report(IoContext& ioContext, Mark&& event) {
-    report(ioContext, TailEvent::Event(kj::mv(event)));
-  }
-
-  inline bool isClosed() const {
-    return state == kj::none;
-  }
+  void report(const InvocationSpanContext& context,
+      TailEvent::Event&& event,
+      kj::Date time,
+      size_t sizeHint);
 
  private:
-  struct State {
-    Reporter reporter;
-    uint32_t sequence = 0;
+  // Instances of Active are refcounted. The TailStreamWriter itself holds the initial ref. Whenever
+  // events are being dispatched, an additional ref will be held by the outstanding pump promise in
+  // order to keep the client stub alive long enough for the rpc calls to complete. It is possible
+  // that the TailStreamWriter will be dropped while pump promises are still pending.
+  struct Active: public kj::Refcounted {
+    // Reference to keep the worker interface instance alive.
+    kj::Maybe<rpc::TailStreamTarget::Client> capability;
+    bool pumping = false;
     bool onsetSeen = false;
-    State(Reporter reporter): reporter(kj::mv(reporter)) {}
+    // Estimated byte size of the queue, used to drop events to avoid excessive memory usage.
+    size_t queueSize = 0;
+    // The number of tail events we had to drop. We'll send a warning indicating this at the end of
+    // the stream.
+    uint32_t droppedEvents = 0;
+    workerd::util::Queue<TailEvent> queue;
+
+    Active(rpc::TailStreamTarget::Client capability): capability(kj::mv(capability)) {}
   };
-  kj::Maybe<State> state;
+
+  struct Closed {};
+
+  kj::OneOf<Pending, kj::Vector<kj::Own<Active>>, Closed> inner;
+  kj::TaskSet& waitUntilTasks;
+
+  static kj::Promise<void> pump(kj::Own<Active> current);
+  // Report an event to the tail stream writer.
+  // sizeHint: The approximate size of the event, in bytes.
+  bool reportImpl(TailEvent&& event, size_t sizeHint);
+
+  uint32_t sequence = 0;
+  bool onsetSeen = false;
+  bool outcomeSeen = false;
 };
+
+kj::Maybe<kj::Own<tracing::TailStreamWriter>> initializeTailStreamWriter(
+    kj::Array<kj::Own<WorkerInterface>> streamingTailWorkers, kj::TaskSet& waitUntilTasks);
 
 }  // namespace workerd::tracing

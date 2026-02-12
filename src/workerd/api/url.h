@@ -17,7 +17,7 @@ class URLSearchParams;
 // This is the legacy, non-standard implementation.
 class URL: public jsg::Object {
 public:
-  static jsg::Ref<URL> constructor(kj::String url, jsg::Optional<kj::String> base);
+  static jsg::Ref<URL> constructor(jsg::Lock& js, kj::String url, jsg::Optional<kj::String> base);
 
   // Href is the only setter that throws. All others ignore errors, leaving their values
   // unchanged.
@@ -53,7 +53,7 @@ public:
   kj::String getSearch();
   void setSearch(kj::String value);
 
-  jsg::Ref<URLSearchParams> getSearchParams();
+  jsg::Ref<URLSearchParams> getSearchParams(jsg::Lock& js);
 
   kj::String getHash();
   void setHash(kj::String value);
@@ -103,7 +103,7 @@ public:
     // Allow URLs which get coerced to strings in either constructor parameter
   }
 
-  // Treat as private -- needs to be public for jsg::alloc<T>()...
+  // Treat as private -- needs to be public for js.alloc<T>()...
   explicit URL(kj::Url&& u);
 
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
@@ -164,7 +164,7 @@ public:
   using Initializer = kj::OneOf<jsg::Ref<URLSearchParams>, kj::String, jsg::Dict<kj::String>,
                                 kj::Array<kj::Array<kj::String>>>;
 
-  static jsg::Ref<URLSearchParams> constructor(jsg::Optional<Initializer> init);
+  static jsg::Ref<URLSearchParams> constructor(jsg::Lock& js, jsg::Optional<Initializer> init);
 
   void append(kj::String name, kj::String value);
   void delete_(kj::String name);
@@ -180,11 +180,11 @@ public:
                 IteratorState,
                 entryIteratorNext)
   JSG_ITERATOR(KeyIterator, keys,
-                kj::String,
+                kj::StringPtr,
                 IteratorState,
                 keyIteratorNext)
   JSG_ITERATOR(ValueIterator, values,
-                kj::String,
+                kj::StringPtr,
                 IteratorState,
                 valueIteratorNext)
 
@@ -252,20 +252,20 @@ private:
     return kj::arr(kj::str(key), kj::str(value));
   }
 
-  static kj::Maybe<kj::String> keyIteratorNext(jsg::Lock& js, IteratorState& state) {
+  static kj::Maybe<kj::StringPtr> keyIteratorNext(jsg::Lock& js, IteratorState& state) {
     if (state.index >= state.parent->url->query.size()) {
       return kj::none;
     }
     auto& [key, value] = state.parent->url->query[state.index++];
-    return kj::str(key);
+    return key.asPtr();
   }
 
-  static kj::Maybe<kj::String> valueIteratorNext(jsg::Lock& js, IteratorState& state) {
+  static kj::Maybe<kj::StringPtr> valueIteratorNext(jsg::Lock& js, IteratorState& state) {
     if (state.index >= state.parent->url->query.size()) {
       return kj::none;
     }
     auto& [key, value] = state.parent->url->query[state.index++];
-    return kj::str(value);
+    return value.asPtr();
   }
 };
 

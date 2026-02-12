@@ -39,15 +39,15 @@ export const nodeJsGetBuiltins = {
 
     // But process.getBuiltinModule should always return the built-in module.
     const builtInPath = process.getBuiltinModule('node:path');
-    const builtInFs = process.getBuiltinModule('node:fs');
+    const builtInVm = process.getBuiltinModule('node:vm');
+
+    // The built-in node:vm module is not available in workers, so this should
+    // return undefined.
+    assert.strictEqual(builtInVm, undefined);
 
     // These are from the worker bundle....
     assert.strictEqual(fs, 1);
     assert.strictEqual(path, 2);
-
-    // But these are from the built-ins...
-    // node:fs is not implemented currently so it should be undefined here.
-    assert.strictEqual(builtInFs, undefined);
 
     // node:path is implemented tho...
     assert.notStrictEqual(path, builtInPath);
@@ -68,9 +68,8 @@ export const nodeJsGetBuiltins = {
 export const nodeJsEventsExports = {
   async test() {
     // Expected node:events exports should be present
-    const { EventEmitter, getMaxListeners, usingDomains } = await import(
-      'node:events'
-    );
+    const { EventEmitter, getMaxListeners, usingDomains } =
+      await import('node:events');
     assert.notEqual(getMaxListeners, undefined);
     assert.strictEqual(getMaxListeners, EventEmitter.getMaxListeners);
     assert.notEqual(usingDomains, undefined);

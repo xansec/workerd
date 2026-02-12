@@ -6,6 +6,7 @@
 
 #include <workerd/api/global-scope.h>
 #include <workerd/io/hibernation-manager.h>
+#include <workerd/io/tracer.h>
 #include <workerd/jsg/ser.h>
 
 namespace workerd::api {
@@ -56,7 +57,7 @@ jsg::Ref<WebSocket> HibernatableWebSocketEvent::claimWebSocket(
   return kj::mv(websocket);
 }
 
-kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEventImpl::run(
+kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEvent::run(
     kj::Own<IoContext_IncomingRequest> incomingRequest,
     kj::Maybe<kj::StringPtr> entrypointName,
     Frankenvalue props,
@@ -64,6 +65,9 @@ kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEve
   // Mark the request as delivered because we're about to run some JS.
   auto& context = incomingRequest->getContext();
   incomingRequest->delivered();
+
+  KJ_DEFER({ waitUntilTasks.add(incomingRequest->drain().attach(kj::mv(incomingRequest))); });
+
   EventOutcome outcome = EventOutcome::OK;
 
   // We definitely have an actor by this point. Let's set the hibernation manager on the actor
@@ -75,74 +79,50 @@ kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEve
 
   auto eventParameters = consumeParams();
 
-  KJ_IF_SOME(t, incomingRequest->getWorkerTracer()) {
-    tracing::HibernatableWebSocketEventInfo::Type type =
-        [&]() -> tracing::HibernatableWebSocketEventInfo::Type {
-      KJ_SWITCH_ONEOF(eventParameters.eventType) {
-        KJ_CASE_ONEOF(_, HibernatableSocketParams::Text) {
-          return tracing::HibernatableWebSocketEventInfo::Message{};
-        }
-        KJ_CASE_ONEOF(data, HibernatableSocketParams::Data) {
-          return tracing::HibernatableWebSocketEventInfo::Message{};
-        }
-        KJ_CASE_ONEOF(close, HibernatableSocketParams::Close) {
-          return tracing::HibernatableWebSocketEventInfo::Close{
-            .code = close.code, .wasClean = close.wasClean};
-        }
-        KJ_CASE_ONEOF(_, HibernatableSocketParams::Error) {
-          return tracing::HibernatableWebSocketEventInfo::Error{};
-        }
-      }
-      KJ_UNREACHABLE;
-    }();
-
-    t.setEventInfo(context.now(), tracing::HibernatableWebSocketEventInfo(kj::mv(type)));
-  }
-
   try {
     co_await context.run(
         [entrypointName = entrypointName, &context, eventParameters = kj::mv(eventParameters),
             props = kj::mv(props)](Worker::Lock& lock) mutable {
       KJ_SWITCH_ONEOF(eventParameters.eventType) {
         KJ_CASE_ONEOF(text, HibernatableSocketParams::Text) {
-          return lock.getGlobalScope().sendHibernatableWebSocketMessage(kj::mv(text.message),
-              eventParameters.eventTimeoutMs, kj::mv(eventParameters.websocketId), lock,
+          return lock.getGlobalScope().sendHibernatableWebSocketMessage(context,
+              kj::mv(text.message), eventParameters.eventTimeoutMs,
+              kj::mv(eventParameters.websocketId), lock,
               lock.getExportedHandler(entrypointName, kj::mv(props), context.getActor()));
         }
         KJ_CASE_ONEOF(data, HibernatableSocketParams::Data) {
-          return lock.getGlobalScope().sendHibernatableWebSocketMessage(kj::mv(data.message),
-              eventParameters.eventTimeoutMs, kj::mv(eventParameters.websocketId), lock,
+          return lock.getGlobalScope().sendHibernatableWebSocketMessage(context,
+              kj::mv(data.message), eventParameters.eventTimeoutMs,
+              kj::mv(eventParameters.websocketId), lock,
               lock.getExportedHandler(entrypointName, kj::mv(props), context.getActor()));
         }
         KJ_CASE_ONEOF(close, HibernatableSocketParams::Close) {
-          return lock.getGlobalScope().sendHibernatableWebSocketClose(kj::mv(close),
+          return lock.getGlobalScope().sendHibernatableWebSocketClose(context, kj::mv(close),
               eventParameters.eventTimeoutMs, kj::mv(eventParameters.websocketId), lock,
               lock.getExportedHandler(entrypointName, kj::mv(props), context.getActor()));
         }
         KJ_CASE_ONEOF(e, HibernatableSocketParams::Error) {
-          return lock.getGlobalScope().sendHibernatableWebSocketError(kj::mv(e.error),
+          return lock.getGlobalScope().sendHibernatableWebSocketError(context, kj::mv(e.error),
               eventParameters.eventTimeoutMs, kj::mv(eventParameters.websocketId), lock,
               lock.getExportedHandler(entrypointName, kj::mv(props), context.getActor()));
         }
         KJ_UNREACHABLE;
       }
     });
-  } catch (kj::Exception e) {
+  } catch (kj::Exception& e) {
     if (auto desc = e.getDescription();
         !jsg::isTunneledException(desc) && !jsg::isDoNotLogException(desc)) {
-      LOG_EXCEPTION("HibernatableWebSocketCustomEventImpl"_kj, e);
+      LOG_EXCEPTION("HibernatableWebSocketCustomEvent"_kj, e);
     }
     outcome = EventOutcome::EXCEPTION;
   }
-
-  waitUntilTasks.add(incomingRequest->drain().attach(kj::mv(incomingRequest)));
 
   co_return Result{
     .outcome = outcome,
   };
 }
 
-kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEventImpl::sendRpc(
+kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEvent::sendRpc(
     capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
     capnp::ByteStreamFactory& byteStreamFactory,
     rpc::EventDispatcher::Client dispatcher) {
@@ -193,18 +173,62 @@ HibernatableWebSocketEvent::ItemsForRelease::ItemsForRelease(
       ownedWebSocket(kj::mv(owned)),
       tags(kj::mv(tags)) {}
 
-HibernatableWebSocketCustomEventImpl::HibernatableWebSocketCustomEventImpl(uint16_t typeId,
+HibernatableWebSocketCustomEvent::HibernatableWebSocketCustomEvent(uint16_t typeId,
     kj::Own<HibernationReader> params,
     kj::Maybe<Worker::Actor::HibernationManager&> manager)
     : typeId(typeId),
       params(kj::mv(params)) {}
-HibernatableWebSocketCustomEventImpl::HibernatableWebSocketCustomEventImpl(
+HibernatableWebSocketCustomEvent::HibernatableWebSocketCustomEvent(
     uint16_t typeId, HibernatableSocketParams params, Worker::Actor::HibernationManager& manager)
     : typeId(typeId),
       params(kj::mv(params)),
       manager(manager) {}
 
-HibernatableSocketParams HibernatableWebSocketCustomEventImpl::consumeParams() {
+// Try to extract event type from params if available
+tracing::HibernatableWebSocketEventInfo::Type HibernatableWebSocketCustomEvent::getEventType()
+    const {
+  KJ_SWITCH_ONEOF(params) {
+    KJ_CASE_ONEOF(socketParams, HibernatableSocketParams) {
+      KJ_SWITCH_ONEOF(socketParams.eventType) {
+        KJ_CASE_ONEOF(_, HibernatableSocketParams::Text) {
+          return tracing::HibernatableWebSocketEventInfo::Message{};
+        }
+        KJ_CASE_ONEOF(_, HibernatableSocketParams::Data) {
+          return tracing::HibernatableWebSocketEventInfo::Message{};
+        }
+        KJ_CASE_ONEOF(close, HibernatableSocketParams::Close) {
+          return tracing::HibernatableWebSocketEventInfo::Close{close.code, close.wasClean};
+        }
+        KJ_CASE_ONEOF(_, HibernatableSocketParams::Error) {
+          return tracing::HibernatableWebSocketEventInfo::Error{};
+        }
+      }
+    }
+    KJ_CASE_ONEOF(reader, kj::Own<HibernationReader>) {
+      // Parse the HibernationReader to determine the actual event type
+      auto payload = reader->getMessage().getPayload();
+      switch (payload.which()) {
+        case rpc::HibernatableWebSocketEventMessage::Payload::TEXT:
+        case rpc::HibernatableWebSocketEventMessage::Payload::DATA:
+          return tracing::HibernatableWebSocketEventInfo::Message{};
+        case rpc::HibernatableWebSocketEventMessage::Payload::CLOSE: {
+          auto close = payload.getClose();
+          return tracing::HibernatableWebSocketEventInfo::Close{
+            close.getCode(), close.getWasClean()};
+        }
+        case rpc::HibernatableWebSocketEventMessage::Payload::ERROR:
+          return tracing::HibernatableWebSocketEventInfo::Error{};
+      }
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+tracing::EventInfo HibernatableWebSocketCustomEvent::getEventInfo() const {
+  return tracing::HibernatableWebSocketEventInfo(getEventType());
+}
+
+HibernatableSocketParams HibernatableWebSocketCustomEvent::consumeParams() {
   KJ_IF_SOME(p, params.tryGet<kj::Own<HibernationReader>>()) {
     kj::Maybe<HibernatableSocketParams> eventParameters;
     auto websocketId = kj::str(p->getMessage().getWebsocketId());

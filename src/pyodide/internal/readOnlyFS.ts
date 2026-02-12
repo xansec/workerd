@@ -1,3 +1,18 @@
+type ReadFn<Info> = FSStreamOps<Info>['read'];
+
+// When we load shared libraries we need to ensure they come from a read only file system.
+
+// Map to store the original trusted read function for each read-only filesystem. We store the
+// function itself to prevent attacks where user code modifies stream_ops.read after filesystem
+// creation and tricks us into loading a dynamically generated so file.
+const TRUSTED_READ_FUNCS: Map<object, ReadFn<any>> = new Map();
+
+export function getTrustedReadFunc<Info>(
+  node: FSNode<Info>
+): ReadFn<Info> | undefined {
+  return TRUSTED_READ_FUNCS.get(node.mount.type);
+}
+
 export function createReadonlyFS<Info>(
   FSOps: FSOps<Info>,
   Module: Module
@@ -8,13 +23,14 @@ export function createReadonlyFS<Info>(
       return ReadOnlyFS.createNode(null, '/', mount.opts.info);
     },
     createNode(parent, name, info): FSNode<Info> {
+      // eslint-disable-next-line prefer-const
       let { permissions: mode, isDir } = FSOps.getNodeMode(parent, name, info);
       if (isDir) {
         mode |= 1 << 14; // set S_IFDIR
       } else {
         mode |= 1 << 15; // set S_IFREG
       }
-      var node = FS.createNode(parent, name, mode);
+      const node = FS.createNode(parent, name, mode);
       node.node_ops = ReadOnlyFS.node_ops;
       node.stream_ops = ReadOnlyFS.stream_ops;
       FSOps.setNodeAttributes(node, info, isDir);
@@ -49,7 +65,7 @@ export function createReadonlyFS<Info>(
       lookup(parent, name) {
         const child = FSOps.lookup(parent, name);
         if (child === undefined) {
-          throw FS.genericErrors[44]; // ENOENT
+          throw FS.genericErrors?.[44] ?? new FS.ErrnoError(44); // ENOENT
         }
         return ReadOnlyFS.createNode(parent, name, child);
       },
@@ -63,21 +79,21 @@ export function createReadonlyFS<Info>(
         } else if (whence === 2) {
           // SEEK_END
           if (FS.isFile(stream.node.mode)) {
-            if ((stream.node.info as any).size == undefined) {
-              throw new Error('File size is undefined');
-            }
-            position += (stream.node.info as any).size;
+            position += stream.node.usedBytes;
           }
         }
         return position;
       },
       read(stream, buffer, offset, length, position) {
         if (position >= stream.node.usedBytes) return 0;
-        var size = Math.min(stream.node.usedBytes - position, length);
+        const size = Math.min(stream.node.usedBytes - position, length);
         buffer = buffer.subarray(offset, offset + size);
         return FSOps.read(stream, position, buffer);
       },
     },
   };
+  // Register this filesystem as read-only and store its trusted read function so we can load so
+  // files from it.
+  TRUSTED_READ_FUNCS.set(ReadOnlyFS, ReadOnlyFS.stream_ops.read);
   return ReadOnlyFS;
 }

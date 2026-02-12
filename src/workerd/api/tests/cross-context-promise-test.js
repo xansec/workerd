@@ -94,7 +94,9 @@ export const expiredContextWorks = {
     strictEqual(results[1].status, 'fulfilled');
     strictEqual(
       results[0].reason.message,
-      'The script will never generate a response.'
+      "The Workers runtime canceled this request because it detected that your Worker's code " +
+        'had hung and would never generate a response. Refer to: ' +
+        'https://developers.cloudflare.com/workers/observability/errors/'
     );
     strictEqual(results[1].value.status, 200);
     strictEqual(await results[1].value.text(), 'ok');
@@ -243,7 +245,7 @@ async function rejectTest(req, env, ctx) {
 async function crossRequestStream(req, env, ctx) {
   // Here, we are going to create a stream that will be used across
   // requests. The first request will create the stream and queue up
-  // a pending read. The second request will fulfull the read by providing
+  // a pending read. The second request will fulfill the read by providing
   // data to the stream.
   if (globalThis.stream === undefined) {
     setupWaiter(ctx);

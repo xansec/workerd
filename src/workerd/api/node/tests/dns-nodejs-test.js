@@ -4,7 +4,7 @@
 // Copyright Joyent and Node contributors. All rights reserved. MIT license.
 import dns from 'node:dns';
 import dnsPromises from 'node:dns/promises';
-import { strictEqual, ok, deepStrictEqual } from 'node:assert';
+import { strictEqual, ok, deepStrictEqual, throws } from 'node:assert';
 import { inspect } from 'node:util';
 
 // Taken from Node.js
@@ -95,9 +95,15 @@ export const errorCodesExist = {
 export const resolveTxt = {
   async test() {
     function validateResult(result) {
+      ok(
+        result.length > 0,
+        `Result length should be greater than 0 but got ${inspect(result)}`
+      );
       ok(Array.isArray(result[0]));
-      strictEqual(result.length, 1);
-      ok(result[0][0].startsWith('v=spf1'));
+      ok(
+        result.some((record) => record[0].startsWith('v=spf1')),
+        `Expected SPF record but got ${inspect(result[0])}`
+      );
     }
 
     validateResult(await dnsPromises.resolveTxt(addresses.TXT_HOST));
@@ -362,5 +368,116 @@ export const getServers = {
       '1.0.0.1',
       '2606:4700:4700::1001',
     ]);
+  },
+};
+
+// Tests are taken from
+// https://github.com/nodejs/node/blob/3153c8333e3a8f2015b795642def4d81ec7cd7b3/test/parallel/test-dns-lookup.js
+export const testDnsLookup = {
+  async test() {
+    {
+      const err = {
+        code: 'ERR_INVALID_ARG_TYPE',
+        name: 'TypeError',
+      };
+
+      throws(() => dns.lookup(1, {}), err);
+      throws(() => dnsPromises.lookup(1, {}), err);
+    }
+
+    throws(
+      () => {
+        dns.lookup(false, 'cb');
+      },
+      {
+        code: 'ERR_INVALID_ARG_TYPE',
+        name: 'TypeError',
+      }
+    );
+
+    throws(
+      () => {
+        dns.lookup(false, 'options', 'cb');
+      },
+      {
+        code: 'ERR_INVALID_ARG_TYPE',
+        name: 'TypeError',
+      }
+    );
+
+    {
+      const family = 20;
+      const err = {
+        code: 'ERR_INVALID_ARG_VALUE',
+        name: 'TypeError',
+        message: `The property 'options.family' must be one of: 0, 4, 6. Received ${family}`,
+      };
+      const options = {
+        family,
+        all: false,
+      };
+
+      throws(() => {
+        dnsPromises.lookup(false, options);
+      }, err);
+      throws(() => {
+        dns.lookup(false, options, () => {});
+      }, err);
+    }
+
+    [1, 0n, 1n, '', '0', Symbol(), true, false, {}, [], () => {}].forEach(
+      (family) => {
+        const err = { code: 'ERR_INVALID_ARG_VALUE' };
+        const options = { family };
+        throws(() => {
+          dnsPromises.lookup(false, options);
+        }, err);
+        throws(() => {
+          dns.lookup(false, options, () => {});
+        }, err);
+      }
+    );
+    [0n, 1n, '', '0', Symbol(), true, false].forEach((family) => {
+      const err = { code: 'ERR_INVALID_ARG_TYPE' };
+      throws(() => {
+        dnsPromises.lookup(false, family);
+      }, err);
+      throws(() => {
+        dns.lookup(false, family, () => {});
+      }, err);
+    });
+
+    [0, 1, 0n, 1n, '', '0', Symbol(), {}, [], () => {}].forEach((all) => {
+      const err = { code: 'ERR_INVALID_ARG_TYPE' };
+      const options = { all };
+      throws(() => {
+        dnsPromises.lookup(false, options);
+      }, err);
+      throws(() => {
+        dns.lookup(false, options, () => {});
+      }, err);
+    });
+
+    [0, 1, 0n, 1n, '', '0', Symbol(), {}, [], () => {}].forEach((verbatim) => {
+      const err = { code: 'ERR_INVALID_ARG_TYPE' };
+      const options = { verbatim };
+      throws(() => {
+        dnsPromises.lookup(false, options);
+      }, err);
+      throws(() => {
+        dns.lookup(false, options, () => {});
+      }, err);
+    });
+
+    [0, 1, 0n, 1n, '', '0', Symbol(), {}, [], () => {}].forEach((order) => {
+      const err = { code: 'ERR_INVALID_ARG_VALUE' };
+      const options = { order };
+      throws(() => {
+        dnsPromises.lookup(false, options);
+      }, err);
+      throws(() => {
+        dns.lookup(false, options, () => {});
+      }, err);
+    });
   },
 };

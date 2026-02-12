@@ -60,7 +60,6 @@ export async function sendDnsRequest(
   server.searchParams.set('type', type);
 
   // syscall needs to be in format of `queryTxt`
-  // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
   const syscall = `query${type.at(0)?.toUpperCase()}${type.slice(1)}`;
 
   let json: SuccessResponse | FailedResponse;
@@ -71,10 +70,15 @@ export async function sendDnsRequest(
       },
       method: 'GET',
     });
+    if (!response.ok) {
+      throw new DnsError(name, errorCodes.BADRESP, syscall);
+    }
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     json = await response.json();
-  } catch {
-    throw new DnsError(name, errorCodes.BADQUERY, syscall);
+  } catch (e) {
+    throw e instanceof DnsError
+      ? e
+      : new DnsError(name, errorCodes.BADQUERY, syscall);
   }
 
   if ('error' in json) {
@@ -232,11 +236,32 @@ export function normalizeSrv({ data }: Answer): SRV {
   };
 }
 
+// This regex works by:
+//
+// `"` - Matches an opening quote
+// ([^"]|"(?!"))* - Matches either:
+//   [^"] - Any character that's not a quote
+//   "(?!") - A quote that's not followed by another quote
+// `"` - Matches a closing quote
+// /g - Global flag to match all occurrences
+const SPLIT_REGEX = /"([^"]|"(?!"))*"/g;
+
 export function normalizeTxt({ data }: Answer): string[] {
   // Each entry has quotation marks as a prefix and suffix.
   // Node.js APIs doesn't have them.
   if (data.startsWith('"') && data.endsWith('"')) {
-    return [data.slice(1, -1)];
+    // If the input starts and ends with a quotation mark, we need to split
+    // each occurrence and remove the leading/trailing characters.
+    // For example, for the input `"test""test""test with " quote"`
+    // It returns: ['test', 'test', 'test with " quote']
+    return (
+      data.match(SPLIT_REGEX)?.map((s) => {
+        if (s.startsWith('"') && s.endsWith('"')) {
+          return s.slice(1, -1);
+        }
+        return s;
+      }) ?? []
+    );
   }
   return [data];
 }

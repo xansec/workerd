@@ -6,10 +6,12 @@
 // INTERNAL IMPLEMENTATION FILE
 //
 // This file contains misc utility functions used elsewhere.
+#include <workerd/jsg/exception.h>
 
-#include <workerd/util/sentry.h>
-
-#include <v8.h>
+#include <v8-array-buffer.h>
+#include <v8-exception.h>
+#include <v8-primitive.h>
+#include <v8-promise.h>
 
 #include <kj/debug.h>
 #include <kj/exception.h>
@@ -17,11 +19,30 @@
 
 #include <typeinfo>
 
+namespace v8 {
+class Isolate;
+}
 namespace workerd::jsg {
 
 class Lock;
+class JsObject;
 
-typedef unsigned int uint;
+using uint = unsigned int;
+
+#define JS_ERROR_TYPES(V)                                                                          \
+  V("Error", Error)                                                                                \
+  V("RangeError", RangeError)                                                                      \
+  V("TypeError", TypeError)                                                                        \
+  V("SyntaxError", SyntaxError)                                                                    \
+  V("ReferenceError", ReferenceError)                                                              \
+  V("CompileError", WasmCompileError)                                                              \
+  V("LinkError", WasmLinkError)                                                                    \
+  V("RuntimeError", WasmRuntimeError)                                                              \
+  V("SuspendError", WasmSuspendError)                                                              \
+  V("AggregateError", AggregateError)                                                              \
+  V("SuppressedError", SuppressedError)                                                            \
+  V("URIError", URIError)                                                                          \
+  V("EvalError", EvalError)
 
 // When a C++ callback wishes to throw a JavaScript exception, it should first call
 // isolate->ThrowException() to set the JavaScript error value, then it should throw
@@ -44,8 +65,8 @@ class JsExceptionThrown: public std::exception {
 };
 
 bool getCaptureThrowsAsRejections(v8::Isolate* isolate);
-bool getCommonJsExportDefault(v8::Isolate* isolate);
 bool getShouldSetToStringTag(v8::Isolate* isolate);
+bool getShouldSetImmutablePrototype(v8::Isolate* isolate);
 
 kj::String fullyQualifiedTypeName(const std::type_info& type);
 kj::String typeName(const std::type_info& type);
@@ -58,18 +79,27 @@ v8::Local<v8::Value> makeInternalError(v8::Isolate* isolate, kj::StringPtr inter
 // Creates a JavaScript error that obfuscates the exception details, while logging the full details
 // to stderr. If the KJ exception was created using throwTunneledException(), don't log anything
 // but instead return the original reconstructed JavaScript exception.
-v8::Local<v8::Value> makeInternalError(v8::Isolate* isolate, kj::Exception&& exception);
+v8::Local<v8::Value> exceptionToJs(
+    v8::Isolate* isolate, kj::Exception&& exception, ExceptionToJsOptions options = {});
 
 // calls makeInternalError() and then tells the isolate to throw it.
 void throwInternalError(v8::Isolate* isolate, kj::StringPtr internalMessage);
 
 // calls makeInternalError() and then tells the isolate to throw it.
-void throwInternalError(v8::Isolate* isolate, kj::Exception&& exception);
+void throwInternalError(
+    v8::Isolate* isolate, kj::Exception&& exception, ExceptionToJsOptions options = {});
 
 constexpr kj::Exception::DetailTypeId TUNNELED_EXCEPTION_DETAIL_ID = 0xe8027292171b1646ull;
 
+// Detail type for JavaScript exception metadata (error type and stack trace)
+constexpr kj::Exception::DetailTypeId JS_EXCEPTION_METADATA_DETAIL_ID = 0xa9ae63464030fcefull;
+
 // Add a serialized copy of the exception value to the KJ exception, as a "detail".
 void addExceptionDetail(Lock& js, kj::Exception& exception, v8::Local<v8::Value> handle);
+
+// Extract and add JavaScript exception metadata (error type and stack trace) to the KJ exception.
+// Serializes using Cap'n Proto schema defined in exception-metadata.capnp.
+void addJsExceptionMetadata(Lock& js, kj::Exception& exception, v8::Local<v8::Value> handle);
 
 struct TypeErrorContext {
   enum Kind : uint8_t {
@@ -194,6 +224,9 @@ kj::Array<kj::byte> asBytes(v8::Local<v8::ArrayBuffer> arrayBuffer);
 // View the contents of the given v8::ArrayBuffer/ArrayBufferView as an ArrayPtr<byte>.
 kj::Array<kj::byte> asBytes(v8::Local<v8::ArrayBufferView> arrayBufferView);
 
+// View the contents of the given v8::SharedArrayBuffer as an ArrayPtr<byte>.
+kj::Array<kj::byte> asBytes(v8::Local<v8::SharedArrayBuffer> sharedArrayBuffer);
+
 // Freeze the given object and all its members, making it recursively immutable.
 //
 // WARNING: This function is unsafe to call on user-provided content since if the value is cyclic
@@ -213,7 +246,7 @@ v8::Local<v8::Value> deepClone(v8::Local<v8::Context> context, v8::Local<v8::Val
 //
 // TODO(cleanup): Call sites should migrate to the new js.str(...) variants on jsg::Lock
 // rather than calling v8Str directly. Once the migration is a big further along, v8Str
-// and it's variants will be explicitly marked deprecated.
+// and its variants will be explicitly marked deprecated.
 template <typename T>
 v8::Local<v8::String> v8Str(v8::Isolate* isolate,
     kj::ArrayPtr<T> ptr,
@@ -266,18 +299,18 @@ template <typename T>
 struct RemoveMaybe_;
 template <typename T>
 struct RemoveMaybe_<kj::Maybe<T>> {
-  typedef T Type;
+  using Type = T;
 };
 template <typename T>
 using RemoveMaybe = typename RemoveMaybe_<T>::Type;
 
 template <typename T>
 struct RemoveRvalueRef_ {
-  typedef T Type;
+  using Type = T;
 };
 template <typename T>
 struct RemoveRvalueRef_<T&&> {
-  typedef T Type;
+  using Type = T;
 };
 template <typename T>
 using RemoveRvalueRef = typename RemoveRvalueRef_<T>::Type;
@@ -286,19 +319,29 @@ enum class JsgKind { RESOURCE, STRUCT, EXTENSION };
 
 template <typename T>
 struct LiftKj_ {
-  template <typename Info, typename Func>
-  static void apply(const Info& info, Func&& func) {
-    auto isolate = info.GetIsolate();
+  template <typename Info, typename Func, typename Ret = void>
+  static Ret apply(const Info& info, Func&& func) {
+    constexpr bool isFastApi = kj::isSameType<v8::Isolate*, Info>();
+    v8::Isolate* isolate;
+    if constexpr (isFastApi) {
+      isolate = info;
+    } else {
+      isolate = info.GetIsolate();
+    }
+
     try {
       try {
-        v8::HandleScope scope(isolate);
-        if constexpr (isVoid<T>()) {
-          func();
-          if constexpr (!kj::canConvert<Info&, v8::PropertyCallbackInfo<void>&>()) {
-            info.GetReturnValue().SetUndefined();
-          }
+        if constexpr (isFastApi) {
+          return func();
         } else {
-          info.GetReturnValue().Set(func());
+          if constexpr (isVoid<T>()) {
+            func();
+            if constexpr (!kj::canConvert<Info&, v8::PropertyCallbackInfo<void>&>()) {
+              info.GetReturnValue().SetUndefined();
+            }
+          } else {
+            info.GetReturnValue().Set(func());
+          }
         }
       } catch (kj::Exception& exception) {
         // This throwInternalError() overload may decode a tunneled error. While constructing the
@@ -314,6 +357,12 @@ struct LiftKj_ {
     } catch (...) {
       throwInternalError(
           isolate, kj::str("caught unknown exception of type: ", kj::getCaughtExceptionType()));
+    }
+
+    if constexpr (isFastApi && !isVoid<Ret>()) {
+      // Since we return early on fast api calls, this should never get executed
+      // unless there is an error thrown from the fast api call itself.
+      return Ret{};
     }
   }
 };
@@ -338,7 +387,6 @@ struct LiftKj_<v8::Local<v8::Promise>> {
       return;
     }
 
-    v8::HandleScope scope(isolate);
     v8::TryCatch tryCatch(isolate);
     try {
       try {
@@ -348,7 +396,7 @@ struct LiftKj_<v8::Local<v8::Promise>> {
         // the v8::Value representing the tunneled error, it itself may cause a JS exception to be
         // thrown. This is the reason for the nested try-catch blocks -- we need to be able to
         // swallow any JsExceptionThrown exceptions that this catch block generates.
-        returnRejectedPromise(info, makeInternalError(isolate, kj::mv(exception)), tryCatch);
+        returnRejectedPromise(info, exceptionToJs(isolate, kj::mv(exception)), tryCatch);
       }
     } catch (JsExceptionThrown&) {
       if (tryCatch.CanContinue()) {
@@ -382,6 +430,13 @@ struct LiftKj_<v8::Local<v8::Promise>> {
 template <typename Info, typename Func>
 void liftKj(const Info& info, Func&& func) {
   LiftKj_<decltype(func())>::apply(info, kj::fwd<Func>(func));
+}
+
+// Direct value version of liftKj for use with Fast API and other contexts where callback info isn't available
+template <typename Ret, typename Func>
+Ret liftKj(v8::Isolate* isolate, Func&& func) {
+  return LiftKj_<decltype(func())>::template apply<v8::Isolate*, Func, Ret>(
+      isolate, kj::fwd<Func>(func));
 }
 
 namespace _ {
@@ -430,6 +485,9 @@ concept HasConfiguration = requires(GetConfiguration<T> arg) { T::jsgConfigurati
 inline bool isFinite(double value) {
   return !(kj::isNaN(value) || value == kj::inf() || value == -kj::inf());
 }
+
+template <typename T>
+concept StrictlyBool = kj::isSameType<T, bool>();
 
 // ======================================================================================
 
@@ -480,9 +538,48 @@ struct Unimplemented {};
 using WontImplement = Unimplemented;
 
 // ======================================================================================
+// Module utilities
+
+// Creates a mutable copy of a module namespace object for CommonJS compatibility.
+// This is needed because ES module namespaces have read-only properties, but
+// CommonJS require() is expected to return objects with mutable properties.
+// This matches Node.js behavior when requiring an ESM module from CJS.
+// See: https://github.com/cloudflare/workerd/issues/5844
+JsObject createMutableModuleExports(Lock& js, JsObject moduleNamespace);
+
+// ======================================================================================
 // Node.js Compat
 
 kj::Maybe<kj::String> checkNodeSpecifier(kj::StringPtr specifier);
 bool isNodeJsCompatEnabled(jsg::Lock& js);
+bool isNodeJsProcessV2Enabled(jsg::Lock& js);
+bool isRequireReturnsDefaultExportEnabled(jsg::Lock& js);
+
+// The following counter is used to track the number of times a method is called.
+// This is mostly useful for validating/testing v8 fast api methods, but also for
+// tracking the number of times a method is called in general.
+struct CallCounter {
+  // Referring to the slow method triggered at least once for a single method call.
+  uint32_t slow = 0;
+  // Referring to the fast method whenever V8 optimizes the method.
+  // Might or might not be called depending on the method's implementation,
+  // and the current limitations of v8 fast api.
+  uint32_t fast = 0;
+
+  void reset() {
+    slow = 0;
+    fast = 0;
+  }
+
+  bool operator==(const CallCounter& rhs) {
+    return slow == rhs.slow && fast == rhs.fast;
+  }
+};
+
+inline kj::String KJ_STRINGIFY(CallCounter& counter) {
+  return kj::str("(", counter.slow, ", ", counter.fast, ")");
+}
+
+static CallCounter callCounter{};
 
 }  // namespace workerd::jsg

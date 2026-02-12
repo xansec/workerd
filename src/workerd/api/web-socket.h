@@ -5,15 +5,18 @@
 #pragma once
 
 #include "basics.h"
+#include "events.h"
 
 #include <workerd/io/io-gate.h>
 #include <workerd/io/observer.h>
 #include <workerd/jsg/jsg.h>
+#include <workerd/util/checked-queue.h>
 #include <workerd/util/weak-refs.h>
 
 #include <kj/compat/http.h>
 
 #include <cstdlib>
+#include <list>
 
 namespace workerd {
 class ActorObserver;
@@ -23,80 +26,6 @@ namespace workerd::api {
 
 template <typename T>
 struct DeferredProxy;
-
-class MessageEvent: public Event {
- public:
-  MessageEvent(jsg::Lock& js, const jsg::JsValue& data)
-      : Event("message"),
-        data(jsg::JsRef(js, data)) {}
-  MessageEvent(jsg::Lock& js, jsg::JsRef<jsg::JsValue> data)
-      : Event("message"),
-        data(kj::mv(data)) {}
-  MessageEvent(jsg::Lock& js, kj::String type, const jsg::JsValue& data)
-      : Event(kj::mv(type)),
-        data(jsg::JsRef(js, kj::mv(data))) {}
-  MessageEvent(jsg::Lock& js, kj::String type, jsg::JsRef<jsg::JsValue> data)
-      : Event(kj::mv(type)),
-        data(kj::mv(data)) {}
-
-  struct Initializer {
-    jsg::JsRef<jsg::JsValue> data;
-
-    JSG_STRUCT(data);
-    JSG_STRUCT_TS_OVERRIDE(MessageEventInit {
-      data: ArrayBuffer | string;
-    });
-  };
-  static jsg::Ref<MessageEvent> constructor(
-      jsg::Lock& js, kj::String type, Initializer initializer) {
-    return jsg::alloc<MessageEvent>(js, kj::mv(type), kj::mv(initializer.data));
-  }
-
-  jsg::JsValue getData(jsg::Lock& js) {
-    return data.getHandle(js);
-  }
-
-  jsg::Unimplemented getOrigin() {
-    return jsg::Unimplemented();
-  }
-  jsg::Unimplemented getLastEventId() {
-    return jsg::Unimplemented();
-  }
-  jsg::Unimplemented getSource() {
-    return jsg::Unimplemented();
-  }
-  jsg::Unimplemented getPorts() {
-    return jsg::Unimplemented();
-  }
-
-  JSG_RESOURCE_TYPE(MessageEvent) {
-    JSG_INHERIT(Event);
-
-    JSG_READONLY_INSTANCE_PROPERTY(data, getData);
-
-    JSG_READONLY_INSTANCE_PROPERTY(origin, getOrigin);
-    JSG_READONLY_INSTANCE_PROPERTY(lastEventId, getLastEventId);
-    JSG_READONLY_INSTANCE_PROPERTY(source, getSource);
-    JSG_READONLY_INSTANCE_PROPERTY(ports, getPorts);
-
-    JSG_TS_ROOT();
-    // MessageEvent will be referenced from the `WebSocketEventMap` define
-    JSG_TS_OVERRIDE({
-      readonly data: ArrayBuffer | string;
-    });
-  }
-
-  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
-    tracker.trackField("data", data);
-  }
-
- private:
-  jsg::JsRef<jsg::JsValue> data;
-
-  void visitForGc(jsg::GcVisitor& visitor) {
-    visitor.visit(data);
-  }
-};
 
 class CloseEvent: public Event {
  public:
@@ -119,9 +48,10 @@ class CloseEvent: public Event {
     JSG_STRUCT(code, reason, wasClean);
     JSG_STRUCT_TS_OVERRIDE(CloseEventInit);
   };
-  static jsg::Ref<CloseEvent> constructor(kj::String type, jsg::Optional<Initializer> initializer) {
+  static jsg::Ref<CloseEvent> constructor(
+      jsg::Lock& js, kj::String type, jsg::Optional<Initializer> initializer) {
     Initializer init = kj::mv(initializer).orDefault({});
-    return jsg::alloc<CloseEvent>(kj::mv(type), init.code.orDefault(0),
+    return js.alloc<CloseEvent>(kj::mv(type), init.code.orDefault(0),
         kj::mv(init.reason).orDefault(nullptr), init.wasClean.orDefault(false));
   }
 
@@ -179,7 +109,7 @@ class WebSocketPair: public jsg::Object {
   WebSocketPair(jsg::Ref<WebSocket> first, jsg::Ref<WebSocket> second)
       : sockets{kj::mv(first), kj::mv(second)} {}
 
-  static jsg::Ref<WebSocketPair> constructor();
+  static jsg::Ref<WebSocketPair> constructor(jsg::Lock& js);
 
   jsg::Ref<WebSocket> getFirst() {
     return sockets[0].addRef();
@@ -516,7 +446,7 @@ class WebSocket: public EventTarget {
       //        HibernatableWebSocket is free to go away. We can no longer rely on tags stored in
       //        the HibernationManager, so instead we copy the data into the api::WebSocket.
       //
-      // We could just copy all tags into api::WebSocket everytime we reactivate/wake from
+      // We could just copy all tags into api::WebSocet every time we reactivate/wake from
       // hibernation, but it could add up to 2.56KB of memory for each websocket.
       // With a maximum of 32k websockets, that could put a lot of memory pressure on the DO.
       kj::OneOf<kj::Array<kj::StringPtr>, kj::Array<kj::String>> tagsRef;
@@ -566,7 +496,7 @@ class WebSocket: public EventTarget {
     kj::Maybe<kj::Own<ActorObserver>> actorMetrics;
 
     // This canceler wraps the pump loop as a precaution to make sure we can't exit the Accepted
-    // state with a pump task still happening asychronously. In practice the canceler should usually
+    // state with a pump task still happening asynchronously. In practice the canceler should usually
     // be empty when destroyed because we do not leave the Accepted state if we're still pumping.
     // Even in the case of IoContext premature cancellation, the pump task should be canceled
     // by the IoContext before the Canceler is destroyed.
@@ -608,7 +538,7 @@ class WebSocket: public EventTarget {
   // - Transitions from `AwaitingAcceptanceOrCoupling` to `Released` when it is coupled to another
   //   web socket.
   // - Transitions from `Accepted` to `Released` when outgoing pump is done and either both
-  //   directions have seen "close" messages or an error has occured.
+  //   directions have seen "close" messages or an error has occurred.
   IoOwn<Native> farNative;
 
   // If any error has occurred.
@@ -620,7 +550,7 @@ class WebSocket: public EventTarget {
     size_t pendingAutoResponses = 0;
   };
   using OutgoingMessagesMap = kj::Table<GatedMessage, kj::InsertionOrderIndex>;
-  // Queue of messages to be sent. This is wraped in a IoOwn so that the pump loop can safely
+  // Queue of messages to be sent. This is wrapped in an IoOwn so that the pump loop can safely
   // access the map without locking the isolate.
   IoOwn<OutgoingMessagesMap> outgoingMessages;
 
@@ -628,16 +558,15 @@ class WebSocket: public EventTarget {
   // between regular websocket messages, and auto-responses.
   struct AutoResponse {
     kj::Promise<void> ongoingAutoResponse = kj::READY_NOW;
-    std::deque<kj::String> pendingAutoResponseDeque;
+    workerd::util::Queue<kj::String> pendingAutoResponseDeque;
     size_t queuedAutoResponses = 0;
     bool isPumping = false;
     bool isClosed = false;
 
     JSG_MEMORY_INFO(AutoResponse) {
       tracker.trackFieldWithSize("ongoingAutoResponse", sizeof(kj::Promise<void>));
-      for (const auto& message: pendingAutoResponseDeque) {
-        tracker.trackField(nullptr, message);
-      }
+      pendingAutoResponseDeque.forEach(
+          [&](const kj::String& message) { tracker.trackField(nullptr, message); });
     }
   };
 
@@ -665,7 +594,7 @@ class WebSocket: public EventTarget {
 
   void setPeer(kj::Own<WeakRef<WebSocket>> peer);
 
-  friend jsg::Ref<WebSocketPair> WebSocketPair::constructor();
+  friend jsg::Ref<WebSocketPair> WebSocketPair::constructor(jsg::Lock&);
 
   void dispatchOpen(jsg::Lock& js);
 
@@ -695,8 +624,7 @@ class WebSocket: public EventTarget {
 };
 
 #define EW_WEBSOCKET_ISOLATE_TYPES                                                                 \
-  api::CloseEvent, api::CloseEvent::Initializer, api::MessageEvent,                                \
-      api::MessageEvent::Initializer, api::WebSocket, api::WebSocketPair,                          \
+  api::CloseEvent, api::CloseEvent::Initializer, api::WebSocket, api::WebSocketPair,               \
       api::WebSocketPair::PairIterator,                                                            \
       api::WebSocketPair::PairIterator::                                                           \
           Next  // The list of websocket.h types that are added to worker.c++'s JSG_DECLARE_ISOLATE_TYPE

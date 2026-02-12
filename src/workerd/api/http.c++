@@ -5,8 +5,10 @@
 #include "http.h"
 
 #include "data-url.h"
+#include "headers.h"
 #include "queue.h"
 #include "sockets.h"
+#include "streams/readable-source.h"
 #include "system-streams.h"
 #include "util.h"
 #include "worker-rpc.h"
@@ -18,8 +20,10 @@
 #include <workerd/jsg/url.h>
 #include <workerd/util/abortable.h>
 #include <workerd/util/autogate.h>
+#include <workerd/util/entropy.h>
 #include <workerd/util/http-util.h>
 #include <workerd/util/mimetype.h>
+#include <workerd/util/own-util.h>
 #include <workerd/util/stream-utils.h>
 #include <workerd/util/strings.h>
 #include <workerd/util/thread-scopes.h>
@@ -30,100 +34,13 @@
 #include <kj/memory.h>
 #include <kj/parse/char.h>
 
-#include <set>
-
 namespace workerd::api {
 
 namespace {
-
-void warnIfBadHeaderString(const jsg::ByteString& byteString) {
-  if (IoContext::hasCurrent()) {
-    auto& context = IoContext::current();
-    if (context.isInspectorEnabled()) {
-      if (byteString.warning == jsg::ByteString::Warning::CONTAINS_EXTENDED_ASCII) {
-        // We're in a bit of a pickle: the script author is using our API correctly, but we're doing
-        // the wrong thing by UTF-8-encoding their bytes. To help the author understand the issue,
-        // we can show the string that they would be putting in the header if we implemented the
-        // spec correctly, and the string that is actually going get serialized onto the wire.
-        auto rawHex = kj::strArray(KJ_MAP(b, fastEncodeUtf16(byteString.asArray())) {
-          KJ_ASSERT(b < 256);  // Guaranteed by StringWrapper having set CONTAINS_EXTENDED_ASCII.
-          return kj::str("\\x", kj::hex(kj::byte(b)));
-        }, "");
-        auto utf8Hex =
-            kj::strArray(
-                KJ_MAP(b, byteString) { return kj::str("\\x", kj::hex(kj::byte(b))); }, "");
-
-        context.logWarning(kj::str("Problematic header name or value: \"", byteString,
-            "\" (raw bytes: \"", rawHex,
-            "\"). "
-            "This string contains 8-bit characters in the range 0x80 - 0xFF. As a quirk to support "
-            "Unicode, we encode header strings in UTF-8, meaning the actual header name/value on "
-            "the wire will be \"",
-            utf8Hex,
-            "\". Consider encoding this string in ASCII for "
-            "compatibility with browser implementations of the Fetch specifications."));
-      } else if (byteString.warning == jsg::ByteString::Warning::CONTAINS_UNICODE) {
-        context.logWarning(kj::str("Invalid header name or value: \"", byteString,
-            "\". Per the Fetch specification, the "
-            "Headers class may only accept header names and values which contain 8-bit characters. "
-            "That is, they must not contain any Unicode code points greater than 0xFF. As a quirk, "
-            "we are encoding this string in UTF-8 in the header, but in a browser this would "
-            "result in a TypeError exception. Consider encoding this string in ASCII for "
-            "compatibility with browser implementations of the Fetch specification."));
-      }
-    }
-  }
-}
-
-// Left- and right-trim HTTP whitespace from `value`.
-jsg::ByteString normalizeHeaderValue(jsg::ByteString value) {
-  warnIfBadHeaderString(value);
-
-  kj::ArrayPtr<char> slice = value;
-  auto isHttpWhitespace = [](char c) { return c == '\t' || c == '\r' || c == '\n' || c == ' '; };
-  while (slice.size() > 0 && isHttpWhitespace(slice.front())) {
-    slice = slice.slice(1, slice.size());
-  }
-  while (slice.size() > 0 && isHttpWhitespace(slice.back())) {
-    slice = slice.first(slice.size() - 1);
-  }
-  if (slice.size() == value.size()) {
-    return kj::mv(value);
-  }
-  return jsg::ByteString(kj::str(slice));
-}
-
-void requireValidHeaderName(const jsg::ByteString& name) {
-  // TODO(cleanup): Code duplication with kj/compat/http.c++
-
-  warnIfBadHeaderString(name);
-
-  constexpr auto HTTP_SEPARATOR_CHARS = kj::parse::anyOfChars("()<>@,;:\\\"/[]?={} \t");
-  // RFC2616 section 2.2: https://www.w3.org/Protocols/rfc2616/rfc2616-sec2.html#sec2.2
-
-  constexpr auto HTTP_TOKEN_CHARS = kj::parse::controlChar.orChar('\x7f')
-                                        .orGroup(kj::parse::whitespaceChar)
-                                        .orGroup(HTTP_SEPARATOR_CHARS)
-                                        .invert();
-  // RFC2616 section 2.2: https://www.w3.org/Protocols/rfc2616/rfc2616-sec2.html#sec2.2
-  // RFC2616 section 4.2: https://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.2
-
-  for (char c: name) {
-    JSG_REQUIRE(HTTP_TOKEN_CHARS.contains(c), TypeError, "Invalid header name.");
-  }
-}
-
-void requireValidHeaderValue(kj::StringPtr value) {
-  // TODO(cleanup): Code duplication with kj/compat/http.c++
-
-  for (char c: value) {
-    JSG_REQUIRE(c != '\0' && c != '\r' && c != '\n', TypeError, "Invalid header value.");
-  }
-}
-
 Request::CacheMode getCacheModeFromName(kj::StringPtr value) {
   if (value == "no-store") return Request::CacheMode::NOSTORE;
   if (value == "no-cache") return Request::CacheMode::NOCACHE;
+  if (value == "reload") return Request::CacheMode::RELOAD;
   JSG_FAIL_REQUIRE(TypeError, kj::str("Unsupported cache mode: ", value));
 }
 
@@ -135,304 +52,13 @@ jsg::Optional<kj::StringPtr> getCacheModeName(Request::CacheMode mode) {
       return "no-cache"_kj;
     case (Request::CacheMode::NOSTORE):
       return "no-store"_kj;
+    case (Request::CacheMode::RELOAD):
+      return "reload"_kj;
   }
   KJ_UNREACHABLE;
 }
 
 }  // namespace
-
-Headers::Headers(jsg::Dict<jsg::ByteString, jsg::ByteString> dict): guard(Guard::NONE) {
-  for (auto& field: dict.fields) {
-    append(kj::mv(field.name), kj::mv(field.value));
-  }
-}
-
-Headers::Headers(const Headers& other): guard(Guard::NONE) {
-  for (auto& header: other.headers) {
-    Header copy{
-      jsg::ByteString(kj::str(header.second.key)),
-      jsg::ByteString(kj::str(header.second.name)),
-      KJ_MAP(value, header.second.values) { return jsg::ByteString(kj::str(value)); },
-    };
-    kj::StringPtr keyRef = copy.key;
-    KJ_ASSERT(headers.insert(std::make_pair(keyRef, kj::mv(copy))).second);
-  }
-}
-
-Headers::Headers(const kj::HttpHeaders& other, Guard guard): guard(Guard::NONE) {
-  other.forEach([this](auto name, auto value) {
-    append(jsg::ByteString(kj::str(name)), jsg::ByteString(kj::str(value)));
-  });
-
-  this->guard = guard;
-}
-
-jsg::Ref<Headers> Headers::clone() const {
-  auto result = jsg::alloc<Headers>(*this);
-  result->guard = guard;
-  return kj::mv(result);
-}
-
-// Fill in the given HttpHeaders with these headers. Note that strings are inserted by
-// reference, so the output must be consumed immediately.
-void Headers::shallowCopyTo(kj::HttpHeaders& out) {
-  for (auto& entry: headers) {
-    for (auto& value: entry.second.values) {
-      out.add(entry.second.name, value);
-    }
-  }
-}
-
-bool Headers::hasLowerCase(kj::StringPtr name) {
-#ifdef KJ_DEBUG
-  for (auto c: name) {
-    KJ_DREQUIRE(!('A' <= c && c <= 'Z'));
-  }
-#endif
-  return headers.find(name) != headers.end();
-}
-
-kj::Array<Headers::DisplayedHeader> Headers::getDisplayedHeaders(jsg::Lock& js) {
-  if (FeatureFlags::get(js).getHttpHeadersGetSetCookie()) {
-    kj::Vector<Headers::DisplayedHeader> copy;
-    for (auto& entry: headers) {
-      if (entry.first == "set-cookie") {
-        // For set-cookie entries, we iterate each individually without
-        // combining them.
-        for (auto& value: entry.second.values) {
-          copy.add(Headers::DisplayedHeader{
-            .key = jsg::ByteString(kj::str(entry.first)),
-            .value = jsg::ByteString(kj::str(value)),
-          });
-        }
-      } else {
-        copy.add(Headers::DisplayedHeader{.key = jsg::ByteString(kj::str(entry.first)),
-          .value = jsg::ByteString(kj::strArray(entry.second.values, ", "))});
-      }
-    }
-    return copy.releaseAsArray();
-  } else {
-    // The old behavior before the standard getSetCookie() API was introduced...
-    auto headersCopy = KJ_MAP(mapEntry, headers) {
-      const auto& header = mapEntry.second;
-      return DisplayedHeader{
-        jsg::ByteString(kj::str(header.key)), jsg::ByteString(kj::strArray(header.values, ", "))};
-    };
-    return headersCopy;
-  }
-}
-
-jsg::Ref<Headers> Headers::constructor(jsg::Lock& js, jsg::Optional<Initializer> init) {
-  using StringDict = jsg::Dict<jsg::ByteString, jsg::ByteString>;
-
-  KJ_IF_SOME(i, init) {
-    KJ_SWITCH_ONEOF(kj::mv(i)) {
-      KJ_CASE_ONEOF(dict, StringDict) {
-        return jsg::alloc<Headers>(kj::mv(dict));
-      }
-      KJ_CASE_ONEOF(headers, jsg::Ref<Headers>) {
-        return jsg::alloc<Headers>(*headers);
-        // It's important to note here that we are treating the Headers object
-        // as a special case here. Per the fetch spec, we *should* be grabbing
-        // the Symbol.iterator off the Headers object and interpreting it as
-        // a Sequence<Sequence<ByteString>> (as in the ByteStringPairs case
-        // below). However, special casing Headers like we do here is more
-        // performant and has other side effects such as preserving the casing
-        // of header names that have been received.
-        //
-        // This does mean that we fail one of the more pathological (and kind
-        // of weird) Web Platform Tests for this API:
-        //
-        //   const h = new Headers();
-        //   h[Symbol.iterator] = function * () { yield ["test", "test"]; };
-        //   const headers = new Headers(h);
-        //   console.log(headers.has("test"));
-        //
-        // The spec would say headers.has("test") here should be true. With our
-        // implementation here, however, we are ignoring the Symbol.iterator so
-        // the test fails.
-      }
-      KJ_CASE_ONEOF(pairs, ByteStringPairs) {
-        auto dict = KJ_MAP(entry, pairs) {
-          JSG_REQUIRE(entry.size() == 2, TypeError,
-              "To initialize a Headers object from a sequence, each inner sequence "
-              "must have exactly two elements.");
-          return StringDict::Field{kj::mv(entry[0]), kj::mv(entry[1])};
-        };
-        return jsg::alloc<Headers>(StringDict{kj::mv(dict)});
-      }
-    }
-  }
-
-  return jsg::alloc<Headers>();
-}
-
-kj::Maybe<jsg::ByteString> Headers::get(jsg::ByteString name) {
-  requireValidHeaderName(name);
-  auto iter = headers.find(jsg::ByteString(toLower(kj::mv(name))));
-  if (iter == headers.end()) {
-    return kj::none;
-  } else {
-    return jsg::ByteString(kj::strArray(iter->second.values, ", "));
-  }
-}
-
-kj::ArrayPtr<jsg::ByteString> Headers::getSetCookie() {
-  auto iter = headers.find("set-cookie");
-  if (iter == headers.end()) {
-    return nullptr;
-  } else {
-    return iter->second.values.asPtr();
-  }
-}
-
-kj::ArrayPtr<jsg::ByteString> Headers::getAll(jsg::ByteString name) {
-  requireValidHeaderName(name);
-
-  if (strcasecmp(name.cStr(), "set-cookie") != 0) {
-    JSG_FAIL_REQUIRE(TypeError, "getAll() can only be used with the header name \"Set-Cookie\".");
-  }
-
-  // getSetCookie() is the standard API here. getAll(...) is our legacy non-standard extension
-  // for the same use case. We continue to support getAll for backwards compatibility but moving
-  // forward users really should be using getSetCookie.
-  return getSetCookie();
-}
-
-bool Headers::has(jsg::ByteString name) {
-  requireValidHeaderName(name);
-  return headers.find(jsg::ByteString(toLower(kj::mv(name)))) != headers.end();
-}
-
-void Headers::set(jsg::ByteString name, jsg::ByteString value) {
-  checkGuard();
-  setUnguarded(kj::mv(name), kj::mv(value));
-}
-
-void Headers::setUnguarded(jsg::ByteString name, jsg::ByteString value) {
-  requireValidHeaderName(name);
-  auto key = jsg::ByteString(toLower(name));
-  value = normalizeHeaderValue(kj::mv(value));
-  requireValidHeaderValue(value);
-  auto [iter, emplaced] = headers.try_emplace(key, kj::mv(key), kj::mv(name), kj::mv(value));
-  if (!emplaced) {
-    // Overwrite existing value(s).
-    iter->second.values.clear();
-    iter->second.values.add(kj::mv(value));
-  }
-}
-
-void Headers::append(jsg::ByteString name, jsg::ByteString value) {
-  checkGuard();
-  requireValidHeaderName(name);
-  auto key = jsg::ByteString(toLower(name));
-  value = normalizeHeaderValue(kj::mv(value));
-  requireValidHeaderValue(value);
-  auto [iter, emplaced] = headers.try_emplace(key, kj::mv(key), kj::mv(name), kj::mv(value));
-  if (!emplaced) {
-    iter->second.values.add(kj::mv(value));
-  }
-}
-
-void Headers::delete_(jsg::ByteString name) {
-  checkGuard();
-  requireValidHeaderName(name);
-  headers.erase(jsg::ByteString(toLower(kj::mv(name))));
-}
-
-// There are a couple implementation details of the Headers iterators worth calling out.
-//
-// 1. Each iterator gets its own copy of the keys and/or values of the headers. While nauseating
-//    from a performance perspective, this solves both the iterator -> iterable lifetime dependence
-//    and the iterator invalidation issue: i.e., it's impossible for a user to unsafely modify the
-//    Headers data structure while iterating over it, because they are simply two separate data
-//    structures. By empirical testing, this seems to be how Chrome implements Headers iteration.
-//
-//    Other alternatives bring their own pitfalls. We could store a Ref of the parent Headers
-//    object, solving the lifetime issue. To solve the iterator invalidation issue, we could store a
-//    copy of the currently-iterated-over key and use std::upper_bound() to find the next entry
-//    every time we want to increment the iterator (making the increment operation O(lg n) rather
-//    than O(1)); or we could make each Header entry in the map store a set of back-pointers to all
-//    live iterators pointing to it, with delete_() incrementing all iterators in the set whenever
-//    it deletes a header entry. Neither hack appealed to me.
-//
-// 2. Notice that the next() member function of the iterator classes moves the string(s) they
-//    contain, rather than making a copy of them as in the FormData iterators. This is safe to do
-//    because, unlike FormData, these iterators have their own copies of the strings, and since they
-//    are forward-only iterators, we know we won't need the strings again.
-//
-// TODO(perf): On point 1, perhaps we could avoid most copies by using a copy-on-write strategy
-//   applied to the header map elements? We'd still copy the whole data structure to avoid iterator
-//   invalidation, but the elements would be cheaper to copy.
-
-jsg::Ref<Headers::EntryIterator> Headers::entries(jsg::Lock& js) {
-  return jsg::alloc<EntryIterator>(IteratorState<DisplayedHeader>{getDisplayedHeaders(js)});
-}
-jsg::Ref<Headers::KeyIterator> Headers::keys(jsg::Lock& js) {
-  if (FeatureFlags::get(js).getHttpHeadersGetSetCookie()) {
-    kj::Vector<jsg::ByteString> keysCopy;
-    for (auto& entry: headers) {
-      // Set-Cookie headers must be handled specially. They should never be combined into a
-      // single value, so the values iterator must separate them. It seems a bit silly, but
-      // the keys iterator can end up having multiple set-cookie instances.
-      if (entry.first == "set-cookie") {
-        for (auto n = 0; n < entry.second.values.size(); n++) {
-          keysCopy.add(jsg::ByteString(kj::str(entry.first)));
-        }
-      } else {
-        keysCopy.add(jsg::ByteString(kj::str(entry.first)));
-      }
-    }
-    return jsg::alloc<KeyIterator>(IteratorState<jsg::ByteString>{keysCopy.releaseAsArray()});
-  } else {
-    auto keysCopy =
-        KJ_MAP(mapEntry, headers) { return jsg::ByteString(kj::str(mapEntry.second.key)); };
-    return jsg::alloc<KeyIterator>(IteratorState<jsg::ByteString>{kj::mv(keysCopy)});
-  }
-}
-jsg::Ref<Headers::ValueIterator> Headers::values(jsg::Lock& js) {
-  if (FeatureFlags::get(js).getHttpHeadersGetSetCookie()) {
-    kj::Vector<jsg::ByteString> values;
-    for (auto& entry: headers) {
-      // Set-Cookie headers must be handled specially. They should never be combined into a
-      // single value, so the values iterator must separate them.
-      if (entry.first == "set-cookie") {
-        for (auto& value: entry.second.values) {
-          values.add(jsg::ByteString(kj::str(value)));
-        }
-      } else {
-        values.add(jsg::ByteString(kj::strArray(entry.second.values, ", ")));
-      }
-    }
-    return jsg::alloc<ValueIterator>(IteratorState<jsg::ByteString>{values.releaseAsArray()});
-  } else {
-    auto valuesCopy = KJ_MAP(mapEntry, headers) {
-      return jsg::ByteString(kj::strArray(mapEntry.second.values, ", "));
-    };
-    return jsg::alloc<ValueIterator>(IteratorState<jsg::ByteString>{kj::mv(valuesCopy)});
-  }
-}
-
-void Headers::forEach(jsg::Lock& js,
-    jsg::Function<void(kj::StringPtr, kj::StringPtr, jsg::Ref<Headers>)> callback,
-    jsg::Optional<jsg::Value> thisArg) {
-  auto receiver = js.v8Undefined();
-  KJ_IF_SOME(arg, thisArg) {
-    auto handle = arg.getHandle(js);
-    if (!handle->IsNullOrUndefined()) {
-      receiver = handle;
-    }
-  }
-  callback.setReceiver(js.v8Ref(receiver));
-
-  for (auto& entry: getDisplayedHeaders(js)) {
-    callback(js, entry.value, entry.key, JSG_THIS);
-  }
-}
-
-bool Headers::inspectImmutable() {
-  return guard != Guard::NONE;
-}
 
 // -----------------------------------------------------------------------------
 // serialization of headers
@@ -447,195 +73,6 @@ bool Headers::inspectImmutable() {
 // normalize capitalization of all registered headers, and http-over-capnp also loses
 // capitalization). So, it's certainly not worth it to try to keep the original capitalization
 // across serialization.
-
-// If any more headers are added to the CommonHeaderName enum later, we should be careful about
-// introducing them into serialization. We need to roll out a change that recognizes the new IDs
-// before rolling out a change that sends them. MAX_COMMON_HEADER_ID is the max value we're willing
-// to send.
-static constexpr uint MAX_COMMON_HEADER_ID =
-    static_cast<uint>(capnp::CommonHeaderName::WWW_AUTHENTICATE);
-
-// ID for the `$commonText` annotation declared in http-over-capnp.capnp.
-// TODO(cleanup): Cap'n Proto should really codegen constants for annotation IDs so we don't have
-//   to copy them.
-static constexpr uint64_t COMMON_TEXT_ANNOTATION_ID = 0x857745131db6fc83;
-
-static kj::Array<kj::StringPtr> makeCommonHeaderList() {
-  auto enums = capnp::Schema::from<capnp::CommonHeaderName>().getEnumerants();
-  auto builder = kj::heapArrayBuilder<kj::StringPtr>(enums.size());
-  bool first = true;
-  for (auto e: enums) {
-    if (first) {
-      // Value zero is invalid, skip it.
-      static_assert(static_cast<uint>(capnp::CommonHeaderName::INVALID) == 0);
-
-      // Add `nullptr` to the array so that our array indexes aren't off-by-one from the enum
-      // values. We could in theory skip this and use +1 and -1 in a bunch of places but that seems
-      // error-prone.
-      builder.add(nullptr);
-
-      first = false;
-      continue;
-    }
-
-    kj::Maybe<kj::StringPtr> name;
-
-    // Look for $commonText annotation.
-    for (auto ann: e.getProto().getAnnotations()) {
-      if (ann.getId() == COMMON_TEXT_ANNOTATION_ID) {
-        name = ann.getValue().getText();
-        break;
-      }
-    }
-
-    builder.add(KJ_ASSERT_NONNULL(name));
-  }
-
-  return builder.finish();
-}
-
-static kj::ArrayPtr<const kj::StringPtr> getCommonHeaderList() {
-  static const kj::Array<kj::StringPtr> LIST = makeCommonHeaderList();
-  return LIST;
-}
-
-static kj::HashMap<kj::String, uint> makeCommonHeaderMap() {
-  kj::HashMap<kj::String, uint> result;
-  auto list = getCommonHeaderList();
-  KJ_ASSERT(MAX_COMMON_HEADER_ID < list.size());
-  for (auto i: kj::range(1, MAX_COMMON_HEADER_ID + 1)) {
-    auto key = kj::str(list[i]);
-    for (auto& c: key) {
-      if ('A' <= c && c <= 'Z') {
-        c = c - 'A' + 'a';
-      }
-    }
-    result.insert(kj::mv(key), i);
-  }
-  return result;
-}
-
-static const kj::HashMap<kj::String, uint>& getCommonHeaderMap() {
-  static const kj::HashMap<kj::String, uint> MAP = makeCommonHeaderMap();
-  return MAP;
-}
-
-void Headers::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
-  // We serialize as a series of key-value pairs. Each value is a length-delimited string. Each key
-  // is a common header ID, or the value zero to indicate an uncommon header, which is then
-  // followed by a length-delimited name.
-
-  serializer.writeRawUint32(static_cast<uint>(guard));
-
-  // Write the count of headers.
-  uint count = 0;
-  for (auto& entry: headers) {
-    count += entry.second.values.size();
-  }
-  serializer.writeRawUint32(count);
-
-  // Now write key/values.
-  auto& commonHeaders = getCommonHeaderMap();
-  for (auto& entry: headers) {
-    auto& header = entry.second;
-    auto commonId = commonHeaders.find(header.key);
-    for (auto& value: header.values) {
-      KJ_IF_SOME(c, commonId) {
-        serializer.writeRawUint32(c);
-      } else {
-        serializer.writeRawUint32(0);
-        serializer.writeLengthDelimited(header.name);
-      }
-      serializer.writeLengthDelimited(value);
-    }
-  }
-}
-
-jsg::Ref<Headers> Headers::deserialize(
-    jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer) {
-  auto result = jsg::alloc<Headers>();
-  uint guard = deserializer.readRawUint32();
-  KJ_REQUIRE(guard <= static_cast<uint>(Guard::NONE), "unknown guard value");
-
-  uint count = deserializer.readRawUint32();
-
-  auto commonHeaders = getCommonHeaderList();
-  for (auto i KJ_UNUSED: kj::zeroTo(count)) {
-    uint commonId = deserializer.readRawUint32();
-    kj::String name;
-    if (commonId == 0) {
-      name = deserializer.readLengthDelimitedString();
-    } else {
-      KJ_ASSERT(commonId < commonHeaders.size());
-      name = kj::str(commonHeaders[commonId]);
-    }
-
-    auto value = deserializer.readLengthDelimitedString();
-
-    result->append(jsg::ByteString(kj::mv(name)), jsg::ByteString(kj::mv(value)));
-  }
-
-  // Don't actually set the guard until here because it may block the ability to call `append()`.
-  result->guard = static_cast<Guard>(guard);
-
-  return result;
-}
-
-// =======================================================================================
-
-namespace {
-
-class BodyBufferInputStream final: public ReadableStreamSource {
- public:
-  BodyBufferInputStream(Body::Buffer buffer)
-      : unread(buffer.view),
-        ownBytes(kj::mv(buffer.ownBytes)) {}
-
-  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
-    size_t amount = kj::min(maxBytes, unread.size());
-    memcpy(buffer, unread.begin(), amount);
-    unread = unread.slice(amount, unread.size());
-    return amount;
-  }
-
-  kj::Maybe<uint64_t> tryGetLength(StreamEncoding encoding) override {
-    if (encoding == StreamEncoding::IDENTITY) {
-      return unread.size();
-    } else {
-      // Who knows what the compressed size will be?
-      return kj::none;
-    }
-  }
-
-  kj::Promise<DeferredProxy<void>> pumpTo(WritableStreamSink& output, bool end) override {
-    if (unread != nullptr) {
-      auto data = unread;
-      unread = nullptr;
-      co_await output.write(data);
-      if (end) co_await output.end();
-    }
-
-    co_return;
-  }
-
- private:
-  kj::ArrayPtr<const byte> unread;
-  kj::OneOf<kj::Own<Body::RefcountedBytes>, jsg::Ref<Blob>> ownBytes;
-};
-
-}  // namespace
-
-// Make an array of characters containing random hexadecimal digits.
-//
-// Note: Rather than use random hex digits, we could generate the hex digits by hashing the
-//   form-data content itself! This would give us pleasing assurance that our boundary string is
-//   not present in the content being divided. The downside is CPU usage if, say, a user uploads
-//   an enormous file.
-kj::String makeRandomBoundaryCharacters() {
-  kj::FixedArray<kj::byte, 16> buffer;
-  IoContext::current().getEntropySource().generate(buffer);
-  return kj::encodeHex(buffer);
-}
 
 Body::Buffer Body::Buffer::clone(jsg::Lock& js) {
   Buffer result;
@@ -670,6 +107,9 @@ Body::ExtractedBody Body::extractBody(jsg::Lock& js, Initializer init) {
     KJ_CASE_ONEOF(stream, jsg::Ref<ReadableStream>) {
       return kj::mv(stream);
     }
+    KJ_CASE_ONEOF(gen, jsg::AsyncGeneratorIgnoringStrings<jsg::Value>) {
+      return ReadableStream::from(js, gen.release());
+    }
     KJ_CASE_ONEOF(text, kj::String) {
       contentType = kj::str(MimeType::PLAINTEXT_STRING);
       buffer = kj::mv(text);
@@ -692,39 +132,48 @@ Body::ExtractedBody Body::extractBody(jsg::Lock& js, Initializer init) {
       buffer = kj::mv(blob);
     }
     KJ_CASE_ONEOF(formData, jsg::Ref<FormData>) {
-      auto boundary = makeRandomBoundaryCharacters();
-      auto type = MimeType::FORM_DATA.clone();
-      type.addParam("boundary"_kj, boundary);
-      contentType = type.toString();
+      // Make an array of characters containing random hexadecimal digits.
+      //
+      // Note: Rather than use random hex digits, we could generate the hex digits by hashing the
+      //   form-data content itself! This would give us pleasing assurance that our boundary string
+      //   is not present in the content being divided. The downside is CPU usage if, say, a user
+      //   uploads an enormous file.
+      kj::FixedArray<kj::byte, 16> boundaryBuffer;
+      workerd::getEntropy(boundaryBuffer);
+      auto boundary = kj::encodeHex(boundaryBuffer);
+      contentType = MimeType::formDataWithBoundary(boundary);
       buffer = formData->serialize(boundary);
     }
     KJ_CASE_ONEOF(searchParams, jsg::Ref<URLSearchParams>) {
-      auto type = MimeType::FORM_URLENCODED.clone();
-      type.addParam("charset"_kj, "UTF-8"_kj);
-      contentType = type.toString();
+      contentType = MimeType::formUrlEncodedWithCharset("UTF-8"_kj);
       buffer = searchParams->toString();
     }
     KJ_CASE_ONEOF(searchParams, jsg::Ref<url::URLSearchParams>) {
-      auto type = MimeType::FORM_URLENCODED.clone();
-      type.addParam("charset"_kj, "UTF-8"_kj);
-      contentType = type.toString();
+      contentType = MimeType::formUrlEncodedWithCharset("UTF-8"_kj);
       buffer = searchParams->toString();
     }
   }
 
-  auto bodyStream = kj::heap<BodyBufferInputStream>(buffer.clone(js));
+  auto buf = buffer.clone(js);
 
-  return {jsg::alloc<ReadableStream>(IoContext::current(), kj::mv(bodyStream)), kj::mv(buffer),
+  // We use streams::newMemorySource() here rather than newSystemStream() wrapping a
+  // newMemoryInputStream() because we do NOT want deferred proxying for bodies with
+  // V8 heap provenance. Specifically, the bufferCopy.view here, while being a kj::ArrayPtr,
+  // will typically be wrapping a v8::BackingStore, and we must ensure that is is consumed
+  // and destroyed while under the isolate lock, which means deferred proxying is not allowed.
+  auto rs = streams::newMemorySource(buf.view, kj::heap(kj::mv(buf.ownBytes)));
+
+  return {js.alloc<ReadableStream>(IoContext::current(), kj::mv(rs)), kj::mv(buffer),
     kj::mv(contentType)};
 }
 
-Body::Body(kj::Maybe<ExtractedBody> init, Headers& headers)
+Body::Body(jsg::Lock& js, kj::Maybe<ExtractedBody> init, Headers& headers)
     : impl(kj::mv(init).map([&headers](auto i) -> Impl {
         KJ_IF_SOME(ct, i.contentType) {
-          if (!headers.hasLowerCase("content-type")) {
+          if (!headers.hasCommon(capnp::CommonHeaderName::CONTENT_TYPE)) {
             // The spec allows the user to override the Content-Type, if they wish, so we only set
             // the Content-Type if it doesn't already exist.
-            headers.set(jsg::ByteString(kj::str("Content-Type")), jsg::ByteString(kj::mv(ct)));
+            headers.setCommon(capnp::CommonHeaderName::CONTENT_TYPE, kj::mv(ct));
           } else if (MimeType::FORM_DATA == ct) {
             // Custom content-type request/responses with FormData are broken since they require a
             // boundary parameter only the FormData serializer can provide. Let's warn if a dev does this.
@@ -762,8 +211,14 @@ void Body::rewindBody(jsg::Lock& js) {
 
   KJ_IF_SOME(i, impl) {
     auto bufferCopy = KJ_ASSERT_NONNULL(i.buffer).clone(js);
-    auto bodyStream = kj::heap<BodyBufferInputStream>(kj::mv(bufferCopy));
-    i.stream = jsg::alloc<ReadableStream>(IoContext::current(), kj::mv(bodyStream));
+
+    // We use streams::newMemorySource() here rather than newSystemStream() wrapping a
+    // newMemoryInputStream() because we do NOT want deferred proxying for bodies with
+    // V8 heap provenance. Specifically, the bufferCopy.view here, while being a kj::ArrayPtr,
+    // will typically be wrapping a v8::BackingStore, and we must ensure that is is consumed
+    // and destroyed while under the isolate lock, which means deferred proxying is not allowed.
+    auto rs = streams::newMemorySource(bufferCopy.view, kj::heap(kj::mv(bufferCopy.ownBytes)));
+    i.stream = js.alloc<ReadableStream>(IoContext::current(), kj::mv(rs));
   }
 }
 
@@ -817,7 +272,7 @@ jsg::Promise<kj::String> Body::text(jsg::Lock& js) {
       // When running in the fiddle, let's warn the developer if they do this.
       auto& context = IoContext::current();
       if (context.isInspectorEnabled()) {
-        KJ_IF_SOME(type, headersRef.get(jsg::ByteString(kj::str("Content-Type")))) {
+        KJ_IF_SOME(type, headersRef.getCommon(js, capnp::CommonHeaderName::CONTENT_TYPE)) {
           maybeWarnIfNotText(js, type);
         }
       }
@@ -833,15 +288,16 @@ jsg::Promise<kj::String> Body::text(jsg::Lock& js) {
 }
 
 jsg::Promise<jsg::Ref<FormData>> Body::formData(jsg::Lock& js) {
-  auto formData = jsg::alloc<FormData>();
+  auto formData = js.alloc<FormData>();
 
   return js.evalNow([&] {
     JSG_REQUIRE(!getBodyUsed(), TypeError,
         "Body has already been used. "
         "It can only be used once. Use tee() first if you need to read it twice.");
 
-    auto contentType = JSG_REQUIRE_NONNULL(headersRef.get(jsg::ByteString(kj::str("Content-Type"))),
-        TypeError, "Parsing a Body as FormData requires a Content-Type header.");
+    auto contentType =
+        JSG_REQUIRE_NONNULL(headersRef.getCommon(js, capnp::CommonHeaderName::CONTENT_TYPE),
+            TypeError, "Parsing a Body as FormData requires a Content-Type header.");
 
     KJ_IF_SOME(i, impl) {
       KJ_ASSERT(!i.stream->isDisturbed());
@@ -872,8 +328,8 @@ jsg::Promise<jsg::Value> Body::json(jsg::Lock& js) {
 
 jsg::Promise<jsg::Ref<Blob>> Body::blob(jsg::Lock& js) {
   return arrayBuffer(js).then(js, [this](jsg::Lock& js, jsg::BufferSource buffer) {
-    kj::String contentType = headersRef.get(jsg::ByteString(kj::str("Content-Type")))
-                                 .map([](jsg::ByteString&& b) -> kj::String {
+    kj::String contentType = headersRef.getCommon(js, capnp::CommonHeaderName::CONTENT_TYPE)
+                                 .map([](auto&& b) -> kj::String {
       return kj::mv(b);
     }).orDefault(nullptr);
 
@@ -884,7 +340,7 @@ jsg::Promise<jsg::Ref<Blob>> Body::blob(jsg::Lock& js) {
       }).orDefault(nullptr);
     }
 
-    return jsg::alloc<Blob>(js, kj::mv(buffer), kj::mv(contentType));
+    return js.alloc<Blob>(js, kj::mv(buffer), kj::mv(contentType));
   });
 }
 
@@ -927,6 +383,7 @@ jsg::Ref<Request> Request::constructor(
   kj::Maybe<Body::ExtractedBody> body;
   Redirect redirect = Redirect::FOLLOW;
   CacheMode cacheMode = CacheMode::NONE;
+  Response_BodyEncoding responseBodyEncoding = Response_BodyEncoding::AUTO;
 
   KJ_SWITCH_ONEOF(input) {
     KJ_CASE_ONEOF(u, kj::String) {
@@ -977,7 +434,7 @@ jsg::Ref<Request> Request::constructor(
       jsg::Ref<Request> oldRequest = kj::mv(r);
       url = kj::str(oldRequest->getUrl());
       method = oldRequest->method;
-      headers = jsg::alloc<Headers>(*oldRequest->headers);
+      headers = js.alloc<Headers>(js, *oldRequest->headers);
       cf = oldRequest->cf.deepClone(js);
       if (!ignoreInputBody) {
         JSG_REQUIRE(!oldRequest->getBodyUsed(), TypeError,
@@ -1051,6 +508,7 @@ jsg::Ref<Request> Request::constructor(
           // explicitly say `signal: null`, they must want to drop the signal that was on the
           // original request.
           signal = kj::mv(s);
+          initDict.signal = kj::none;
         }
 
         KJ_IF_SOME(newCf, initDict.cf) {
@@ -1077,6 +535,16 @@ jsg::Ref<Request> Request::constructor(
           cacheMode = getCacheModeFromName(c);
         }
 
+        KJ_IF_SOME(e, initDict.encodeResponseBody) {
+          if (e == "manual"_kj) {
+            responseBodyEncoding = Response_BodyEncoding::MANUAL;
+          } else if (e == "automatic"_kj) {
+            responseBodyEncoding = Response_BodyEncoding::AUTO;
+          } else {
+            JSG_FAIL_REQUIRE(TypeError, kj::str("encodeResponseBody: unexpected value: ", e));
+          }
+        }
+
         if (initDict.method != kj::none || initDict.body != kj::none) {
           // We modified at least one of the method or the body. In this case, we enforce the
           // spec rule that GET/HEAD requests cannot have bodies. (On the other hand, if neither
@@ -1092,9 +560,10 @@ jsg::Ref<Request> Request::constructor(
         method = otherRequest->method;
         redirect = otherRequest->redirect;
         cacheMode = otherRequest->cacheMode;
+        responseBodyEncoding = otherRequest->responseBodyEncoding;
         fetcher = otherRequest->getFetcher();
         signal = otherRequest->getSignal();
-        headers = jsg::alloc<Headers>(*otherRequest->headers);
+        headers = js.alloc<Headers>(js, *otherRequest->headers);
         cf = otherRequest->cf.deepClone(js);
         KJ_IF_SOME(b, otherRequest->getBody()) {
           // Note that unlike when `input` (Request ctor's 1st parameter) is a Request object, here
@@ -1107,22 +576,24 @@ jsg::Ref<Request> Request::constructor(
   }
 
   if (headers == kj::none) {
-    headers = jsg::alloc<Headers>();
+    headers = js.alloc<Headers>();
   }
 
   // TODO(conform): If `init` has a keepalive flag, pass it to the Body constructor.
-  return jsg::alloc<Request>(method, url, redirect, KJ_ASSERT_NONNULL(kj::mv(headers)),
-      kj::mv(fetcher), kj::mv(signal), kj::mv(cf), kj::mv(body), cacheMode);
+  return js.alloc<Request>(js, method, url, redirect, KJ_ASSERT_NONNULL(kj::mv(headers)),
+      kj::mv(fetcher), kj::mv(signal), kj::mv(cf), kj::mv(body), /* thisSignal */ kj::none,
+      cacheMode, responseBodyEncoding);
 }
 
 jsg::Ref<Request> Request::clone(jsg::Lock& js) {
-  auto headersClone = headers->clone();
+  auto headersClone = headers->clone(js);
 
   auto cfClone = cf.deepClone(js);
   auto bodyClone = Body::clone(js);
 
-  return jsg::alloc<Request>(method, url, redirect, kj::mv(headersClone), getFetcher(), getSignal(),
-      kj::mv(cfClone), kj::mv(bodyClone));
+  return js.alloc<Request>(js, method, url, redirect, kj::mv(headersClone), getFetcher(),
+      /* signal */ getSignal(), kj::mv(cfClone), kj::mv(bodyClone), /* thisSignal */ kj::none,
+      cacheMode, responseBodyEncoding);
 }
 
 kj::StringPtr Request::getMethod() {
@@ -1173,9 +644,17 @@ jsg::Ref<AbortSignal> Request::getThisSignal(jsg::Lock& js) {
   KJ_IF_SOME(s, thisSignal) {
     return s.addRef();
   }
-  auto newSignal = jsg::alloc<AbortSignal>(kj::none, kj::none, AbortSignal::Flag::NEVER_ABORTS);
+  auto newSignal = js.alloc<AbortSignal>(kj::none, kj::none, AbortSignal::Flag::NEVER_ABORTS);
   thisSignal = newSignal.addRef();
   return newSignal;
+}
+
+void Request::clearSignalIfIgnoredForSubrequest(jsg::Lock& js) {
+  KJ_IF_SOME(s, signal) {
+    if (s->isIgnoredForSubrequests(js)) {
+      signal = kj::none;
+    }
+  }
 }
 
 kj::Maybe<Request::Redirect> Request::tryParseRedirect(kj::StringPtr redirect) {
@@ -1206,26 +685,26 @@ kj::Maybe<kj::String> Request::serializeCfBlobJson(jsg::Lock& js) {
   }
   auto obj = KJ_ASSERT_NONNULL(clone.get(js));
 
-  int ttl = 2;
+  constexpr int NOCACHE_TTL = -1;
   switch (cacheMode) {
     case CacheMode::NOSTORE:
-      ttl = -1;
+      if (obj.has(js, "cacheTtl")) {
+        jsg::JsValue oldTtl = obj.get(js, "cacheTtl");
+        JSG_REQUIRE(oldTtl.strictEquals(js.num(NOCACHE_TTL)), TypeError,
+            kj::str("CacheTtl: ", oldTtl, ", is not compatible with cache: ",
+                getCacheModeName(cacheMode).orDefault("none"_kj), " header."));
+      } else {
+        obj.set(js, "cacheTtl", js.num(NOCACHE_TTL));
+      }
+      KJ_FALLTHROUGH;
+    case CacheMode::RELOAD:
       obj.set(js, "cacheLevel", js.str("bypass"_kjc));
       break;
     case CacheMode::NOCACHE:
-      ttl = 0;
+      obj.set(js, "cacheForceRevalidate", js.boolean(true));
       break;
     case CacheMode::NONE:
       KJ_UNREACHABLE;
-  }
-
-  if (obj.has(js, "cacheTtl")) {
-    jsg::JsValue oldTtl = obj.get(js, "cacheTtl");
-    JSG_REQUIRE(oldTtl == js.num(ttl), TypeError,
-        kj::str("CacheTtl: ", oldTtl, ", is not compatible with cache: ",
-            getCacheModeName(cacheMode).orDefault("none"_kj), " header."));
-  } else {
-    obj.set(js, "cacheTtl", js.num(ttl));
   }
 
   return clone.serialize(js);
@@ -1233,17 +712,24 @@ kj::Maybe<kj::String> Request::serializeCfBlobJson(jsg::Lock& js) {
 
 void RequestInitializerDict::validate(jsg::Lock& js) {
   KJ_IF_SOME(c, cache) {
-    // Check compatability flag
+    // Check compatibility flag
     JSG_REQUIRE(FeatureFlags::get(js).getCacheOptionEnabled(), Error,
         kj::str("The 'cache' field on 'RequestInitializerDict' is not implemented."));
 
     // Validate that the cache type is valid
     auto cacheMode = getCacheModeFromName(c);
 
-    if (!FeatureFlags::get(js).getCacheNoCache()) {
-      JSG_REQUIRE(cacheMode != Request::CacheMode::NOCACHE, TypeError,
-          kj::str("Unsupported cache mode: ", c));
-    }
+    bool invalidNoCache =
+        !FeatureFlags::get(js).getCacheNoCache() && (cacheMode == Request::CacheMode::NOCACHE);
+    bool invalidReload =
+        !FeatureFlags::get(js).getCacheReload() && (cacheMode == Request::CacheMode::RELOAD);
+    JSG_REQUIRE(
+        !invalidNoCache && !invalidReload, TypeError, kj::str("Unsupported cache mode: ", c));
+  }
+
+  KJ_IF_SOME(e, encodeResponseBody) {
+    JSG_REQUIRE(e == "manual"_kj || e == "automatic"_kj, TypeError,
+        kj::str("encodeResponseBody: unexpected value: ", e));
   }
 }
 
@@ -1255,49 +741,59 @@ void Request::serialize(jsg::Lock& js,
   // Our strategy is to construct an initializer dict object and serialize that as a JS object.
   // This makes the deserialization end really simple (just call the constructor), and it also
   // gives us extensibility: we can add new fields without having to bump the serialization tag.
-  serializer.write(js,
-      jsg::JsValue(initDictHandler.wrap(js,
-          RequestInitializerDict{
-            // GET is the default, so only serialize the method if it's something else.
-            .method = method == kj::HttpMethod::GET ? jsg::Optional<kj::String>() : kj::str(method),
+  // clang-format off
+  serializer.write(js, jsg::JsValue(initDictHandler.wrap(js, RequestInitializerDict{
+    // GET is the default, so only serialize the method if it's something else.
+    .method = method == kj::HttpMethod::GET ? jsg::Optional<kj::String>() : kj::str(method),
 
-            .headers = headers.addRef(),
+    .headers = headers.addRef(),
 
-            .body = getBody().map([](jsg::Ref<ReadableStream> stream) -> Body::Initializer {
-    // jsg::Ref<ReadableStream> is one of the possible variants of Body::Initializer.
-    return kj::mv(stream);
-  }),
+    .body = getBody().map([](jsg::Ref<ReadableStream> stream) -> Body::Initializer {
+      // jsg::Ref<ReadableStream> is one of the possible variants of Body::Initializer.
+      return kj::mv(stream);
+    }),
 
-            // "manual" is the default for `redirect`, so only encode if it's not that.
-            .redirect = redirect == Redirect::MANUAL ? kj::str(getRedirect())
-                                                     : kj::Maybe<kj::String>(kj::none),
+    // "manual" is the default for `redirect`, so only encode if it's not that.
+    .redirect = redirect == Redirect::MANUAL ? kj::str(getRedirect())
+                                              : kj::Maybe<kj::String>(kj::none),
 
-            // We have to ignore .fetcher for serialization. We can't simply fail if a fetcher is present
-            // because requests received by the top-level fetch handler actually have .fetcher set to
-            // the hidden "next" binding, which historically could be different from null (although in
-            // practice these days it is always the same). We obviously want to be able to serialize
-            // requests received by the top-level fetch handler so... we have to ignore this. This
-            // property should probably go away in any case.
+    // We have to ignore .fetcher for serialization. We can't simply fail if a fetcher is present
+    // because requests received by the top-level fetch handler actually have .fetcher set to
+    // the hidden "next" binding, which historically could be different from null (although in
+    // practice these days it is always the same). We obviously want to be able to serialize
+    // requests received by the top-level fetch handler so... we have to ignore this. This
+    // property should probably go away in any case.
 
-            .cf = cf.getRef(js),
+    .cf = cf.getRef(js),
 
-            .cache = getCacheModeName(cacheMode).map(
-                [](kj::StringPtr name) -> kj::String { return kj::str(name); }),
+    .cache = getCacheModeName(cacheMode).map(
+        [](kj::StringPtr name) -> kj::String { return kj::str(name); }),
 
-            // .mode is unimplemented
-            // .credentials is unimplemented
-            // .referrer is unimplemented
-            // .referrerPolicy is unimplemented
-            // .integrity is required to be empty
+    // .mode is unimplemented
+    // .credentials is unimplemented
+    // .referrer is unimplemented
+    // .referrerPolicy is unimplemented
+    // .integrity is required to be empty
 
-            // If an AbortSignal is present, we'll try to serialize it. As of this writing, AbortSignal
-            // is not serializable, but we could add support for sending it over RPC in the future.
-            //
-            // Note we have to double-Maybe this, so that if no signal is present, the property is absent
-            // instead of `null`.
-            .signal = signal.map([](jsg::Ref<AbortSignal>& s) -> kj::Maybe<jsg::Ref<AbortSignal>> {
-    return s.addRef();
-  })})));
+    // If an AbortSignal is present, we'll try to serialize it. As of this writing, AbortSignal
+    // is not serializable, but we could add support for sending it over RPC in the future.
+    //
+    // Note we have to double-Maybe this, so that if no signal is present, the property is absent
+    // instead of `null`.
+    .signal =
+        signal.map([&js](jsg::Ref<AbortSignal>& s) -> kj::Maybe<jsg::Ref<AbortSignal>> {
+      if (s->isIgnoredForSubrequests(js)) {
+        return kj::none;
+      }
+
+      return s.addRef();
+    }),
+
+    // Only serialize responseBodyEncoding if it's not the default AUTO
+    .encodeResponseBody = responseBodyEncoding == Response_BodyEncoding::AUTO
+        ? jsg::Optional<kj::String>()
+        : kj::str("manual")
+  })));
 }
 
 jsg::Ref<Request> Request::deserialize(jsg::Lock& js,
@@ -1311,16 +807,135 @@ jsg::Ref<Request> Request::deserialize(jsg::Lock& js,
 
 // =======================================================================================
 
+namespace {
+constexpr kj::StringPtr defaultStatusText(uint statusCode) {
+  // RFC 7231 recommendations, unless otherwise specified.
+  // https://tools.ietf.org/html/rfc7231#section-6.1
+#define STATUS(code, text) case code: return text##_kj
+  switch (statusCode) {
+    // Status code 0 is used exclusively with error responses
+    // created using Response.error()
+    STATUS(0, "");
+    STATUS(100, "Continue");
+    STATUS(101, "Switching Protocols");
+    STATUS(102, "Processing");   // RFC 2518, WebDAV
+    STATUS(103, "Early Hints");  // RFC 8297
+    STATUS(200, "OK");
+    STATUS(201, "Created");
+    STATUS(202, "Accepted");
+    STATUS(203, "Non-Authoritative Information");
+    STATUS(204, "No Content");
+    STATUS(205, "Reset Content");
+    STATUS(206, "Partial Content");
+    STATUS(207, "Multi-Status");      // RFC 4918, WebDAV
+    STATUS(208, "Already Reported");  // RFC 5842, WebDAV
+    STATUS(226, "IM Used");           // RFC 3229
+    STATUS(300, "Multiple Choices");
+    STATUS(301, "Moved Permanently");
+    STATUS(302, "Found");
+    STATUS(303, "See Other");
+    STATUS(304, "Not Modified");
+    STATUS(305, "Use Proxy");
+
+    STATUS(307, "Temporary Redirect");
+    STATUS(308, "Permanent Redirect");  // RFC 7538
+    STATUS(400, "Bad Request");
+    STATUS(401, "Unauthorized");
+    STATUS(402, "Payment Required");
+    STATUS(403, "Forbidden");
+    STATUS(404, "Not Found");
+    STATUS(405, "Method Not Allowed");
+    STATUS(406, "Not Acceptable");
+    STATUS(407, "Proxy Authentication Required");
+    STATUS(408, "Request Timeout");
+    STATUS(409, "Conflict");
+    STATUS(410, "Gone");
+    STATUS(411, "Length Required");
+    STATUS(412, "Precondition Failed");
+    STATUS(413, "Payload Too Large");
+    STATUS(414, "URI Too Long");
+    STATUS(415, "Unsupported Media Type");
+    STATUS(416, "Range Not Satisfiable");
+    STATUS(417, "Expectation Failed");
+    STATUS(418, "I'm a teapot");          // RFC 2324
+    STATUS(421, "Misdirected Request");   // RFC 7540
+    STATUS(422, "Unprocessable Entity");  // RFC 4918, WebDAV
+    STATUS(423, "Locked");                // RFC 4918, WebDAV
+    STATUS(424, "Failed Dependency");     // RFC 4918, WebDAV
+    STATUS(426, "Upgrade Required");
+    STATUS(428, "Precondition Required");            // RFC 6585
+    STATUS(429, "Too Many Requests");                // RFC 6585
+    STATUS(431, "Request Header Fields Too Large");  // RFC 6585
+    STATUS(451, "Unavailable For Legal Reasons");    // RFC 7725
+    STATUS(500, "Internal Server Error");
+    STATUS(501, "Not Implemented");
+    STATUS(502, "Bad Gateway");
+    STATUS(503, "Service Unavailable");
+    STATUS(504, "Gateway Timeout");
+    STATUS(505, "HTTP Version Not Supported");
+    STATUS(506, "Variant Also Negotiates");          // RFC 2295
+    STATUS(507, "Insufficient Storage");             // RFC 4918, WebDAV
+    STATUS(508, "Loop Detected");                    // RFC 5842, WebDAV
+    STATUS(510, "Not Extended");                     // RFC 2774
+    STATUS(511, "Network Authentication Required");  // RFC 6585
+    default:
+      // If we don't recognize the status code, check which range it falls into and use the status
+      // code class defined by RFC 7231, section 6, as the status text.
+      if (statusCode >= 200 && statusCode < 300) {
+        return "Successful"_kj;
+      } else if (statusCode >= 300 && statusCode < 400) {
+        return "Redirection"_kj;
+      } else if (statusCode >= 400 && statusCode < 500) {
+        return "Client Error"_kj;
+      } else if (statusCode >= 500 && statusCode < 600) {
+        return "Server Error"_kj;
+      } else {
+        return ""_kj;
+      }
+  }
+#undef STATUS
+}
+
+constexpr bool isNullBodyStatusCode(uint statusCode) {
+  switch (statusCode) {
+    // Fetch spec section 2.2.3 defines these status codes as null body statuses:
+    // https://fetch.spec.whatwg.org/#null-body-status
+    case 101:
+    case 204:
+    case 205:
+    case 304:
+      return true;
+    default:
+      return false;
+  }
+}
+
+constexpr bool isRedirectStatusCode(uint statusCode) {
+  switch (statusCode) {
+    // Fetch spec section 2.2.3 defines these status codes as redirect statuses:
+    // https://fetch.spec.whatwg.org/#redirect-status
+    case 301:
+    case 302:
+    case 303:
+    case 307:
+    case 308:
+      return true;
+    default:
+      return false;
+  }
+}
+}  // namespace
+
 Response::Response(jsg::Lock& js,
     int statusCode,
-    kj::String statusText,
+    kj::Maybe<kj::String> statusText,
     jsg::Ref<Headers> headers,
     CfProperty&& cf,
     kj::Maybe<Body::ExtractedBody> body,
     kj::Array<kj::String> urlList,
     kj::Maybe<jsg::Ref<WebSocket>> webSocket,
     Response::BodyEncoding bodyEncoding)
-    : Body(kj::mv(body), *headers),
+    : Body(js, kj::mv(body), *headers),
       statusCode(statusCode),
       statusText(kj::mv(statusText)),
       headers(kj::mv(headers)),
@@ -1328,11 +943,11 @@ Response::Response(jsg::Lock& js,
       urlList(kj::mv(urlList)),
       webSocket(kj::mv(webSocket)),
       bodyEncoding(bodyEncoding),
-      hasEnabledWebSocketCompression(FeatureFlags::get(js).getWebSocketCompression()),
       asyncContext(jsg::AsyncContextFrame::currentRef(js)) {}
 
-// Defined later in this file.
-static kj::StringPtr defaultStatusText(uint statusCode);
+jsg::Ref<Response> Response::error(jsg::Lock& js) {
+  return js.alloc<Response>(js, 0, kj::none, js.alloc<Headers>(), CfProperty(), kj::none);
+};
 
 jsg::Ref<Response> Response::constructor(jsg::Lock& js,
     jsg::Optional<kj::Maybe<Body::Initializer>> optionalBodyInit,
@@ -1370,7 +985,7 @@ jsg::Ref<Response> Response::constructor(jsg::Lock& js,
       KJ_IF_SOME(initHeaders, initDict.headers) {
         headers = Headers::constructor(js, kj::mv(initHeaders));
       } else {
-        headers = jsg::alloc<Headers>(jsg::Dict<jsg::ByteString, jsg::ByteString>());
+        headers = js.alloc<Headers>();
       }
 
       KJ_IF_SOME(newCf, initDict.cf) {
@@ -1393,8 +1008,11 @@ jsg::Ref<Response> Response::constructor(jsg::Lock& js,
 
       statusCode = otherResponse->statusCode;
       bodyEncoding = otherResponse->bodyEncoding;
-      statusText = kj::str(otherResponse->statusText);
-      headers = jsg::alloc<Headers>(*otherResponse->headers);
+      kj::StringPtr otherStatusText = otherResponse->getStatusText();
+      if (otherStatusText != defaultStatusText(statusCode)) {
+        statusText = kj::str(otherStatusText);
+      }
+      headers = js.alloc<Headers>(js, *otherResponse->headers);
       cf = otherResponse->cf.deepClone(js);
       KJ_IF_SOME(otherWs, otherResponse->webSocket) {
         webSocket = otherWs.addRef();
@@ -1420,8 +1038,6 @@ jsg::Ref<Response> Response::constructor(jsg::Lock& js,
         JSG_FAIL_REQUIRE(TypeError, "Invalid statusText");
       }
     }
-  } else {
-    statusText = kj::str(defaultStatusText(statusCode));
   }
 
   KJ_IF_SOME(bi, bodyInit) {
@@ -1458,8 +1074,8 @@ jsg::Ref<Response> Response::constructor(jsg::Lock& js,
     }
   }
 
-  return jsg::alloc<Response>(js, statusCode, KJ_ASSERT_NONNULL(kj::mv(statusText)),
-      kj::mv(headers), kj::mv(cf), kj::mv(body), nullptr, kj::mv(webSocket), bodyEncoding);
+  return js.alloc<Response>(js, statusCode, kj::mv(statusText), kj::mv(headers),
+      kj::mv(cf), kj::mv(body), nullptr, kj::mv(webSocket), bodyEncoding);
 }
 
 jsg::Ref<Response> Response::redirect(jsg::Lock& js, kj::String url, jsg::Optional<int> status) {
@@ -1480,7 +1096,7 @@ jsg::Ref<Response> Response::redirect(jsg::Lock& js, kj::String url, jsg::Option
     parsedUrl = kj::str(parsed.getHref());
   } else {
     auto urlOptions = kj::Url::Options{.percentDecode = false, .allowEmpty = true};
-    auto maybeParsedUrl = kj::Url::tryParse(kj::str(url), kj::Url::REMOTE_HREF, urlOptions);
+    auto maybeParsedUrl = kj::Url::tryParse(url.asPtr(), kj::Url::REMOTE_HREF, urlOptions);
     if (maybeParsedUrl == kj::none) {
       JSG_FAIL_REQUIRE(TypeError, kj::str("Unable to parse URL: ", url));
     }
@@ -1495,21 +1111,17 @@ jsg::Ref<Response> Response::redirect(jsg::Lock& js, kj::String url, jsg::Option
   // Build our headers object with `Location` set to the parsed URL.
   kj::HttpHeaders kjHeaders(IoContext::current().getHeaderTable());
   kjHeaders.set(kj::HttpHeaderId::LOCATION, kj::mv(parsedUrl));
-  auto headers = jsg::alloc<Headers>(kjHeaders, Headers::Guard::IMMUTABLE);
+  auto headers = js.alloc<Headers>(js, kjHeaders, Headers::Guard::IMMUTABLE);
 
-  auto statusText = defaultStatusText(statusCode);
-
-  return jsg::alloc<Response>(
-      js, statusCode, kj::str(statusText), kj::mv(headers), nullptr, nullptr);
+  return js.alloc<Response>(js, statusCode, kj::none, kj::mv(headers), nullptr, kj::none);
 }
 
 jsg::Ref<Response> Response::json_(
     jsg::Lock& js, jsg::JsValue any, jsg::Optional<Initializer> maybeInit) {
 
-  const auto maybeSetContentType = [](auto headers) {
-    if (!headers->hasLowerCase("content-type"_kj)) {
-      headers->set(
-          jsg::ByteString(kj::str("content-type")), jsg::ByteString(MimeType::JSON.toString()));
+  const auto maybeSetContentType = [](jsg::Lock& js, auto headers) {
+    if (!headers->hasCommon(capnp::CommonHeaderName::CONTENT_TYPE)) {
+      headers->setCommon(capnp::CommonHeaderName::CONTENT_TYPE, MimeType::JSON.toString());
     }
     return kj::mv(headers);
   };
@@ -1527,16 +1139,19 @@ jsg::Ref<Response> Response::json_(
     KJ_SWITCH_ONEOF(init) {
       KJ_CASE_ONEOF(dict, InitializerDict) {
         KJ_IF_SOME(headers, dict.headers) {
-          dict.headers = maybeSetContentType(Headers::constructor(js, kj::mv(headers)));
+          dict.headers = maybeSetContentType(js, Headers::constructor(js, kj::mv(headers)));
         } else {
-          dict.headers = maybeSetContentType(jsg::alloc<Headers>());
+          dict.headers = maybeSetContentType(js, js.alloc<Headers>());
         }
       }
       KJ_CASE_ONEOF(res, jsg::Ref<Response>) {
+        auto otherStatusText = res->getStatusText();
         auto newInit = InitializerDict{
           .status = res->statusCode,
-          .statusText = kj::str(res->statusText),
-          .headers = maybeSetContentType(Headers::constructor(js, res->headers.addRef())),
+          .statusText = otherStatusText == nullptr ||
+                        otherStatusText == defaultStatusText(res->statusCode)
+                        ? jsg::Optional<kj::String>() : kj::str(otherStatusText),
+          .headers = maybeSetContentType(js, Headers::constructor(js, res->headers.addRef())),
           .cf = res->cf.getRef(js),
           .encodeBody =
               kj::str(res->bodyEncoding == Response::BodyEncoding::MANUAL ? "manual" : "automatic"),
@@ -1551,7 +1166,7 @@ jsg::Ref<Response> Response::json_(
     }
   } else {
     maybeInit = InitializerDict{
-      .headers = maybeSetContentType(jsg::alloc<Headers>()),
+      .headers = maybeSetContentType(js, js.alloc<Headers>()),
     };
   }
 
@@ -1562,15 +1177,16 @@ jsg::Ref<Response> Response::clone(jsg::Lock& js) {
   JSG_REQUIRE(
       webSocket == kj::none, TypeError, "Cannot clone a response to a WebSocket handshake.");
 
-  auto headersClone = headers->clone();
+  auto headersClone = headers->clone(js);
   auto cfClone = cf.deepClone(js);
 
   auto bodyClone = Body::clone(js);
 
   auto urlListClone = KJ_MAP(url, urlList) { return kj::str(url); };
 
-  return jsg::alloc<Response>(js, statusCode, kj::str(statusText), kj::mv(headersClone),
-      kj::mv(cfClone), kj::mv(bodyClone), kj::mv(urlListClone));
+  return js.alloc<Response>(js, statusCode,
+      mapCopyString(statusText),
+      kj::mv(headersClone), kj::mv(cfClone), kj::mv(bodyClone), kj::mv(urlListClone));
 }
 
 kj::Promise<DeferredProxy<void>> Response::send(jsg::Lock& js,
@@ -1604,6 +1220,8 @@ kj::Promise<DeferredProxy<void>> Response::send(jsg::Lock& js,
         "Worker tried to return a WebSocket in a response to a request "
         "which did not contain the header \"Upgrade: websocket\".");
 
+    const bool hasEnabledWebSocketCompression = FeatureFlags::get(js).getWebSocketCompression();
+
     if (hasEnabledWebSocketCompression &&
         outHeaders.get(kj::HttpHeaderId::SEC_WEBSOCKET_EXTENSIONS) == kj::none) {
       // Since workerd uses `MANUAL_COMPRESSION` mode for websocket compression, we need to
@@ -1617,13 +1235,11 @@ kj::Promise<DeferredProxy<void>> Response::send(jsg::Lock& js,
         // requested, so we'll just use the client's requested headers.
         KJ_IF_SOME(reqHeaders, maybeReqHeaders) {
           KJ_IF_SOME(value, reqHeaders.get(kj::HttpHeaderId::SEC_WEBSOCKET_EXTENSIONS)) {
-            outHeaders.set(kj::HttpHeaderId::SEC_WEBSOCKET_EXTENSIONS, value);
+            outHeaders.setPtr(kj::HttpHeaderId::SEC_WEBSOCKET_EXTENSIONS, value);
           }
         }
       }
-    }
-
-    if (!hasEnabledWebSocketCompression) {
+    } else if (!hasEnabledWebSocketCompression) {
       // While we guard against an origin server including `Sec-WebSocket-Extensions` in a Response
       // (we don't send the extension in an offer, and if the server includes it in a response we
       // will reject the connection), a Worker could still explicitly add the header to a Response.
@@ -1647,13 +1263,13 @@ kj::Promise<DeferredProxy<void>> Response::send(jsg::Lock& js,
     auto encoding = getContentEncoding(context, outHeaders, bodyEncoding, FeatureFlags::get(js));
     auto maybeLength = jsBody->tryGetLength(encoding);
     auto stream =
-        newSystemStream(outer.send(statusCode, statusText, outHeaders, maybeLength), encoding);
+        newSystemStream(outer.send(statusCode, getStatusText(), outHeaders, maybeLength), encoding);
     // We need to enter the AsyncContextFrame that was captured when the
     // Response was created before starting the loop.
     jsg::AsyncContextFrame::Scope scope(js, asyncContext);
     return jsBody->pumpTo(js, kj::mv(stream), true);
   } else {
-    outer.send(statusCode, statusText, outHeaders, uint64_t(0));
+    outer.send(statusCode, getStatusText(), outHeaders, static_cast<uint64_t>(0));
     return addNoopDeferredProxy(kj::READY_NOW);
   }
 }
@@ -1662,7 +1278,10 @@ int Response::getStatus() {
   return statusCode;
 }
 kj::StringPtr Response::getStatusText() {
-  return statusText;
+  KJ_IF_SOME(text, statusText) {
+    return text;
+  }
+  return defaultStatusText(statusCode);
 }
 jsg::Ref<Headers> Response::getHeaders(jsg::Lock& js) {
   return headers.addRef();
@@ -1705,8 +1324,7 @@ void Response::serialize(jsg::Lock& js,
       jsg::JsValue(initDictHandler.wrap(js,
           InitializerDict{
             .status = statusCode == 200 ? jsg::Optional<int>() : statusCode,
-            .statusText = statusText == defaultStatusText(statusCode) ? jsg::Optional<kj::String>()
-                                                                      : kj::str(statusText),
+            .statusText = statusText.map([](auto& txt) { return kj::str(txt); }),
             .headers = headers.addRef(),
             .cf = cf.getRef(js),
 
@@ -1732,6 +1350,15 @@ jsg::Ref<Response> Response::deserialize(jsg::Lock& js,
     const jsg::TypeHandler<kj::Maybe<jsg::Ref<ReadableStream>>>& streamHandler) {
   auto body = KJ_ASSERT_NONNULL(streamHandler.tryUnwrap(js, deserializer.readValue(js)));
   auto init = KJ_ASSERT_NONNULL(initDictHandler.tryUnwrap(js, deserializer.readValue(js)));
+
+  // If the status code is zero, then it was an error response. We cannot
+  // use the Response::constructor.
+  KJ_IF_SOME(status, init.status) {
+    if (status == 0) {
+      return Response::error(js);
+    }
+  }
+
   return Response::constructor(js, kj::mv(body), kj::mv(init));
 }
 
@@ -1800,25 +1427,6 @@ namespace {
 // Fetch spec requires (suggests?) 20: https://fetch.spec.whatwg.org/#http-redirect-fetch
 constexpr auto MAX_REDIRECT_COUNT = 20;
 
-// URI-encode control characters and spaces.
-kj::String uriEncodeControlChars(kj::ArrayPtr<const byte> bytes) {
-  // TODO(cleanup): Once this is deployed, update open-source KJ HTTP to do this automatically.
-  const char HEX_DIGITS_URI[] = "0123456789ABCDEF";
-
-  kj::Vector<char> result(bytes.size() + 1);
-  for (byte b: bytes) {
-    if (b > 0x20) {
-      result.add(b);
-    } else {
-      result.add('%');
-      result.add(HEX_DIGITS_URI[b / 16]);
-      result.add(HEX_DIGITS_URI[b % 16]);
-    }
-  }
-  result.add('\0');
-  return kj::String(result.releaseAsArray());
-}
-
 jsg::Promise<jsg::Ref<Response>> handleHttpResponse(jsg::Lock& js,
     jsg::Ref<Fetcher> fetcher,
     jsg::Ref<Request> jsRequest,
@@ -1842,39 +1450,76 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
   auto signal = jsRequest->getSignal();
   KJ_IF_SOME(s, signal) {
     // If the AbortSignal has already been triggered, then we need to stop here.
-    if ((s)->getAborted()) {
-      return js.rejectedPromise<jsg::Ref<Response>>((s)->getReason(js));
+    if (s->getAborted(js)) {
+      return js.rejectedPromise<jsg::Ref<Response>>(s->getReason(js));
     }
   }
 
+  // Get client and trace context (if needed) in one clean call
+  auto clientWithTracing = fetcher->getClientWithTracing(ioContext, jsRequest->serializeCfBlobJson(js), "fetch"_kjc);
+  auto traceContext = kj::mv(clientWithTracing.traceContext);
+
   // TODO(cleanup): Don't convert to HttpClient. Use the HttpService interface instead. This
   //   requires a significant rewrite of the code below. It'll probably get simpler, though?
-  kj::Own<kj::HttpClient> client =
-      asHttpClient(fetcher->getClient(ioContext, jsRequest->serializeCfBlobJson(js), "fetch"_kjc));
+  kj::Own<kj::HttpClient> client = asHttpClient(kj::mv(clientWithTracing.client));
+
+  if (util::Autogate::Autogate::isEnabled(util::AutogateKey::FETCH_REQUEST_MEMORY_ADJUSTMENT)) {
+    // fetch requests use a lot of unaccounted c++ memory, so we simply adjust memory usage by some
+    // arbitrary amount to protect against OOMs.
+    client = client.attach(js.getExternalMemoryAdjustment(3 * 1024));
+  }
 
   kj::HttpHeaders headers(ioContext.getHeaderTable());
   jsRequest->shallowCopyHeadersTo(headers);
 
   // If the jsRequest has a CacheMode, we need to handle that here.
-  // Currently, the only cache mode we support is undefined and no-store (behind an autogate),
-  // but we will soon support no-cache.
+  // Currently, the only cache mode we support is undefined and no-store, no-cache, and reload
   auto headerIds = ioContext.getHeaderIds();
   const auto cacheMode = jsRequest->getCacheMode();
   switch (cacheMode) {
+    case Request::CacheMode::RELOAD:
+      KJ_FALLTHROUGH;
     case Request::CacheMode::NOSTORE:
       KJ_FALLTHROUGH;
     case Request::CacheMode::NOCACHE:
       if (headers.get(headerIds.cacheControl) == kj::none) {
-        headers.set(headerIds.cacheControl, "no-cache");
+        headers.setPtr(headerIds.cacheControl, "no-cache");
       }
       if (headers.get(headerIds.pragma) == kj::none) {
-        headers.set(headerIds.pragma, "no-cache");
+        headers.setPtr(headerIds.pragma, "no-cache");
       }
       KJ_FALLTHROUGH;
     case Request::CacheMode::NONE:
       break;
     default:
       KJ_UNREACHABLE;
+  }
+
+  KJ_IF_SOME(ctx, traceContext) {
+    ctx.setTag("network.protocol.name"_kjc, "http"_kjc);
+    ctx.setTag("network.protocol.version"_kjc, "HTTP/1.1"_kjc);
+    ctx.setTag("http.request.method"_kjc, kj::str(jsRequest->getMethodEnum()));
+    ctx.setTag("url.full"_kjc, jsRequest->getUrl());
+
+    KJ_IF_SOME(userAgent, headers.get(headerIds.userAgent)) {
+      ctx.setTag("user_agent.original"_kjc, userAgent);
+    }
+
+    KJ_IF_SOME(contentType, headers.get(headerIds.contentType)) {
+      ctx.setTag("http.request.header.content-type"_kjc, contentType);
+    }
+
+    KJ_IF_SOME(contentLength, headers.get(headerIds.contentLength)) {
+      ctx.setTag("http.request.header.content-length"_kjc, contentLength);
+    }
+
+    KJ_IF_SOME(accept, headers.get(headerIds.accept)) {
+      ctx.setTag("http.request.header.accept"_kjc, accept);
+    }
+
+    KJ_IF_SOME(acceptEncoding, headers.get(headerIds.acceptEncoding)) {
+      ctx.setTag("http.request.header.accept-encoding"_kjc, acceptEncoding);
+    }
   }
 
   kj::String url =
@@ -1887,7 +1532,8 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
       headers.unset(kj::HttpHeaderId::SEC_WEBSOCKET_EXTENSIONS);
     }
     auto webSocketResponse = client->openWebSocket(url, headers);
-    return ioContext.awaitIo(js, AbortSignal::maybeCancelWrap(signal, kj::mv(webSocketResponse)),
+    return ioContext.awaitIo(js,
+        AbortSignal::maybeCancelWrap(js, signal, kj::mv(webSocketResponse)),
         [fetcher = kj::mv(fetcher), jsRequest = kj::mv(jsRequest), urlList = kj::mv(urlList),
             client = kj::mv(client), signal = kj::mv(signal)](
             jsg::Lock& js, kj::HttpClient::WebSocketResponse&& response) mutable
@@ -1903,15 +1549,15 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
           webSocket = webSocket.attach(kj::mv(client));
           KJ_IF_SOME(s, signal) {
             // If the AbortSignal has already been triggered, then we need to stop here.
-            if ((s)->getAborted()) {
-              return js.rejectedPromise<jsg::Ref<Response>>((s)->getReason(js));
+            if (s->getAborted(js)) {
+              return js.rejectedPromise<jsg::Ref<Response>>(s->getReason(js));
             }
             webSocket = kj::refcounted<AbortableWebSocket>(kj::mv(webSocket), s->getCanceler());
           }
           return js.resolvedPromise(makeHttpResponse(js, jsRequest->getMethodEnum(),
               kj::mv(urlList), response.statusCode, response.statusText, *response.headers,
-              newNullInputStream(), jsg::alloc<WebSocket>(kj::mv(webSocket)),
-              Response::BodyEncoding::AUTO, kj::mv(signal)));
+              newNullInputStream(), js.alloc<WebSocket>(kj::mv(webSocket)),
+              jsRequest->getResponseBodyEncoding(), kj::mv(signal)));
         }
       }
       KJ_UNREACHABLE;
@@ -1923,6 +1569,11 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
       // standard does not say that we should. Hence, we always use StreamEncoding::IDENTITY.
       // https://github.com/whatwg/fetch/issues/589
       auto maybeLength = jsBody->tryGetLength(StreamEncoding::IDENTITY);
+      KJ_IF_SOME(ctx, traceContext) {
+        KJ_IF_SOME(length, maybeLength) {
+          ctx.setTag("http.request.body.size"_kjc, static_cast<int64_t>(length));
+        }
+      }
 
       if (maybeLength.orDefault(1) == 0 &&
           headers.get(kj::HttpHeaderId::CONTENT_LENGTH) == kj::none &&
@@ -1933,7 +1584,13 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
         // the code in global-scope.c++ on the receiving end will decide the body should be null.
         // We'd like to avoid this weird discontinuity, so let's set Content-Length explicitly to
         // 0.
-        headers.set(kj::HttpHeaderId::CONTENT_LENGTH, "0"_kj);
+        headers.setPtr(kj::HttpHeaderId::CONTENT_LENGTH, "0"_kj);
+      }
+
+      KJ_IF_SOME(ctx, traceContext) {
+        KJ_IF_SOME(cfRay, headers.get(headerIds.cfRay)) {
+          ctx.setTag("cloudflare.ray_id"_kjc, cfRay);
+        }
       }
 
       nativeRequest = client->request(jsRequest->getMethodEnum(), url, headers, maybeLength);
@@ -1963,13 +1620,13 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
       // TODO(someday): Allow deferred proxying for bidirectional streaming.
       ioContext.addWaitUntil(handleCancelablePump(
           AbortSignal::maybeCancelWrap(
-              signal, ioContext.waitForDeferredProxy(jsBody->pumpTo(js, kj::mv(stream), true))),
+              js, signal, ioContext.waitForDeferredProxy(jsBody->pumpTo(js, kj::mv(stream), true))),
           jsBody.addRef()));
     } else {
-      nativeRequest = client->request(jsRequest->getMethodEnum(), url, headers, uint64_t(0));
+      nativeRequest = client->request(jsRequest->getMethodEnum(), url, headers, static_cast<uint64_t>(0));
     }
     return ioContext.awaitIo(js,
-        AbortSignal::maybeCancelWrap(signal, kj::mv(KJ_ASSERT_NONNULL(nativeRequest).response))
+        AbortSignal::maybeCancelWrap(js, signal, kj::mv(KJ_ASSERT_NONNULL(nativeRequest).response))
             .catch_([](kj::Exception&& exception) -> kj::Promise<kj::HttpClient::Response> {
       if (exception.getDescription().startsWith("invalid Content-Length header value")) {
         return JSG_KJ_EXCEPTION(FAILED, Error, exception.getDescription());
@@ -1979,9 +1636,15 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
       return kj::mv(exception);
     }),
         [fetcher = kj::mv(fetcher), jsRequest = kj::mv(jsRequest), urlList = kj::mv(urlList),
-            client = kj::mv(client)](jsg::Lock& js,
+            client = kj::mv(client), traceContext = kj::mv(traceContext)](jsg::Lock& js,
             kj::HttpClient::Response&& response) mutable -> jsg::Promise<jsg::Ref<Response>> {
       response.body = response.body.attach(kj::mv(client));
+      KJ_IF_SOME(ctx, traceContext) {
+        ctx.setTag("http.response.status_code"_kjc, static_cast<int64_t>(response.statusCode));
+        KJ_IF_SOME(length, response.body->tryGetLength()) {
+          ctx.setTag("http.response.body.size"_kjc, static_cast<int64_t>(length));
+        }
+      }
       return handleHttpResponse(
           js, kj::mv(fetcher), kj::mv(jsRequest), kj::mv(urlList), kj::mv(response));
     });
@@ -2015,8 +1678,8 @@ jsg::Promise<jsg::Ref<Response>> handleHttpResponse(jsg::Lock& js,
 
   KJ_IF_SOME(s, signal) {
     // If the AbortSignal has already been triggered, then we need to stop here.
-    if ((s)->getAborted()) {
-      return js.rejectedPromise<jsg::Ref<Response>>((s)->getReason(js));
+    if (s->getAborted(js)) {
+      return js.rejectedPromise<jsg::Ref<Response>>(s->getReason(js));
     }
     response.body = kj::refcounted<AbortableInputStream>(kj::mv(response.body), s->getCanceler());
   }
@@ -2024,17 +1687,25 @@ jsg::Promise<jsg::Ref<Response>> handleHttpResponse(jsg::Lock& js,
   if (isRedirectStatusCode(response.statusCode) &&
       jsRequest->getRedirectEnum() == Request::Redirect::FOLLOW) {
     KJ_IF_SOME(l, response.headers->get(kj::HttpHeaderId::LOCATION)) {
-      return handleHttpRedirectResponse(
-          js, kj::mv(fetcher), kj::mv(jsRequest), kj::mv(urlList), response.statusCode, l);
+
+      // Pump the response body to a singleton null stream before following the redirect.
+      auto& ioContext = IoContext::current();
+      return ioContext.awaitIo(js,
+          response.body->pumpTo(getGlobalNullOutputStream()).ignoreResult().attach(kj::mv(response.body)),
+          [fetcher = kj::mv(fetcher), jsRequest = kj::mv(jsRequest), urlList = kj::mv(urlList),
+           status = response.statusCode, location = kj::str(l)](jsg::Lock& js) mutable {
+        return handleHttpRedirectResponse(
+            js, kj::mv(fetcher), kj::mv(jsRequest), kj::mv(urlList), status, kj::mv(location));
+      });
     } else {
-      // No Location header. That's okay, we just return the response as is.
+      // No Location header. That's OK, we just return the response as is.
       // See https://fetch.spec.whatwg.org/#http-redirect-fetch step 2.
     }
   }
 
   auto result = makeHttpResponse(js, jsRequest->getMethodEnum(), kj::mv(urlList),
       response.statusCode, response.statusText, *response.headers, kj::mv(response.body), kj::none,
-      Response::BodyEncoding::AUTO, kj::mv(signal));
+      jsRequest->getResponseBodyEncoding(), kj::mv(signal));
 
   return js.resolvedPromise(kj::mv(result));
 }
@@ -2093,6 +1764,33 @@ jsg::Promise<jsg::Ref<Response>> handleHttpRedirectResponse(jsg::Lock& js,
   if (urlList.size() - 1 >= MAX_REDIRECT_COUNT) {
     auto exception = JSG_KJ_EXCEPTION(FAILED, TypeError, "Too many redirects.", urlList);
     return js.rejectedPromise<jsg::Ref<Response>>(kj::mv(exception));
+  }
+
+  if (FeatureFlags::get(js).getStripAuthorizationOnCrossOriginRedirect()) {
+    auto base = urlList.back().toString();
+
+    auto currentUrl = KJ_UNWRAP_OR(jsg::Url::tryParse(base.asPtr()), {
+      auto exception =
+        JSG_KJ_EXCEPTION(FAILED, TypeError, "Invalid current URL; unable to follow redirect.");
+      return js.rejectedPromise<jsg::Ref<Response>>(kj::mv(exception));
+    });
+
+    auto locationUrl = KJ_UNWRAP_OR(jsg::Url::tryParse(location, base.asPtr()), {
+      auto exception =
+        JSG_KJ_EXCEPTION(FAILED, TypeError, "Invalid Location header; unable to follow redirect.");
+      return js.rejectedPromise<jsg::Ref<Response>>(kj::mv(exception));
+    });
+
+    if (currentUrl.getOrigin() != locationUrl.getOrigin()) {
+      // If request’s current URL’s origin is not same origin with locationURL’s origin, then
+      // for each headerName of CORS non-wildcard request-header name, delete headerName from
+      // request’s header list.
+      // -- Fetch spec s. 4.4.13
+      // <https://fetch.spec.whatwg.org/#http-redirect-fetch>
+      //  (NB: "CORS non-wildcard request-header name" consists solely of "Authorization")
+
+      jsRequest->getHeaders(js)->deleteCommon(capnp::CommonHeaderName::AUTHORIZATION);
+    }
   }
 
   urlList.add(kj::mv(KJ_ASSERT_NONNULL(redirectedLocation)));
@@ -2154,18 +1852,18 @@ jsg::Ref<Response> makeHttpResponse(jsg::Lock& js,
     kj::Maybe<jsg::Ref<WebSocket>> webSocket,
     Response::BodyEncoding bodyEncoding,
     kj::Maybe<jsg::Ref<AbortSignal>> signal) {
-  auto responseHeaders = jsg::alloc<Headers>(headers, Headers::Guard::RESPONSE);
+  auto responseHeaders = js.alloc<Headers>(js, headers, Headers::Guard::RESPONSE);
   auto& context = IoContext::current();
 
   // The Fetch spec defines responses to HEAD or CONNECT requests, or responses with null body
   // statuses, as having null bodies.
-  // See https://fetch.spec.whatwg.org/#main-fetch step 11.
+  // See https://fetch.spec.whatwg.org/#main-fetch step 21.
   //
   // Note that we don't handle the CONNECT case here because kj-http handles CONNECT specially,
   // and the Fetch spec doesn't allow users to create Requests with CONNECT methods.
   kj::Maybe<Body::ExtractedBody> responseBody = kj::none;
   if (method != kj::HttpMethod::HEAD && !isNullBodyStatusCode(statusCode)) {
-    responseBody = Body::ExtractedBody(jsg::alloc<ReadableStream>(context,
+    responseBody = Body::ExtractedBody(js.alloc<ReadableStream>(context,
         newSystemStream(kj::mv(body),
             getContentEncoding(context, headers, bodyEncoding, FeatureFlags::get(js)))));
   }
@@ -2173,14 +1871,17 @@ jsg::Ref<Response> makeHttpResponse(jsg::Lock& js,
   // The Fetch spec defines "response URLs" as having no fragments. Since the last URL in the list
   // is the one reported by Response::getUrl(), we nullify its fragment before serialization.
   kj::Array<kj::String> urlList;
-  if (urlListParam.size() > 0) {
+  if (!urlListParam.empty()) {
     urlListParam.back().fragment = kj::none;
     urlList = KJ_MAP(url, urlListParam) { return url.toString(); };
   }
 
   // TODO(someday): Fill response CF blob from somewhere?
-  return jsg::alloc<Response>(js, statusCode, kj::str(statusText), kj::mv(responseHeaders), nullptr,
-      kj::mv(responseBody), kj::mv(urlList), kj::mv(webSocket));
+  kj::Maybe<kj::String> maybeStatusText = statusText == defaultStatusText(statusCode)
+      ? kj::Maybe<kj::String>()
+      : kj::str(statusText);
+  return js.alloc<Response>(js, statusCode, kj::mv(maybeStatusText), kj::mv(responseHeaders),
+      nullptr, kj::mv(responseBody), kj::mv(urlList), kj::mv(webSocket), bodyEncoding);
 }
 
 namespace {
@@ -2206,6 +1907,11 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
     // front is robust, and won't add significant overhead compared to the rest of fetch().
     auto jsRequest = Request::constructor(js, kj::mv(requestOrUrl), kj::mv(requestInit));
 
+    // Clear the request's signal if the 'ignoreForSubrequests' flag is set. This happens when
+    // a request from an incoming fetch is passed-through to another fetch. We want to avoid
+    // aborting the subrequest in that case.
+    jsRequest->clearSignalIfIgnoredForSubrequest(js);
+
     // This URL list keeps track of redirections and becomes a source for Response's URL list. The
     // first URL in the list is the Request's URL (visible to JS via Request::getUrl()). The last URL
     // in the list is the Request's "current" URL (eventually visible to JS via Response::getUrl()).
@@ -2217,20 +1923,29 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
     } else KJ_IF_SOME(f, jsRequest->getFetcher()) {
       actualFetcher = kj::mv(f);
     } else {
-      actualFetcher = jsg::alloc<Fetcher>(
-          IoContext::NULL_CLIENT_CHANNEL, Fetcher::RequiresHostAndProtocol::YES);
+      actualFetcher =
+          js.alloc<Fetcher>(IoContext::NULL_CLIENT_CHANNEL, Fetcher::RequiresHostAndProtocol::YES);
     }
 
     KJ_IF_SOME(dataUrl, DataUrl::tryParse(jsRequest->getUrl())) {
       // If the URL is a data URL, we need to handle it specially.
-      auto data = dataUrl.releaseData();
-      auto headers = jsg::alloc<Headers>();
-      headers->set(jsg::ByteString(kj::str("content-type")),
-          jsg::ByteString(dataUrl.getMimeType().toString()));
-      return js.resolvedPromise(Response::constructor(js, kj::Maybe(kj::mv(data)),
+      kj::Maybe<kj::Array<kj::byte>> maybeResponseBody;
+
+      // The Fetch spec defines responses to HEAD or CONNECT requests, or responses with null body
+      // statuses, as having null bodies.
+      // See https://fetch.spec.whatwg.org/#main-fetch step 21.
+      //
+      // Note that we don't handle the CONNECT case here because kj-http handles CONNECT specially,
+      // and the Fetch spec doesn't allow users to create Requests with CONNECT methods.
+      if (jsRequest->getMethodEnum() == kj::HttpMethod::GET) {
+        maybeResponseBody.emplace(dataUrl.releaseData());
+      }
+
+      auto headers = js.alloc<Headers>();
+      headers->setCommon(capnp::CommonHeaderName::CONTENT_TYPE, dataUrl.getMimeType().toString());
+      return js.resolvedPromise(Response::constructor(js, kj::mv(maybeResponseBody),
           Response::InitializerDict{
             .status = 200,
-            .statusText = kj::str("OK"),
             .headers = kj::mv(headers),
           }));
     }
@@ -2301,20 +2016,27 @@ kj::Maybe<jsg::Ref<JsRpcProperty>> Fetcher::getRpcMethod(jsg::Lock& js, kj::Stri
     return kj::none;
   }
 
+  return getRpcMethodInternal(js, kj::mv(name));
+}
+
+kj::Maybe<jsg::Ref<JsRpcProperty>> Fetcher::getRpcMethodInternal(jsg::Lock& js, kj::String name) {
+  // Same as getRpcMethod, but skips compatibility check to allow RPC to be used from bindings
+  // attached to workers without rpc flag.
+
   // Do not return a method for `then`, otherwise JavaScript decides this is a thenable, i.e. a
   // custom Promise, which will mean a Promise that resolves to this object will attempt to chain
   // with it, which is not what you want!
   if (name == "then"_kj) return kj::none;
 
-  return jsg::alloc<JsRpcProperty>(JSG_THIS, kj::mv(name));
+  return js.alloc<JsRpcProperty>(JSG_THIS, kj::mv(name));
 }
 
 rpc::JsRpcTarget::Client Fetcher::getClientForOneCall(
     jsg::Lock& js, kj::Vector<kj::StringPtr>& path) {
   auto& ioContext = IoContext::current();
   auto worker = getClient(ioContext, kj::none, "jsRpcSession"_kjc);
-  auto event = kj::heap<api::JsRpcSessionCustomEventImpl>(
-      JsRpcSessionCustomEventImpl::WORKER_RPC_EVENT_TYPE);
+  auto event = kj::heap<api::JsRpcSessionCustomEvent>(
+      JsRpcSessionCustomEvent::WORKER_RPC_EVENT_TYPE);
 
   auto result = event->getCap();
 
@@ -2329,6 +2051,79 @@ rpc::JsRpcTarget::Client Fetcher::getClientForOneCall(
   // (Don't extend `path` because we're the root.)
 
   return result;
+}
+
+void Fetcher::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
+  auto channel = getSubrequestChannel(IoContext::current());
+  channel->requireAllowsTransfer();
+
+  KJ_IF_SOME(handler, serializer.getExternalHandler()) {
+    KJ_IF_SOME(frankenvalueHandler, kj::tryDowncast<Frankenvalue::CapTableBuilder>(handler)) {
+      // Encoding a Frankenvalue (e.g. for dynamic loopback props or dynamic isolate env).
+      serializer.writeRawUint32(frankenvalueHandler.add(kj::mv(channel)));
+      return;
+    } else KJ_IF_SOME(rpcHandler, kj::tryDowncast<RpcSerializerExternalHandler>(handler)) {
+      JSG_REQUIRE(FeatureFlags::get(js).getWorkerdExperimental(), DOMDataCloneError,
+          "ServiceStub serialization requires the 'experimental' compat flag.");
+
+      auto token = channel->getToken(IoChannelFactory::ChannelTokenUsage::RPC);
+      rpcHandler.write([token = kj::mv(token)](rpc::JsValue::External::Builder builder) {
+        builder.setSubrequestChannelToken(token);
+      });
+      return;
+    }
+    // TODO(someday): structuredClone() should have special handling that just reproduces the same
+    //   local object. At present we have no way to recognize structuredClone() here though.
+  }
+
+  // The allow_irrevocable_stub_storage flag allows us to just embed the token inline. This format
+  // is temporary, anyone using this will lose their data later.
+  JSG_REQUIRE(FeatureFlags::get(js).getAllowIrrevocableStubStorage(), DOMDataCloneError,
+      "ServiceStub cannot be serialized in this context.");
+  serializer.writeLengthDelimited(channel->getToken(IoChannelFactory::ChannelTokenUsage::STORAGE));
+}
+
+jsg::Ref<Fetcher> Fetcher::deserialize(jsg::Lock& js,
+    rpc::SerializationTag tag, jsg::Deserializer& deserializer) {
+  KJ_IF_SOME(handler, deserializer.getExternalHandler()) {
+    KJ_IF_SOME(frankenvalueHandler, kj::tryDowncast<Frankenvalue::CapTableReader>(handler)) {
+      // Decoding a Frankenvalue (e.g. for dynamic loopback props or dynamic isolate env).
+      auto& cap = KJ_REQUIRE_NONNULL(frankenvalueHandler.get(deserializer.readRawUint32()),
+          "serialized ServiceStub had invalid cap table index");
+
+      KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::SubrequestChannel>(cap)) {
+        // Probably decoding dynamic ctx.props.
+        return js.alloc<Fetcher>(IoContext::current().addObject(kj::addRef(channel)));
+      } else KJ_IF_SOME(channel, kj::tryDowncast<IoChannelCapTableEntry>(cap)) {
+        // Probably decoding dynamic isolate env.
+        return js.alloc<Fetcher>(
+            channel.getChannelNumber(IoChannelCapTableEntry::Type::SUBREQUEST),
+            RequiresHostAndProtocol::YES, /*isInHouse=*/false);
+      } else {
+        KJ_FAIL_REQUIRE("ServiceStub capability in Frankenvalue is not a SubrequestChannel?");
+      }
+    } else KJ_IF_SOME(rpcHandler, kj::tryDowncast<RpcDeserializerExternalHandler>(handler)) {
+      JSG_REQUIRE(FeatureFlags::get(js).getWorkerdExperimental(), DOMDataCloneError,
+          "ServiceStub serialization requires the 'experimental' compat flag.");
+
+      auto external = rpcHandler.read();
+      KJ_REQUIRE(external.isSubrequestChannelToken());
+      auto& ioctx = IoContext::current();
+      auto channel = ioctx.getIoChannelFactory().subrequestChannelFromToken(
+          IoChannelFactory::ChannelTokenUsage::RPC,
+          external.getSubrequestChannelToken());
+      return js.alloc<Fetcher>(ioctx.addObject(kj::mv(channel)));
+    }
+  }
+
+  // The allow_irrevocable_stub_storage flag allows us to just embed the token inline. This format
+  // is temporary, anyone using this will lose their data later.
+  JSG_REQUIRE(FeatureFlags::get(js).getAllowIrrevocableStubStorage(), DOMDataCloneError,
+      "ServiceStub cannot be deserialized in this context.");
+  auto& ioctx = IoContext::current();
+  auto channel = ioctx.getIoChannelFactory().subrequestChannelFromToken(
+      IoChannelFactory::ChannelTokenUsage::STORAGE, deserializer.readLengthDelimitedBytes());
+  return js.alloc<Fetcher>(ioctx.addObject(kj::mv(channel)));
 }
 
 static jsg::Promise<void> throwOnError(
@@ -2352,7 +2147,7 @@ static jsg::Promise<Fetcher::GetResult> parseResponse(
       return js.resolvedPromise(Fetcher::GetResult(kj::mv(body)));
     } else {
       // Empty body.
-      return js.resolvedPromise(Fetcher::GetResult(jsg::alloc<ReadableStream>(
+      return js.resolvedPromise(Fetcher::GetResult(js.alloc<ReadableStream>(
           IoContext::current(), newSystemStream(newNullInputStream(), StreamEncoding::IDENTITY))));
     }
   }
@@ -2388,7 +2183,7 @@ jsg::Promise<Fetcher::GetResult> Fetcher::get(
     uint status = response->getStatus();
     if (status == 404 || status == 410) {
       return js.resolvedPromise(GetResult(js.v8Ref(js.v8Null())));
-    } else if (status < 200 || status >= 300) {
+    } else if (!response->getOk()) {
       // Manually construct exception so that we can incorporate method and status into the text
       // that JavaScript sees.
       // TODO(someday): Would be nice to attach the response to the JavaScript error, maybe? Or
@@ -2443,12 +2238,11 @@ jsg::Promise<void> Fetcher::delete_(jsg::Lock& js, kj::String url) {
 jsg::Promise<Fetcher::QueueResult> Fetcher::queue(
     jsg::Lock& js, kj::String queueName, kj::Array<ServiceBindingQueueMessage> messages) {
   auto& ioContext = IoContext::current();
-  auto worker = getClient(ioContext, kj::none, "queue"_kjc);
 
   auto encodedMessages = kj::heapArrayBuilder<IncomingQueueMessage>(messages.size());
   for (auto& msg: messages) {
     KJ_IF_SOME(b, msg.body) {
-      JSG_REQUIRE(msg.serializedBody == nullptr, TypeError,
+      JSG_REQUIRE(msg.serializedBody == kj::none, TypeError,
           "Expected one of body or serializedBody for each message");
       jsg::Serializer serializer(js,
           jsg::Serializer::Options{
@@ -2470,7 +2264,9 @@ jsg::Promise<Fetcher::QueueResult> Fetcher::queue(
     }
   }
 
-  auto event = kj::refcounted<api::QueueCustomEventImpl>(QueueEvent::Params{
+  // Only create worker interface after the error checks above to reduce overhead in case of errors.
+  auto worker = getClient(ioContext, kj::none, "queue"_kjc);
+  auto event = kj::refcounted<api::QueueCustomEvent>(QueueEvent::Params{
     .queueName = kj::mv(queueName),
     .messages = encodedMessages.finish(),
   });
@@ -2517,16 +2313,58 @@ jsg::Promise<Fetcher::ScheduledResult> Fetcher::scheduled(
 
 kj::Own<WorkerInterface> Fetcher::getClient(
     IoContext& ioContext, kj::Maybe<kj::String> cfStr, kj::ConstString operationName) {
+  auto clientWithTracing = getClientWithTracing(ioContext, kj::mv(cfStr), kj::mv(operationName));
+  return clientWithTracing.client.attach(kj::mv(clientWithTracing.traceContext));
+}
+
+Fetcher::ClientWithTracing Fetcher::getClientWithTracing(
+    IoContext& ioContext, kj::Maybe<kj::String> cfStr, kj::ConstString operationName) {
   KJ_SWITCH_ONEOF(channelOrClientFactory) {
     KJ_CASE_ONEOF(channel, uint) {
-      return ioContext.getSubrequestChannel(
-          channel, isInHouse, kj::mv(cfStr), kj::mv(operationName));
+      // For channels, create trace context
+      auto traceContext = ioContext.makeUserTraceSpan(kj::mv(operationName));
+      auto client = ioContext.getSubrequestChannel(channel, isInHouse, kj::mv(cfStr), traceContext);
+      return ClientWithTracing{kj::mv(client), kj::mv(traceContext)};
+    }
+    KJ_CASE_ONEOF(channel, IoOwn<IoChannelFactory::SubrequestChannel>) {
+      auto traceContext = ioContext.makeUserTraceSpan(kj::mv(operationName));
+      auto client = ioContext.getSubrequest(
+          [&](TraceContext& tracing, IoChannelFactory& ioChannelFactory) {
+        return channel->startRequest({.cfBlobJson = kj::mv(cfStr), .parentSpan = tracing.getInternalSpanParent()});
+      }, {
+        .inHouse = isInHouse,
+        .wrapMetrics = !isInHouse,
+        .existingTraceContext = traceContext,
+      });
+      return ClientWithTracing{kj::mv(client), kj::mv(traceContext)};
     }
     KJ_CASE_ONEOF(outgoingFactory, IoOwn<OutgoingFactory>) {
-      return outgoingFactory->newSingleUseClient(kj::mv(cfStr));
+      // For outgoing factories, no trace context needed
+      auto client = outgoingFactory->newSingleUseClient(kj::mv(cfStr));
+      return ClientWithTracing{kj::mv(client), kj::none};
     }
     KJ_CASE_ONEOF(outgoingFactory, kj::Own<CrossContextOutgoingFactory>) {
-      return outgoingFactory->newSingleUseClient(ioContext, kj::mv(cfStr));
+      // For cross-context outgoing factories, no trace context needed
+      auto client = outgoingFactory->newSingleUseClient(ioContext, kj::mv(cfStr));
+      return ClientWithTracing{kj::mv(client), kj::none};
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+kj::Own<IoChannelFactory::SubrequestChannel> Fetcher::getSubrequestChannel(IoContext& ioContext) {
+  KJ_SWITCH_ONEOF(channelOrClientFactory) {
+    KJ_CASE_ONEOF(channel, uint) {
+      return ioContext.getIoChannelFactory().getSubrequestChannel(channel);
+    }
+    KJ_CASE_ONEOF(channel, IoOwn<IoChannelFactory::SubrequestChannel>) {
+      return kj::addRef(*channel);
+    }
+    KJ_CASE_ONEOF(outgoingFactory, IoOwn<OutgoingFactory>) {
+      return outgoingFactory->getSubrequestChannel();
+    }
+    KJ_CASE_ONEOF(outgoingFactory, kj::Own<CrossContextOutgoingFactory>) {
+      return outgoingFactory->getSubrequestChannel(ioContext);
     }
   }
   KJ_UNREACHABLE;
@@ -2600,120 +2438,4 @@ kj::Url Fetcher::parseUrl(jsg::Lock& js, kj::StringPtr url) {
     JSG_FAIL_REQUIRE(TypeError, kj::str("Fetch API cannot load: ", url));
   }
 }
-
-static kj::StringPtr defaultStatusText(uint statusCode) {
-  // RFC 7231 recommendations, unless otherwise specified.
-  // https://tools.ietf.org/html/rfc7231#section-6.1
-#define STATUS(code, text)                                                                         \
-  case code:                                                                                       \
-    return text##_kj
-  switch (statusCode) {
-    STATUS(100, "Continue");
-    STATUS(101, "Switching Protocols");
-    STATUS(102, "Processing");   // RFC 2518, WebDAV
-    STATUS(103, "Early Hints");  // RFC 8297
-    STATUS(200, "OK");
-    STATUS(201, "Created");
-    STATUS(202, "Accepted");
-    STATUS(203, "Non-Authoritative Information");
-    STATUS(204, "No Content");
-    STATUS(205, "Reset Content");
-    STATUS(206, "Partial Content");
-    STATUS(207, "Multi-Status");      // RFC 4918, WebDAV
-    STATUS(208, "Already Reported");  // RFC 5842, WebDAV
-    STATUS(226, "IM Used");           // RFC 3229
-    STATUS(300, "Multiple Choices");
-    STATUS(301, "Moved Permanently");
-    STATUS(302, "Found");
-    STATUS(303, "See Other");
-    STATUS(304, "Not Modified");
-    STATUS(305, "Use Proxy");
-    STATUS(307, "Temporary Redirect");
-    STATUS(308, "Permanent Redirect");  // RFC 7538
-    STATUS(400, "Bad Request");
-    STATUS(401, "Unauthorized");
-    STATUS(402, "Payment Required");
-    STATUS(403, "Forbidden");
-    STATUS(404, "Not Found");
-    STATUS(405, "Method Not Allowed");
-    STATUS(406, "Not Acceptable");
-    STATUS(407, "Proxy Authentication Required");
-    STATUS(408, "Request Timeout");
-    STATUS(409, "Conflict");
-    STATUS(410, "Gone");
-    STATUS(411, "Length Required");
-    STATUS(412, "Precondition Failed");
-    STATUS(413, "Payload Too Large");
-    STATUS(414, "URI Too Long");
-    STATUS(415, "Unsupported Media Type");
-    STATUS(416, "Range Not Satisfiable");
-    STATUS(417, "Expectation Failed");
-    STATUS(418, "I'm a teapot");          // RFC 2324
-    STATUS(421, "Misdirected Request");   // RFC 7540
-    STATUS(422, "Unprocessable Entity");  // RFC 4918, WebDAV
-    STATUS(423, "Locked");                // RFC 4918, WebDAV
-    STATUS(424, "Failed Dependency");     // RFC 4918, WebDAV
-    STATUS(426, "Upgrade Required");
-    STATUS(428, "Precondition Required");            // RFC 6585
-    STATUS(429, "Too Many Requests");                // RFC 6585
-    STATUS(431, "Request Header Fields Too Large");  // RFC 6585
-    STATUS(451, "Unavailable For Legal Reasons");    // RFC 7725
-    STATUS(500, "Internal Server Error");
-    STATUS(501, "Not Implemented");
-    STATUS(502, "Bad Gateway");
-    STATUS(503, "Service Unavailable");
-    STATUS(504, "Gateway Timeout");
-    STATUS(505, "HTTP Version Not Supported");
-    STATUS(506, "Variant Also Negotiates");          // RFC 2295
-    STATUS(507, "Insufficient Storage");             // RFC 4918, WebDAV
-    STATUS(508, "Loop Detected");                    // RFC 5842, WebDAV
-    STATUS(510, "Not Extended");                     // RFC 2774
-    STATUS(511, "Network Authentication Required");  // RFC 6585
-    default:
-      // If we don't recognize the status code, check which range it falls into and use the status
-      // code class defined by RFC 7231, section 6, as the status text.
-      if (statusCode >= 200 && statusCode < 300) {
-        return "Successful"_kj;
-      } else if (statusCode >= 300 && statusCode < 400) {
-        return "Redirection"_kj;
-      } else if (statusCode >= 400 && statusCode < 500) {
-        return "Client Error"_kj;
-      } else if (statusCode >= 500 && statusCode < 600) {
-        return "Server Error"_kj;
-      } else {
-        KJ_UNREACHABLE;
-      }
-  }
-#undef STATUS
-}
-
-bool isNullBodyStatusCode(uint statusCode) {
-  switch (statusCode) {
-    // Fetch spec section 2.2.3 defines these status codes as null body statuses:
-    // https://fetch.spec.whatwg.org/#null-body-status
-    case 101:
-    case 204:
-    case 205:
-    case 304:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool isRedirectStatusCode(uint statusCode) {
-  switch (statusCode) {
-    // Fetch spec section 2.2.3 defines these status codes as redirect statuses:
-    // https://fetch.spec.whatwg.org/#redirect-status
-    case 301:
-    case 302:
-    case 303:
-    case 307:
-    case 308:
-      return true;
-    default:
-      return false;
-  }
-}
-
 }  // namespace workerd::api

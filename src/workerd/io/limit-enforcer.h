@@ -4,13 +4,25 @@
 
 #pragma once
 
-#include <workerd/io/observer.h>
-#include <workerd/jsg/jsg.h>
+#include <workerd/io/outcome.capnp.h>
+
+#include <v8-isolate.h>
+
+#include <kj/async.h>   // For Promise
+#include <kj/memory.h>  // for Own
+#include <kj/one-of.h>  // for OneOf
+#include <kj/time.h>    // for Duration
 
 namespace workerd {
+class IsolateObserver;
+class RequestObserver;
 
 struct ActorCacheSharedLruOptions;
 class IoContext;
+
+namespace jsg {
+class Lock;
+}  // namespace jsg
 
 static constexpr size_t DEFAULT_MAX_PBKDF2_ITERATIONS = 100'000;
 
@@ -64,7 +76,7 @@ class IsolateLimitEnforcer: public kj::Refcounted {
   // Report resource usage metrics to the given isolate metrics object.
   virtual void reportMetrics(IsolateObserver& isolateMetrics) const = 0;
 
-  // Called when performing a cypto key derivation function (like pbkdf2) to determine if
+  // Called when performing a crypto key derivation function (like pbkdf2) to determine if
   // if the requested number of iterations is acceptable. If kj::none is returned, the
   // number of iterations requested is acceptable. If a number is returned, the requested
   // iterations is unacceptable and the return value specifies the maximum.
@@ -83,6 +95,18 @@ class IsolateLimitEnforcer: public kj::Refcounted {
   virtual size_t getBlobSizeLimit() const {
     return 128 * 1024 * 1024;  // 128 MB
   }
+
+  virtual bool hasExcessivelyExceededHeapLimit() const = 0;
+
+  // Inserts a custom mark event named `name` into this isolate's perf event data stream. At
+  // present, this is only implemented internally. Call this function from various APIs to be able
+  // to correlate perf event data with usage of those APIs.
+  //
+  // TODO(cleanup): This isn't strictly related to limit enforcement, so it's a bit odd here. It's
+  //  observability-related. However, our internal perf event observability is fairly tightly
+  //  coupled with our CPU time limiting system, so adding this function here is a path of least
+  //  resistance.
+  virtual void markPerfEvent(kj::LiteralStringConst name) const {};
 };
 
 // Abstract interface that enforces resource limits on a IoContext.
@@ -109,7 +133,7 @@ class LimitEnforcer {
   // external subrequests.
   virtual void newSubrequest(bool isInHouse) = 0;
 
-  enum class KvOpType { GET, GET_WITH, PUT, LIST, DELETE };
+  enum class KvOpType { GET, GET_WITH, PUT, LIST, DELETE, GET_BULK };
   // Called before starting a KV operation. Throws a JSG exception if the operation should be
   // blocked due to exceeding limits, such as the free tier daily operation limit.
   virtual void newKvRequest(KvOpType op) = 0;
@@ -144,6 +168,9 @@ class LimitEnforcer {
   // Returns a promise that will reject if and when a limit is exceeded that prevents further
   // JavaScript execution, such as the CPU or memory limit.
   virtual kj::Promise<void> onLimitsExceeded() = 0;
+  // Sets a callback to call when the cpu limit is nearly exceeded. The callback must be signal safe
+  // and cannot take the isolate lock.
+  virtual void setCpuLimitNearlyExceededCallback(kj::Function<void(void)>) = 0;
 
   // Throws an exception if a limit has already been exceeded which prevents further JavaScript
   // execution, such as the CPU or memory limit.
@@ -151,6 +178,9 @@ class LimitEnforcer {
 
   // Report resource usage metrics to the given request metrics object.
   virtual void reportMetrics(RequestObserver& requestMetrics) = 0;
+
+  // Only used downstream for internal metrics.
+  virtual kj::Duration consumeTimeElapsedForPeriodicLogging() = 0;
 };
 
 }  // namespace workerd

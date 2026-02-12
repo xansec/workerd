@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 export {
-  AiOptions,
+  type AiOptions,
   InferenceUpstreamError,
   Ai,
 } from 'cloudflare-internal:ai-api';
@@ -13,3 +13,21 @@ export {
   AiGatewayInternalError,
   AiGatewayLogNotFound,
 } from 'cloudflare-internal:aig-api';
+
+export {
+  AutoRAG,
+  AutoRAGInternalError,
+  AutoRAGNotFoundError,
+  AutoRAGUnauthorizedError,
+} from 'cloudflare-internal:autorag-api';
+
+export {
+  ToMarkdownService,
+  type ConversionResponse,
+  type SupportedFileFormat,
+  type ConversionOptions,
+  type ConversionRequestOptions,
+  type EmbeddedImageConversionOptions,
+  type ImageConversionOptions,
+  type MarkdownDocument,
+} from 'cloudflare-internal:to-markdown-api';

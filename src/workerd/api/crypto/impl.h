@@ -11,13 +11,14 @@
 
 #include <workerd/api/util.h>
 
+#include <ncrypto.h>
 #include <openssl/base.h>
 #include <openssl/bn.h>
 #include <openssl/err.h>
 
 #include <kj/encoding.h>
 
-typedef struct bignum_st BIGNUM;
+using BIGNUM = struct bignum_st;
 
 // Wrap calls to OpenSSL's EVP_* interface (and similar APIs) in this macro to
 // deal with errors.
@@ -136,7 +137,7 @@ class CryptoKey::Impl {
 
   Impl(bool extractable, CryptoKeyUsageSet usages): extractable(extractable), usages(usages) {}
 
-  static kj::Own<CryptoKey::Impl> from(kj::Own<EVP_PKEY> key);
+  static kj::Own<CryptoKey::Impl> from(jsg::Lock& js, kj::Own<EVP_PKEY> key);
 
   bool isExtractable() const {
     return extractable;
@@ -220,7 +221,7 @@ class CryptoKey::Impl {
 
   virtual kj::StringPtr getAlgorithmName() const = 0;
 
-  virtual CryptoKey::AsymmetricKeyDetails getAsymmetricKeyDetail() const {
+  virtual CryptoKey::AsymmetricKeyDetails getAsymmetricKeyDetail(jsg::Lock& js) const {
     JSG_FAIL_REQUIRE(DOMNotSupportedError,
         "The getAsymmetricKeyDetail operation is not implemented for \"", getAlgorithmName(),
         "\".");
@@ -252,6 +253,10 @@ class CryptoKey::Impl {
     return false;
   }
 
+  virtual void visitForGc(jsg::GcVisitor& visitor) {
+    // By default, nothing to visit.
+  }
+
  private:
   const bool extractable;
   const CryptoKeyUsageSet usages;
@@ -272,7 +277,7 @@ struct CryptoAlgorithm {
   //   would have to be const in order to enable const-copying, but it turns out you cannot specify
   //   `const` on a reference-to-function (the compiler ignores it as "redundant", but then
   //   template metaprogramming cannot recognize it as const). Maybe we can fix this in KJ, by
-  //   making `RemoveConstOrDisable` recognize function references are inherenly const.
+  //   making `RemoveConstOrDisable` recognize function references are inherently const.
 
   // Allow comparison by name, case-insensitive. This is a convenience for placing in an std::set.
   inline bool operator==(const CryptoAlgorithm& other) const {
@@ -294,7 +299,7 @@ class SslArrayDisposer: public kj::ArrayDisposer {
       size_t elementSize,
       size_t elementCount,
       size_t capacity,
-      void (*destroyElement)(void*)) const;
+      void (*destroyElement)(void*)) const override;
 };
 
 template <typename T, void (*sslFree)(T*)>
@@ -379,7 +384,7 @@ struct ClearErrorOnReturn {
 // Returns ceil(a / b) for integers (std::ceil always returns a floating point result).
 template <typename T>
 static inline T integerCeilDivision(T a, T b) {
-  static_assert(std::is_unsigned<T>::value);
+  static_assert(std::is_unsigned_v<T>);
   return a == 0 ? 0 : 1 + (a - 1) / b;
 }
 
@@ -425,12 +430,23 @@ void checkPbkdfLimits(jsg::Lock& js, size_t iterations);
 // is properly seeded without consuming entropy.
 bool CSPRNG(kj::ArrayPtr<kj::byte> buffer);
 
-kj::Own<CryptoKey::Impl> fromRsaKey(kj::Own<EVP_PKEY> key);
+kj::Own<CryptoKey::Impl> fromRsaKey(jsg::Lock& js, kj::Own<EVP_PKEY> key);
 kj::Own<CryptoKey::Impl> fromEcKey(kj::Own<EVP_PKEY> key);
 kj::Own<CryptoKey::Impl> fromEd25519Key(kj::Own<EVP_PKEY> key);
 
 // If the input bytes are a valid ASN.1 sequence, return them minus the prefix.
 kj::Maybe<kj::ArrayPtr<const kj::byte>> tryGetAsn1Sequence(kj::ArrayPtr<const kj::byte> data);
+
+template <typename T = const kj::byte>
+ncrypto::Buffer<T> ToNcryptoBuffer(kj::ArrayPtr<T> array) {
+  return ncrypto::Buffer<T>(array.begin(), array.size());
+}
+
+kj::Maybe<kj::Array<kj::byte>> simdutfBase64UrlDecode(kj::StringPtr input);
+kj::Maybe<jsg::BufferSource> simdutfBase64UrlDecode(jsg::Lock& js, kj::StringPtr input);
+jsg::BufferSource simdutfBase64UrlDecodeChecked(
+    jsg::Lock& js, kj::StringPtr input, kj::StringPtr error);
+
 }  // namespace workerd::api
 
 KJ_DECLARE_NON_POLYMORPHIC(DH);

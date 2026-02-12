@@ -5,7 +5,6 @@
 #pragma once
 
 #include "jsg.h"
-#include "ser.h"
 
 #define JSG_DOM_EXCEPTION_FOR_EACH_ERROR_NAME(f)                                                   \
   f(INDEX_SIZE_ERR, 1, "IndexSizeError") f(DOMSTRING_SIZE_ERR, 2, "DOMStringSizeError")            \
@@ -28,8 +27,10 @@
                                                   f(DATA_CLONE_ERR, 25, "DataCloneError")
 
 namespace workerd::jsg {
+class Serializer;
+class Deserializer;
 
-// JSG allows DOMExceptions to be tunneled through kj::Exceptions (see makeInternalError() for
+// JSG allows DOMExceptions to be tunneled through kj::Exceptions (see exceptionToJs() for
 // details). While this feature is activated conditionally at run-time, and thus does not depend
 // on any specific concrete C++ type, JSG needs to be able to unit test the tunneled exception
 // functionality, thus the existence of this implementation.

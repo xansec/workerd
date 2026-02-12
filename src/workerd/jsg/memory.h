@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include <v8-array-buffer.h>
 #include <v8-profiler.h>
 
 #include <kj/common.h>
@@ -21,6 +20,10 @@
 
 #include <stack>
 #include <string>
+
+namespace v8 {
+class BackingStore;
+}
 
 namespace workerd::jsg {
 
@@ -84,7 +87,7 @@ namespace workerd::jsg {
 // Within a jsg::Object, your only responsibility would be to implement the
 // helper visitForMemoryInfo(jsg::MemoryTracker& tracker) const method only
 // if the type has additional fields that need to be tracked. This works a
-// lot like the visitForGc(...) method used for gc tracing:
+// lot like the visitForGc(...) method used for GC tracing:
 //
 //   class Foo : public jsg::Object {
 //   public:
@@ -153,14 +156,17 @@ concept MemoryRetainerIsRootNode = requires(T a) {
 template <typename T>
 concept V8Value = requires(T a) { std::is_assignable_v<v8::Value, T>; };
 
+// sometimes jsgGetMemoryName is virtual sometimes it is not, so ¯\_(ツ)_/¯
 #define JSG_MEMORY_INFO(Name)                                                                      \
-  kj::StringPtr jsgGetMemoryName() const {                                                         \
+  _Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \"-Wsuggest-override\"")          \
+      kj::StringPtr                                                                                \
+      jsgGetMemoryName() const {                                                                   \
     return #Name##_kjc;                                                                            \
   }                                                                                                \
   size_t jsgGetMemorySelfSize() const {                                                            \
     return sizeof(Name);                                                                           \
   }                                                                                                \
-  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const _Pragma("GCC diagnostic pop")
 
 // jsg::MemoryTracker is used to construct the embedder graph for v8 heap
 // snapshot construction.
@@ -218,7 +224,7 @@ class MemoryTracker final {
       kj::Maybe<kj::StringPtr> nodeName = kj::none);
 
   template <typename T,
-      typename test = typename std::enable_if<std::numeric_limits<T>::is_specialized, bool>::type,
+      typename test = typename std::enable_if_t<std::numeric_limits<T>::is_specialized, bool>,
       typename dummy = bool>
   inline void trackField(kj::StringPtr edgeName,
       const kj::Array<T>& value,
@@ -306,8 +312,8 @@ class MemoryTracker final {
   explicit MemoryTracker(v8::Isolate* isolate, v8::EmbedderGraph* graph);
 
   KJ_NOINLINE MemoryRetainerNode* addNode(const void* retainer,
-      const kj::StringPtr name,
-      const size_t size,
+      kj::StringPtr name,
+      size_t size,
       v8::Local<v8::Object> obj,
       kj::Maybe<kj::Function<bool()>> checkIsRootNode,
       MemoryInfoDetachedState detachedness,
@@ -341,11 +347,6 @@ void MemoryTracker::trackFieldWithSize(
 void MemoryTracker::trackInlineFieldWithSize(
     kj::StringPtr edgeName, size_t size, kj::Maybe<kj::StringPtr> nodeName) {
   if (size > 0) addNode(nodeName.orDefault(edgeName), size, edgeName);
-}
-
-void MemoryTracker::trackField(
-    kj::StringPtr edgeName, const v8::BackingStore* value, kj::Maybe<kj::StringPtr> nodeName) {
-  trackFieldWithSize(edgeName, value->ByteLength(), "BackingStore"_kjc);
 }
 
 void MemoryTracker::trackField(

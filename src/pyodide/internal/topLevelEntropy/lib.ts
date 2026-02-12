@@ -9,7 +9,9 @@
 import { default as entropyPatches } from 'pyodide-internal:topLevelEntropy/entropy_patches.py';
 import { default as entropyImportContext } from 'pyodide-internal:topLevelEntropy/entropy_import_context.py';
 import { default as importPatchManager } from 'pyodide-internal:topLevelEntropy/import_patch_manager.py';
-import { simpleRunPython } from 'pyodide-internal:util';
+import { default as allowEntropy } from 'pyodide-internal:topLevelEntropy/allow_entropy.py';
+import { simpleRunPython, PythonUserError } from 'pyodide-internal:util';
+import { CHECK_RNG_STATE } from 'pyodide-internal:metadata';
 
 let allowed_entropy_calls_addr: number;
 
@@ -34,7 +36,7 @@ function setupShouldAllowBadEntropy(Module: Module): void {
 function shouldAllowBadEntropy(Module: Module): boolean {
   const val = Module.HEAP8[allowed_entropy_calls_addr];
   if (val) {
-    Module.HEAP8[allowed_entropy_calls_addr]--;
+    Module.HEAP8[allowed_entropy_calls_addr]!--;
     return true;
   }
   return false;
@@ -58,8 +60,13 @@ export function getRandomValues(Module: Module, arr: Uint8Array): Uint8Array {
     return crypto.getRandomValues(arr);
   }
   if (!shouldAllowBadEntropy(Module)) {
+    console.log('Entropy call failed');
+    console.log('JS stack:', new Error().stack);
+    console.log('Python stack:');
     Module._dump_traceback();
-    throw new Error('Disallowed operation called within global scope');
+    throw new PythonUserError(
+      'Disallowed operation called within global scope'
+    );
   }
   // "entropy" in the test suite is a bunch of 42's. Good to use a readily identifiable pattern
   // here which is different than the test suite.
@@ -73,25 +80,29 @@ export function getRandomValues(Module: Module, arr: Uint8Array): Uint8Array {
  * Hypothetically, we could skip it for new dedicated snapshots.
  */
 export function entropyMountFiles(Module: Module): void {
-  Module.FS.mkdir(`/lib/python3.12/site-packages/_cloudflare`);
+  const cloudflareDir = Module.FS.sitePackages + '/_cloudflare';
+  Module.FS.mkdir(cloudflareDir);
+  Module.FS.writeFile(cloudflareDir + '/__init__.py', new Uint8Array(0), {
+    canOwn: true,
+  });
   Module.FS.writeFile(
-    `/lib/python3.12/site-packages/_cloudflare/__init__.py`,
-    new Uint8Array(0),
-    { canOwn: true }
-  );
-  Module.FS.writeFile(
-    `/lib/python3.12/site-packages/_cloudflare/entropy_patches.py`,
+    cloudflareDir + '/entropy_patches.py',
     new Uint8Array(entropyPatches),
     { canOwn: true }
   );
   Module.FS.writeFile(
-    `/lib/python3.12/site-packages/_cloudflare/entropy_import_context.py`,
+    cloudflareDir + '/entropy_import_context.py',
     new Uint8Array(entropyImportContext),
     { canOwn: true }
   );
   Module.FS.writeFile(
-    `/lib/python3.12/site-packages/_cloudflare/import_patch_manager.py`,
+    cloudflareDir + '/import_patch_manager.py',
     new Uint8Array(importPatchManager),
+    { canOwn: true }
+  );
+  Module.FS.writeFile(
+    cloudflareDir + '/allow_entropy.py',
+    new Uint8Array(allowEntropy),
     { canOwn: true }
   );
 }
@@ -121,6 +132,24 @@ del before_top_level
   );
 }
 
+/**
+ * Called to check that random number generator state was not advanced by top level calls. We
+ * manually install overlays that crash when they are called in order to prevent this situation.
+ */
+export function entropyAfterSnapshot(Module: Module): void {
+  if (!CHECK_RNG_STATE) {
+    return;
+  }
+  simpleRunPython(
+    Module,
+    `
+from _cloudflare.entropy_patches import after_snapshot
+after_snapshot()
+del after_snapshot
+    `
+  );
+}
+
 let isReady = false;
 /**
  * Called to reseed rngs and turn off blocks that prevent access to rng APIs.
@@ -138,6 +167,6 @@ export function entropyBeforeRequest(Module: Module): void {
 from _cloudflare.entropy_patches import before_first_request
 before_first_request()
 del before_first_request
-  `
+    `
   );
 }

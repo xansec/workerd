@@ -25,7 +25,7 @@ struct CacheQueryOptions {
 
   // Historically, Cloudflare has not supported the Vary header because it's easy to blow up your
   // cache keys. Customers can now implement this with workers by modifying cache keys as they see
-  // fit based on any arbitary parameter (User-Agent, Content-Encoding, etc.).
+  // fit based on any arbitrary parameter (User-Agent, Content-Encoding, etc.).
   jsg::WontImplement ignoreVary;
 
   // Only used in CacheStorage::match(), which we won't implement.
@@ -41,16 +41,20 @@ class Cache: public jsg::Object {
   jsg::Unimplemented add(Request::Info request);
   jsg::Unimplemented addAll(kj::Array<Request::Info> requests);
 
-  jsg::Promise<jsg::Optional<jsg::Ref<Response>>> match(
-      jsg::Lock& js, Request::Info request, jsg::Optional<CacheQueryOptions> options);
+  jsg::Promise<jsg::Optional<jsg::Ref<Response>>> match(jsg::Lock& js,
+      Request::Info request,
+      jsg::Optional<CacheQueryOptions> options,
+      CompatibilityFlags::Reader flags);
 
   jsg::Promise<void> put(jsg::Lock& js,
       Request::Info request,
       jsg::Ref<Response> response,
       CompatibilityFlags::Reader flags);
 
-  jsg::Promise<bool> delete_(
-      jsg::Lock& js, Request::Info request, jsg::Optional<CacheQueryOptions> options);
+  jsg::Promise<bool> delete_(jsg::Lock& js,
+      Request::Info request,
+      jsg::Optional<CacheQueryOptions> options,
+      CompatibilityFlags::Reader flags);
 
   // Our cache does not support one-to-many matching, so this is not possible to implement.
   jsg::WontImplement matchAll(jsg::Optional<Request::Info>, jsg::Optional<CacheQueryOptions>) {
@@ -85,8 +89,10 @@ class Cache: public jsg::Object {
  private:
   kj::Maybe<kj::String> cacheName;
 
-  kj::Own<kj::HttpClient> getHttpClient(
-      IoContext& context, kj::Maybe<kj::String> cfBlobJson, kj::LiteralStringConst operationName);
+  kj::Own<kj::HttpClient> getHttpClient(IoContext& context,
+      kj::Maybe<kj::String> cfBlobJson,
+      TraceContext& traceContext,
+      bool enableCompatFlags);
 };
 
 // =======================================================================================
@@ -94,7 +100,7 @@ class Cache: public jsg::Object {
 
 class CacheStorage: public jsg::Object {
  public:
-  CacheStorage();
+  CacheStorage(jsg::Lock& js);
 
   jsg::Promise<jsg::Ref<Cache>> open(jsg::Lock& js, kj::String cacheName);
 

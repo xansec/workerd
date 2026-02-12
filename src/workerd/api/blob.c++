@@ -14,7 +14,7 @@ namespace workerd::api {
 
 namespace {
 // Concatenate an array of segments (parameter to Blob constructor).
-kj::Array<byte> concat(jsg::Lock& js, jsg::Optional<Blob::Bits> maybeBits) {
+jsg::BufferSource concat(jsg::Lock& js, jsg::Optional<Blob::Bits> maybeBits) {
   // TODO(perf): Make it so that a Blob can keep references to the input data rather than copy it.
   //   Note that we can't keep references to ArrayBuffers since they are mutable, but we can
   //   reference other Blobs in the input.
@@ -52,21 +52,17 @@ kj::Array<byte> concat(jsg::Lock& js, jsg::Optional<Blob::Bits> maybeBits) {
         partSize <= upperLimit, RangeError, kj::str("Blob part too large: ", partSize, " bytes"));
 
     // Checks for oversize
-    if (size + partSize > maxBlobSize) {
-      // TODO(soon): This logging is just to help us determine further how common
-      // this case is. We can and should remove the logging once we have enough data.
-      LOG_WARNING_PERIODICALLY(
-          kj::str("NOSENTRY Attempt to create a Blob with size ", size + partSize));
-    }
     JSG_REQUIRE(size + partSize <= maxBlobSize, RangeError,
         kj::str("Blob size ", size + partSize, " exceeds limit ", maxBlobSize));
     size += partSize;
   }
 
-  if (size == 0) return nullptr;
+  auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, size);
+  auto result = jsg::BufferSource(js, kj::mv(backing));
 
-  auto result = kj::heapArray<byte>(size);
-  auto view = result.asPtr();
+  if (size == 0) return kj::mv(result);
+
+  auto view = result.asArrayPtr();
 
   for (auto& part: bits) {
     KJ_SWITCH_ONEOF(part) {
@@ -95,7 +91,7 @@ kj::Array<byte> concat(jsg::Lock& js, jsg::Optional<Blob::Bits> maybeBits) {
 
   KJ_ASSERT(view == nullptr);
 
-  return result;
+  return kj::mv(result);
 }
 
 kj::String normalizeType(kj::String type) {
@@ -119,22 +115,6 @@ kj::String normalizeType(kj::String type) {
   return kj::mv(type);
 }
 
-jsg::BufferSource wrap(jsg::Lock& js, kj::Array<byte> data) {
-  auto buf = JSG_REQUIRE_NONNULL(jsg::BufferSource::tryAlloc(js, data.size()), Error,
-      "Unable to allocate space for Blob data");
-  buf.asArrayPtr().copyFrom(data);
-  return kj::mv(buf);
-
-  // TODO(perf): Ideally we could just wrap the data like this, in which
-  // the underlying v8::BackingStore is supposed to free the buffer when
-  // it is done with it. Unfortunately ASAN complains about a leak that
-  // will require more investigation.
-  // return jsg::BufferSource(js, jsg::BackingStore::from(kj::mv(data)));
-}
-
-kj::ArrayPtr<const kj::byte> getPtr(jsg::BufferSource& source) {
-  return source.asArrayPtr();
-}
 }  // namespace
 
 Blob::Blob(kj::Array<byte> data, kj::String type)
@@ -144,12 +124,7 @@ Blob::Blob(kj::Array<byte> data, kj::String type)
 
 Blob::Blob(jsg::Lock& js, jsg::BufferSource data, kj::String type)
     : ownData(kj::mv(data)),
-      data(getPtr(ownData.get<jsg::BufferSource>())),
-      type(kj::mv(type)) {}
-
-Blob::Blob(jsg::Lock& js, kj::Array<byte> data, kj::String type)
-    : ownData(wrap(js, kj::mv(data))),
-      data(getPtr(ownData.get<jsg::BufferSource>())),
+      data(ownData.get<jsg::BufferSource>().asArrayPtr()),
       type(kj::mv(type)) {}
 
 Blob::Blob(jsg::Ref<Blob> parent, kj::ArrayPtr<const byte> data, kj::String type)
@@ -166,7 +141,7 @@ jsg::Ref<Blob> Blob::constructor(
     }
   }
 
-  return jsg::alloc<Blob>(js, concat(js, kj::mv(bits)), kj::mv(type));
+  return js.alloc<Blob>(js, concat(js, kj::mv(bits)), kj::mv(type));
 }
 
 kj::ArrayPtr<const byte> Blob::getData() const {
@@ -174,8 +149,10 @@ kj::ArrayPtr<const byte> Blob::getData() const {
   return data;
 }
 
-jsg::Ref<Blob> Blob::slice(
-    jsg::Optional<int> maybeStart, jsg::Optional<int> maybeEnd, jsg::Optional<kj::String> type) {
+jsg::Ref<Blob> Blob::slice(jsg::Lock& js,
+    jsg::Optional<int> maybeStart,
+    jsg::Optional<int> maybeEnd,
+    jsg::Optional<kj::String> type) {
   int start = maybeStart.orDefault(0);
   int end = maybeEnd.orDefault(data.size());
 
@@ -201,7 +178,7 @@ jsg::Ref<Blob> Blob::slice(
     end = data.size();
   }
 
-  return jsg::alloc<Blob>(
+  return js.alloc<Blob>(
       JSG_THIS, data.slice(start, end), normalizeType(kj::mv(type).orDefault(nullptr)));
 }
 
@@ -282,9 +259,9 @@ class Blob::BlobInputStream final: public ReadableStreamSource {
   jsg::Ref<Blob> blob;
 };
 
-jsg::Ref<ReadableStream> Blob::stream() {
+jsg::Ref<ReadableStream> Blob::stream(jsg::Lock& js) {
   FeatureObserver::maybeRecordUse(FeatureObserver::Feature::BLOB_AS_STREAM);
-  return jsg::alloc<ReadableStream>(IoContext::current(), kj::heap<BlobInputStream>(JSG_THIS));
+  return js.alloc<ReadableStream>(IoContext::current(), kj::heap<BlobInputStream>(JSG_THIS));
 }
 
 // =======================================================================================
@@ -295,7 +272,7 @@ File::File(kj::Array<byte> data, kj::String name, kj::String type, double lastMo
       lastModified(lastModified) {}
 
 File::File(
-    jsg::Lock& js, kj::Array<byte> data, kj::String name, kj::String type, double lastModified)
+    jsg::Lock& js, jsg::BufferSource data, kj::String name, kj::String type, double lastModified)
     : Blob(js, kj::mv(data), kj::mv(type)),
       name(kj::mv(name)),
       lastModified(lastModified) {}
@@ -327,7 +304,7 @@ jsg::Ref<File> File::constructor(
     lastModified = dateNow();
   }
 
-  return jsg::alloc<File>(js, concat(js, kj::mv(bits)), kj::mv(name), kj::mv(type), lastModified);
+  return js.alloc<File>(js, concat(js, kj::mv(bits)), kj::mv(name), kj::mv(type), lastModified);
 }
 
 }  // namespace workerd::api

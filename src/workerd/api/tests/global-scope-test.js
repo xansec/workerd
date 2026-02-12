@@ -2,11 +2,13 @@ import {
   deepStrictEqual,
   strictEqual,
   throws,
+  doesNotThrow,
   notStrictEqual,
   ok,
 } from 'node:assert';
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import util from 'node:util';
 
 export const navigatorUserAgent = {
   async test() {
@@ -132,7 +134,7 @@ export const queueMicrotask = {
       throws(() => globalThis.queueMicrotask(i), {
         message:
           "Failed to execute 'queueMicrotask' on 'ServiceWorkerGlobalScope': " +
-          "parameter 1 is not of type 'Function'.",
+          "parameter 1 is not of type 'function'.",
       });
     });
     let resolve;
@@ -289,6 +291,38 @@ export const structuredClone = {
 
     const memory = new WebAssembly.Memory({ initial: 2, maximum: 2 });
     throws(() => globalThis.structuredClone(memory));
+
+    // This tests serialization of an API object. Only serializeable API objects (like `Headers`)
+    // can be cloned.
+    {
+      let orig = new Headers({ foo: 123, bar: 'abc' });
+      let cloned = globalThis.structuredClone(orig);
+      ok(cloned instanceof Headers);
+      strictEqual(cloned.get('foo'), '123');
+      strictEqual(cloned.get('bar'), 'abc');
+    }
+
+    // Verify that trying to serialize a non-serializable API type throws.
+    throws(() => globalThis.structuredClone(new TextEncoder()), {
+      name: 'DataCloneError',
+      code: DOMException.DATA_CLONE_ERR,
+      message:
+        'Could not serialize object of type "TextEncoder". This type does not support ' +
+        'serialization.',
+    });
+
+    // Test serialization of DOMException. This is technically an API object.
+    {
+      const de1 = new DOMException('hello', 'NotAllowedError');
+
+      const de2 = globalThis.structuredClone(de1);
+      ok(de2 instanceof DOMException);
+      strictEqual(de1.name, de2.name);
+      strictEqual(de1.message, de2.message);
+      strictEqual(de1.stack, de2.stack);
+      strictEqual(de1.code, de2.code);
+      notStrictEqual(de1, de2);
+    }
   },
 };
 
@@ -742,5 +776,68 @@ export const toStringTag = {
     const internalFlag = Symbol.for('cloudflare:internal-class');
     strictEqual(Headers.prototype[internalFlag], internalFlag);
     strictEqual(new Headers()[internalFlag], internalFlag);
+  },
+};
+export const validateGlobalThis = {
+  test() {
+    util.inspect(globalThis);
+  },
+};
+
+export const webSocketUrlValidation = {
+  async test() {
+    // Username and password should have been set in Authorization header
+    // but we silently ignore it to match the fetch() implementation.
+    doesNotThrow(() => new WebSocket('ws://username@domain.com'));
+    // Empty values should be rejected.
+    throws(() => new WebSocket(''), {
+      name: 'SyntaxError',
+      message: /invalid/,
+    });
+  },
+};
+
+export const reuseCtx = {
+  async test(controller, env, ctx) {
+    ctx.reused = true;
+    await ctx.exports.reuseCtx.check(null);
+    await ctx.exports.reuseCtx.check(null);
+  },
+
+  check(_, env, ctx) {
+    strictEqual(ctx.reused, undefined);
+    ctx.reused = true;
+  },
+};
+
+export const structuredCloneError = {
+  test() {
+    // If it doesn't crash, we're good.
+    var globalProp = {
+      get p1() {
+        return this;
+      },
+      get trigger() {
+        function createSab() {
+          var sab = new SharedArrayBuffer(4096);
+          return sab;
+        }
+        var prop = {};
+        Object.defineProperty(prop, 'constructor', {
+          writable: true,
+          value: createSab,
+        });
+        return prop.constructor();
+      },
+      get p2() {
+        var gTCtor = globalThis.Intl.constructor;
+        var returnVal;
+        try {
+          returnVal = gTCtor.entries(this);
+        } catch (e) {}
+        return returnVal;
+      },
+    };
+    globalThis.structuredClone(globalProp);
   },
 };

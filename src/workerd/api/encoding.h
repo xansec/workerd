@@ -16,7 +16,7 @@ namespace workerd::api {
 // the second label is the public identifier.
 #define EW_ENCODINGS(V)                                                                            \
   V(Utf8, "utf-8")                                                                                 \
-  V(Ibm866, "ibm-866")                                                                             \
+  V(Ibm866, "ibm866")                                                                              \
   V(Iso8859_2, "iso-8859-2")                                                                       \
   V(Iso8859_3, "iso-8859-3")                                                                       \
   V(Iso8859_4, "iso-8859-4")                                                                       \
@@ -49,7 +49,7 @@ namespace workerd::api {
   V(Big5, "big5")                                                                                  \
   V(Euc_Jp, "euc-jp")                                                                              \
   V(Iso2022_Jp, "iso-2022-jp")                                                                     \
-  V(Shift_Jis, "shift-jis")                                                                        \
+  V(Shift_Jis, "shift_jis")                                                                        \
   V(Euc_Kr, "euc-kr")                                                                              \
   V(Replacement, "replacement")                                                                    \
   V(Utf16be, "utf-16be")                                                                           \
@@ -74,7 +74,11 @@ class Decoder {
   virtual void reset() {}
 };
 
-// Decoder implementation that provides a fast-track for US-ASCII.
+// Decoder implementation that provides a fast-track for windows-1252.
+// When the input contains only bytes <= 0x7F or >= 0xA0, these are
+// identical between Latin-1 and windows-1252 so we can use V8's
+// efficient NewFromOneByte. For bytes in 0x80-0x9F, we remap them
+// to the correct windows-1252 code points using NewFromTwoByte.
 class AsciiDecoder final: public Decoder {
  public:
   AsciiDecoder() = default;
@@ -95,9 +99,10 @@ class AsciiDecoder final: public Decoder {
 // of encodings required by the Encoding specification.
 class IcuDecoder final: public Decoder {
  public:
-  IcuDecoder(Encoding encoding, UConverter* converter, bool ignoreBom)
+  IcuDecoder(Encoding encoding, UConverter* converter, bool fatal, bool ignoreBom)
       : encoding(encoding),
         inner(converter),
+        fatal(fatal),
         ignoreBom(ignoreBom),
         bomSeen(false) {}
   IcuDecoder(IcuDecoder&&) = default;
@@ -124,6 +129,7 @@ class IcuDecoder final: public Decoder {
   Encoding encoding;
   std::unique_ptr<UConverter, ConverterDeleter> inner;
 
+  bool fatal;
   bool ignoreBom;
   bool bomSeen;
 };
@@ -148,7 +154,7 @@ class TextDecoder final: public jsg::Object {
   };
 
   static jsg::Ref<TextDecoder> constructor(
-      jsg::Optional<kj::String> label, jsg::Optional<ConstructorOptions> options);
+      jsg::Lock& js, jsg::Optional<kj::String> label, jsg::Optional<ConstructorOptions> options);
 
   jsg::JsString decode(jsg::Lock& js,
       jsg::Optional<kj::Array<const kj::byte>> input,
@@ -174,6 +180,12 @@ class TextDecoder final: public jsg::Object {
       JSG_READONLY_INSTANCE_PROPERTY(fatal, getFatal);
       JSG_READONLY_INSTANCE_PROPERTY(ignoreBOM, getIgnoreBom);
     }
+    // TODO(soon): Defining the constructor override here *should not* be
+    // necessary but for some reason the type generation is creating an
+    // invalid result without it.
+    JSG_TS_OVERRIDE({
+      constructor(label?: string, options?: TextDecoderConstructorOptions);
+    });
   }
 
   explicit TextDecoder(DecoderImpl decoder): decoder(kj::mv(decoder)) {}
@@ -208,11 +220,11 @@ class TextEncoder final: public jsg::Object {
     JSG_STRUCT(read, written);
   };
 
-  static jsg::Ref<TextEncoder> constructor();
+  static jsg::Ref<TextEncoder> constructor(jsg::Lock& js);
 
   jsg::BufferSource encode(jsg::Lock& js, jsg::Optional<jsg::JsString> input);
 
-  EncodeIntoResult encodeInto(jsg::Lock& js, jsg::JsString input, jsg::BufferSource buffer);
+  EncodeIntoResult encodeInto(jsg::Lock& js, jsg::JsString input, jsg::JsUint8Array buffer);
 
   // UTF-8 is the only encoding type supported by the WHATWG spec.
   kj::StringPtr getEncoding() {
@@ -233,6 +245,7 @@ class TextEncoder final: public jsg::Object {
     // `Uint8Array`. The spec defines that this function returns a `Uint8Array` too.
     JSG_TS_OVERRIDE({
       encode(input?: string): Uint8Array;
+      encodeInto(input: string, buffer: Uint8Array): TextEncoderEncodeIntoResult;
     });
   }
 };

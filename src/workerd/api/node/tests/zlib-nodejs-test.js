@@ -1398,7 +1398,7 @@ export const zlibFromGzipWithTrailingGarbage = {
     {
       const { promise, resolve } = Promise.withResolvers();
       zlib.gunzip(data, (err, result) => {
-        // TOOD(soon): Use same error code as NodeJS
+        // TODO(soon): Use same error code as NodeJS
         // TODO(soon): Do our messages have a redundant "Error: " word?
         assert.strictEqual(err.name, 'Error');
         assert.match(err.message, /unknown compression method/);
@@ -2180,6 +2180,63 @@ export const maxOutputLength = {
   },
 };
 
+// Test for maxOutputLength: 0 - should throw immediately instead of infinite loop
+export const maxOutputLengthZero = {
+  async test() {
+    const expectedError = {
+      name: 'RangeError',
+      message:
+        /The value of "options\.maxOutputLength" is out of range\. It must be >= 1/,
+    };
+
+    // Sync zlib - deflateSync with maxOutputLength: 0 should throw
+    assert.throws(
+      () => zlib.deflateSync('data', { maxOutputLength: 0 }),
+      expectedError
+    );
+
+    // Sync zlib - inflateSync with maxOutputLength: 0 should throw
+    const compressed = zlib.deflateSync('data');
+    assert.throws(
+      () => zlib.inflateSync(compressed, { maxOutputLength: 0 }),
+      expectedError
+    );
+
+    // Sync brotli - brotliCompressSync with maxOutputLength: 0 should throw
+    assert.throws(
+      () => zlib.brotliCompressSync('data', { maxOutputLength: 0 }),
+      expectedError
+    );
+
+    // Sync brotli - brotliDecompressSync with maxOutputLength: 0 should throw
+    const brotliCompressed = zlib.brotliCompressSync('data');
+    assert.throws(
+      () => zlib.brotliDecompressSync(brotliCompressed, { maxOutputLength: 0 }),
+      expectedError
+    );
+
+    // Async zlib - deflate with maxOutputLength: 0 should error
+    {
+      const { promise, resolve } = Promise.withResolvers();
+      zlib.deflate('data', { maxOutputLength: 0 }, (err) => {
+        assert.match(err.message, expectedError.message);
+        resolve();
+      });
+      await promise;
+    }
+
+    // Async brotli - brotliCompress with maxOutputLength: 0 should error
+    {
+      const { promise, resolve } = Promise.withResolvers();
+      zlib.brotliCompress('data', { maxOutputLength: 0 }, (err) => {
+        assert.match(err.message, expectedError.message);
+        resolve();
+      });
+      await promise;
+    }
+  },
+};
+
 // Test taken from
 // https://github.com/nodejs/node/blob/24302c9fe94e1dd755ac8a8cc1f6aa4444f75cb3/test/parallel/test-zlib-invalid-arg-value-brotli-compress.js
 export const invalidArgValueBrotliCompress = {
@@ -2629,5 +2686,71 @@ export const compatFlagTest = {
       { status: 'fulfilled', value: 'true' },
       { status: 'fulfilled', value: 'true' },
     ]);
+  },
+};
+
+export const stateSizeTest = {
+  test() {
+    const Uint32Array_orig = Uint32Array;
+    assert.throws(
+      () => {
+        const message = 'Come on, Fhqwhgads.';
+        const buffer = Buffer.from(message);
+        globalThis.Uint32Array = function (...args) {
+          if (args.length == 1 && arguments[0] == 2) {
+            return new Uint32Array_orig(new ArrayBuffer(32), 32);
+          }
+          return new Uint32Array_orig(...args);
+        };
+
+        const zipper = new zlib.Gzip();
+        const zipped = zipper._processChunk(buffer, zlib.constants.FINISH);
+        const unzipper = new zlib.Gunzip();
+        unzipper._processChunk(zipped, zlib.constants.FINISH);
+      },
+      {
+        message: /Invalid write result buffer/,
+      }
+    );
+    globalThis.Uint32Array = Uint32Array_orig;
+  },
+};
+
+export const zlibStreamTest = {
+  async test() {
+    const imgBase64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAIAQMAAAD+wSzIAAAABlBMVEX///+/v7+jQ3Y5AAAADklEQVQI12P4AIX8EAgALgAD/aNpbtEAAAAASUVORK5CYII';
+
+    const buf = Buffer.from(imgBase64, 'base64');
+    const imageStream = Readable.from(Buffer.from(imgBase64, 'base64'));
+    const g = zlib.createGzip();
+
+    const { promise, resolve } = Promise.withResolvers();
+    const chunks = [];
+    const w = new Writable({
+      construct(callback) {
+        // Double queueMicrotask is intentional to reproduce the bug.
+        // Do not remove any of them.
+        queueMicrotask(() => {
+          queueMicrotask(() => {
+            callback(null);
+          });
+        });
+      },
+      write(chunk, encoding, callback) {
+        chunks.push(chunk);
+        callback();
+      },
+    });
+    w.on('close', resolve);
+    const pp = imageStream.pipe(g);
+    pp.pipe(w);
+
+    await promise;
+
+    assert.strictEqual(
+      zlib.gunzipSync(Buffer.concat(chunks)).toString('hex'),
+      buf.toString('hex')
+    );
   },
 };

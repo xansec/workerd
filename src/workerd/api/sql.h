@@ -31,6 +31,7 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
   jsg::Ref<Cursor> exec(jsg::Lock& js, jsg::JsString query, jsg::Arguments<BindingValue> bindings);
   IngestResult ingest(jsg::Lock& js, kj::String query);
+  void setMaxPageCountForTest(jsg::Lock& js, int count);
 
   jsg::Ref<Statement> prepare(jsg::Lock& js, jsg::JsString query);
 
@@ -46,6 +47,8 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
       // 'ingest' functionality is still experimental-only
       JSG_METHOD(ingest);
+
+      JSG_METHOD(setMaxPageCountForTest);
     }
 
     JSG_READONLY_PROTOTYPE_PROPERTY(databaseSize, getDatabaseSize);
@@ -69,6 +72,7 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   bool isAllowedTrigger(kj::StringPtr name) const override;
   void onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const override;
   bool allowTransactions() const override;
+  bool shouldAddQueryStats() const override;
 
   SqliteDatabase& getDb(jsg::Lock& js) {
     return storage->getSqliteDb(js);
@@ -175,7 +179,8 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 class SqlStorage::Cursor final: public jsg::Object {
  public:
   template <typename... Params>
-  Cursor(jsg::Lock& js, Params&&... params) {
+  Cursor(jsg::Lock& js, kj::Maybe<kj::Function<void(Cursor&)>> doneCb, Params&&... params)
+      : doneCallback(kj::mv(doneCb)) {
     auto stateObj = kj::heap<State>(kj::fwd<Params>(params)...);
     initColumnNames(js, *stateObj);
     if (stateObj->query.isDone()) {
@@ -255,6 +260,9 @@ class SqlStorage::Cursor final: public jsg::Object {
   // Nulled out when query is done or canceled.
   kj::Maybe<IoOwn<State>> state;
 
+  // Called when the query is done or canceled.
+  kj::Maybe<kj::Function<void(Cursor&)>> doneCallback;
+
   // True if the cursor was canceled by a new call to the same statement. This is used only to
   // flag an error if the application tries to reuse the cursor.
   bool canceled = false;
@@ -301,7 +309,7 @@ class SqlStorage::Cursor final: public jsg::Object {
 // The prepared statement API is supported only for backwards compatibility for certain early
 // internal users of SQLite-backed DOs. This API was not released because we chose instead to
 // implement automatic prepared statement caching via the simple `exec()` API. Since this is
-// a compatibility shim only, to simplify things, it is acutally just a wrapper around `exec()`.
+// a compatibility shim only, to simplify things, it is actually just a wrapper around `exec()`.
 class SqlStorage::Statement final: public jsg::Object {
  public:
   Statement(jsg::Lock& js, jsg::Ref<SqlStorage> sqlStorage, jsg::JsString query)

@@ -86,7 +86,7 @@ jsg::JsValue oldDeserializeV8Value(jsg::Lock& js, kj::ArrayPtr<const kj::byte> b
 }
 
 KJ_TEST("wire format version does not change deserialization behavior on real data") {
-  // This test chceks for the presence of a specially named file in the current working directory
+  // This test checks for the presence of a specially named file in the current working directory
   // that contains lines of hex-encoded v8-serialized data. It processes one line at time,
   // hex-decoding it and then testing deserializing/re-serializing it.
 
@@ -107,14 +107,14 @@ KJ_TEST("wire format version does not change deserialization behavior on real da
       const auto key = "some-key"_kj;
       while (std::getline(file, hexStr)) {
         auto dataIn = kj::decodeHex(kj::ArrayPtr(hexStr.c_str(), hexStr.size()));
-        KJ_EXPECT(!dataIn.hadErrors, hexStr);
+        KJ_EXPECT(!dataIn.hadErrors, kj::str(hexStr.c_str()));
 
         auto oldVal = oldDeserializeV8Value(isolateLock, dataIn);
         auto oldOutput = serializeV8Value(isolateLock, oldVal);
 
         auto newVal = deserializeV8Value(isolateLock, key, dataIn);
         auto newOutput = serializeV8Value(isolateLock, newVal);
-        KJ_EXPECT(oldOutput == newOutput, hexStr);
+        KJ_EXPECT(oldOutput == newOutput, kj::str(hexStr.c_str()));
       }
     });
   });

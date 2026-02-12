@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
+load("@protobuf//bazel:proto_library.bzl", "proto_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
 # Noop function used to override rules we don't want to support in standalone.
 def _noop_override(**kwargs):
     pass
@@ -49,17 +55,18 @@ PERFETTO_CONFIG = struct(
         linenoise = ["@perfetto_dep_linenoise//:linenoise"],
         sqlite = ["@perfetto_dep_sqlite//:sqlite"],
         sqlite_ext_percentile = ["@perfetto_dep_sqlite_src//:percentile_ext"],
-        protoc = ["@com_google_protobuf//:protoc"],
-        protoc_lib = ["@com_google_protobuf//:protoc_lib"],
-        protobuf_lite = ["@com_google_protobuf//:protobuf_lite"],
-        protobuf_full = ["@com_google_protobuf//:protobuf"],
-        protobuf_descriptor_proto = ["@com_google_protobuf//:descriptor_proto"],
+        protoc = ["@protobuf//:protoc"],
+        protoc_lib = ["@protobuf//:protoc_lib"],
+        protobuf_lite = ["@protobuf//:protobuf_lite"],
+        protobuf_full = ["@protobuf//:protobuf"],
+        protobuf_descriptor_proto = ["@protobuf//:descriptor_proto"],
 
         # The Python targets are empty on the standalone build because we assume
         # any relevant deps are installed on the system or are not applicable.
         protobuf_py = [],
         pandas_py = [],
         tp_vendor_py = [],
+        tp_resolvers_py = [],
 
         # There are multiple configurations for the function name demangling
         # logic in trace processor:
@@ -75,6 +82,10 @@ PERFETTO_CONFIG = struct(
         #     your own demangling implementation.
         demangle_wrapper = ["//:src_trace_processor_demangle"],
         llvm_demangle = ["@perfetto_dep_llvm_demangle//:llvm_demangle"],
+
+        # no open csd support needed
+        open_csd = [],
+        android_test_common = [],
     ),
 
     # This struct allows embedders to customize the cc_opts for Perfetto
@@ -101,7 +112,7 @@ PERFETTO_CONFIG = struct(
     proto_library_visibility = "//visibility:private",
 
     # Allow Bazel embedders to change the visibility of the Go protos.
-    # Go protos have all sorts of strange behaviour in Google3 so need special
+    # Go protos have all sorts of strange behavior in Google3 so need special
     # handling as the rules for other languages do not work for Go.
     go_proto_library_visibility = "//visibility:private",
 
@@ -111,18 +122,19 @@ PERFETTO_CONFIG = struct(
     # This field is completely optional, the embedder can omit the whole
     # |rule_overrides| or individual keys. They are assigned to None or noop
     # actions here just for documentation purposes.
+    # TODO: (cleanup): Drop all of these again once they are properly imported in perfetto.
     rule_overrides = struct(
-        proto_library = None,
-        cc_binary = None,
-        cc_library = None,
-        cc_proto_library = None,
+        proto_library = proto_library,
+        cc_binary = cc_binary,
+        cc_library = cc_library,
+        cc_proto_library = cc_proto_library,
 
         # Supporting java rules pulls in the JDK and generally is not something
         # we need for most embedders.
         java_proto_library = _noop_override,
         java_lite_proto_library = _noop_override,
-        py_binary = None,
-        py_library = None,
+        py_binary = py_binary,
+        py_library = py_library,
         py_proto_library = None,
         go_proto_library = None,
         jspb_proto_library = None,
@@ -132,4 +144,5 @@ PERFETTO_CONFIG = struct(
     # for now we shouldn't need any perfetto-specific compiler options, should already be set up
     # properly through .bazelrc.
     default_copts = [],
+    default_cxxopts = [],
 )

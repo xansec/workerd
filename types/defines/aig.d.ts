@@ -1,3 +1,9 @@
+type GatewayRetries = {
+  maxAttempts?: 1 | 2 | 3 | 4 | 5;
+  retryDelayMs?: number;
+  backoff?: 'constant' | 'linear' | 'exponential';
+};
+
 export type GatewayOptions = {
   id: string;
   cacheKey?: string;
@@ -5,6 +11,16 @@ export type GatewayOptions = {
   skipCache?: boolean;
   metadata?: Record<string, number | string | boolean | null | bigint>;
   collectLog?: boolean;
+  eventId?: string;
+  requestTimeoutMs?: number;
+  retries?: GatewayRetries;
+};
+
+export type UniversalGatewayOptions = Exclude<GatewayOptions, 'id'> & {
+  /**
+   ** @deprecated
+   */
+  id?: string;
 };
 
 export type AiGatewayPatchLog = {
@@ -56,7 +72,12 @@ export type AIGatewayProviders =
   | 'google-ai-studio'
   | 'mistral'
   | 'grok'
-  | 'openrouter';
+  | 'openrouter'
+  | 'deepseek'
+  | 'cerebras'
+  | 'cartesia'
+  | 'elevenlabs'
+  | 'adobe-firefly';
 
 export type AIGatewayHeaders = {
   'cf-aig-metadata':
@@ -69,6 +90,11 @@ export type AIGatewayHeaders = {
   'cf-aig-cache-ttl': number | string;
   'cf-aig-skip-cache': boolean | string;
   'cf-aig-cache-key': string;
+  'cf-aig-event-id': string;
+  'cf-aig-request-timeout': number | string;
+  'cf-aig-max-attempts': number | string;
+  'cf-aig-retry-delay': number | string;
+  'cf-aig-backoff': string;
   'cf-aig-collect-log': boolean | string;
   Authorization: string;
   'Content-Type': string;
@@ -88,5 +114,9 @@ export interface AiGatewayLogNotFound extends Error {}
 export declare abstract class AiGateway {
   patchLog(logId: string, data: AiGatewayPatchLog): Promise<void>;
   getLog(logId: string): Promise<AiGatewayLog>;
-  run(data: AIGatewayUniversalRequest | AIGatewayUniversalRequest[]): Promise<Response>;
+  run(
+    data: AIGatewayUniversalRequest | AIGatewayUniversalRequest[],
+    options?: { gateway?: UniversalGatewayOptions; extraHeaders?: object }
+  ): Promise<Response>;
+  getUrl(provider?: AIGatewayProviders | string): Promise<string>; // eslint-disable-line
 }

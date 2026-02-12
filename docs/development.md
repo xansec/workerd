@@ -22,26 +22,22 @@ just prepare
 just compile-commands
 ```
 
+## Dependencies
+
+In order to install dependencies, please run the following command. Also refer to Building workerd in README.md for the list of required dependencies by platform.
+
+- For Ubuntu:
+
+```sh
+just prepare-ubuntu
+```
+
 ## Code Formatting
 
 workerd code is automatically formatted by clang-format. Run `python ./tools/cross/format.py` to reformat the code
 or use the appropriate IDE extension.
-While workerd generally requires llvm 15, formatting requires clang-format-18.
+While building workerd currently requires LLVM 19 or above, formatting requires clang-format 18.1.8 as different
+versions result in different format suggestions. This is automatically fetched using Bazel and does not need to be
+installed manually.
 
 Code formatting is checked before check-in and during `Linting` CI build.
-
-## Clang-format
-
-Workerd depends on clang-format v18.1.8. In order to install it on Linux, please run the following code:
-
-```bash
-wget https://apt.llvm.org/llvm.sh
-chmod +x llvm.sh
-sudo ./llvm.sh 18 clang-format
-```
-
-If you didn't do so, please symlink clang-format-18 to clang.
-
-```bash
-sudo ln -s /usr/bin/clang-format-18 /usr/bin/clang-format
-```

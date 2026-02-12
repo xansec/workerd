@@ -11,7 +11,6 @@
 #include <workerd/jsg/observer.h>
 #include <workerd/util/sqlite.h>
 
-#include <kj/exception.h>
 #include <kj/refcount.h>
 #include <kj/string.h>
 #include <kj/time.h>
@@ -100,6 +99,12 @@ class RequestObserver: public kj::Refcounted {
   // occurred asynchronously.
   virtual void reportFailure(const kj::Exception& e, FailureSource source = FailureSource::OTHER) {}
 
+  // Called when an internal exception is observed during this request. Used to track which
+  // internal exception types occurred during a request, for metrics purposes. The same exception
+  // type may be reported multiple times during a single request; implementations should deduplicate.
+  virtual void reportInternalException(
+      const kj::Exception& e, jsg::InternalExceptionObserver::Detail detail) {}
+
   // Wrap the given WorkerInterface with a version that collects metrics. This method may only be
   // called once, and only one method call may be made to the returned interface.
   //
@@ -124,23 +129,8 @@ class RequestObserver: public kj::Refcounted {
   virtual SpanParent getSpan() {
     return nullptr;
   }
-  virtual SpanParent getUserSpan() {
-    return nullptr;
-  }
 
-  // If the worker is configured to support streaming tail workers, reportTailEvent
-  // will forward the given event on to the collection of streaming tail workers
-  // that are configured with this observer. Otherwise, this is a non-op.
-  virtual void reportTailEvent(IoContext& ioContext, tracing::TailEvent::Event&& event) {
-    reportTailEvent(ioContext, [event = kj::mv(event)]() mutable { return kj::mv(event); });
-  }
-
-  // If the worker is configured to support streaming tail workers, reportTailEvent
-  // will forward the event returned by the callback on to the collection of streaming
-  // fail workers that are configured with this observer. The callback will only be
-  // invoked if there are tail workers.
-  virtual void reportTailEvent(
-      IoContext& ioContext, kj::FunctionParam<tracing::TailEvent::Event()> fn) {}
+  virtual void setOutcome(EventOutcome outcome) {}
 
   virtual kj::Own<void> addedContextTask() {
     return kj::Own<void>();
@@ -355,7 +345,7 @@ class FeatureObserver {
   virtual void use(Feature feature) const {}
 
   using CollectCallback = kj::Function<void(Feature, const uint64_t)>;
-  // This method is called from the internal metrics collection mechanisn to harvest the
+  // This method is called from the internal metrics collection mechanism to harvest the
   // current features and counts that have been recorded by the observer.
   virtual void collect(CollectCallback&& callback) const {}
 

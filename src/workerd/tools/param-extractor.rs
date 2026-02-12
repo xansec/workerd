@@ -1,13 +1,15 @@
-use std::{
-    ffi::OsStr,
-    fs::File,
-    io::{BufReader, BufWriter, Write},
-    path::Path,
-};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Write;
+use std::path::Path;
 
 use anyhow::Result;
 use flate2::read::GzDecoder;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Contains the declarations we care about
 #[derive(Deserialize, PartialEq, Debug)]
@@ -37,13 +39,13 @@ impl Clang {
 
     fn name(&self) -> Option<&str> {
         match self {
-            Clang::NamespaceDecl { name }
-            | Clang::FunctionDecl { name }
-            | Clang::CXXMethodDecl { name }
-            | Clang::CXXRecordDecl { name }
-            | Clang::ParmVarDecl { name }
-            | Clang::Other { name } => name.as_ref().map(AsRef::as_ref),
-            Clang::CXXConstructorDecl => Some("constructor"),
+            Self::NamespaceDecl { name }
+            | Self::FunctionDecl { name }
+            | Self::CXXMethodDecl { name }
+            | Self::CXXRecordDecl { name }
+            | Self::ParmVarDecl { name }
+            | Self::Other { name } => name.as_ref().map(AsRef::as_ref),
+            Self::CXXConstructorDecl => Some("constructor"),
         }
     }
 }
@@ -56,9 +58,21 @@ fn main() -> Result<()> {
     let clang_ast = args.value_from_os_str("--input", |path_str| {
         let path = Path::new(path_str);
         let file = File::open(path)?;
-        let serde = match path.extension().and_then(OsStr::to_str) {
-            Some("gz") => serde_json::from_reader(BufReader::new(GzDecoder::new(file))),
-            _ => serde_json::from_reader(BufReader::new(file)),
+        let serde = {
+            let reader: &mut dyn BufRead = {
+                if Some("gz") == path.extension().and_then(OsStr::to_str) {
+                    &mut BufReader::new(GzDecoder::new(file))
+                } else {
+                    &mut BufReader::new(file)
+                }
+            };
+
+            let mut deserializer = serde_json::Deserializer::from_reader(reader);
+            // Note: serde_json doesn't support custom recursion limits, only disabling.
+            // We disable the limit to handle deeply nested AST structures (default 128 is
+            // insufficient for the clang AST dump, which can be deeply nested).
+            deserializer.disable_recursion_limit();
+            ClangNode::deserialize(&mut deserializer)
         };
         serde.map_err(anyhow::Error::from)
     })?;
@@ -109,13 +123,11 @@ fn traverse_disambiguous(
         .inner
         .into_iter()
         .flat_map(|node| {
+            let mut qualified: Vec<_> = fully_qualified_parent_name.to_vec();
+            qualified.push(disambiguous_name.clone());
             if node.kind.is_function_like() {
-                let mut qualified: Vec<_> = fully_qualified_parent_name.to_vec();
-                qualified.push(disambiguous_name.clone());
                 traverse_function_like(node, &qualified)
             } else {
-                let mut qualified: Vec<_> = fully_qualified_parent_name.to_vec();
-                qualified.push(disambiguous_name.clone());
                 traverse_disambiguous(node, &qualified)
             }
         })
@@ -126,7 +138,7 @@ fn traverse_function_like(
     node: ClangNode,
     fully_qualified_parent_name: &[String],
 ) -> Vec<Parameter> {
-    let function_like_name = node.kind.name().unwrap().to_owned();
+    let function_like_name = node.kind.name().expect("missing name").to_owned();
 
     node.inner
         .into_iter()

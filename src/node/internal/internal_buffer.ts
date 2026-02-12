@@ -7,7 +7,7 @@
 // Copyright Joyent and Node contributors. All rights reserved. MIT license.
 // Copyright Feross Aboukhadijeh, and other contributors. All rights reserved. MIT license.
 
-/* todo: the following is adopted code, enabling linting one day */
+/* TODO: the following is adopted code, enabling linting one day */
 /* eslint-disable */
 
 import {
@@ -37,7 +37,7 @@ import { validateString } from 'node-internal:validators';
 
 import internalUtil from 'node-internal:util';
 import {
-  InspectOptionsStylized,
+  type InspectOptionsStylized,
   inspect as utilInspect,
 } from 'node-internal:internal_inspect';
 
@@ -55,7 +55,7 @@ float32Array[0] = -1; // 0xBF800000
 // check this with `os.endianness()` because that is determined at compile time.
 export const bigEndian = uInt8Float32Array[3] === 0;
 
-// Node.js caps it's max length at uint32_t max, we are very intentionally more
+// Node.js caps its max length at uint32_t max, we are very intentionally more
 // conservative here, capping at int32_t max.
 export const kMaxLength = 2147483647;
 export const kStringMaxLength = 536870888;
@@ -477,8 +477,8 @@ export function SlowBuffer(length: number) {
 Object.setPrototypeOf(SlowBuffer.prototype, Uint8Array.prototype);
 Object.setPrototypeOf(SlowBuffer, Uint8Array);
 
-Buffer.isBuffer = function isBuffer(b: unknown) {
-  return b != null && (b as any)[kIsBuffer] && b !== Buffer.prototype;
+Buffer.isBuffer = function isBuffer(b: unknown): b is Buffer {
+  return b instanceof Buffer;
 };
 
 export function compare(a: Buffer | Uint8Array, b: Buffer | Uint8Array) {
@@ -675,11 +675,12 @@ Buffer.prototype.inspect = function inspect(
   ctx: InspectOptionsStylized
 ) {
   let str = '';
-  const max = INSPECT_MAX_BYTES;
+  const max = Math.min(this.byteLength, INSPECT_MAX_BYTES);
+
   str = this.toString('hex', 0, max)
     .replace(/(.{2})/g, '$1 ')
     .trim();
-  const remaining = this.length - max;
+  const remaining = this.byteLength - max;
   if (remaining > 0) {
     str += ` ... ${remaining} more byte${remaining > 1 ? 's' : ''}`;
   }

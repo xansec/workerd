@@ -5,12 +5,13 @@
 #include "impl.h"
 #include "kdf.h"
 
-#include <openssl/crypto.h>
-#include <openssl/hkdf.h>
+#include <ncrypto.h>
 
 namespace workerd::api {
 namespace {
 
+// The underlying implementation of HKDF for WebCrypto.
+// The CryptoKey::Impl here is used only for web crypto uses.
 class HkdfKey final: public CryptoKey::Impl {
  public:
   explicit HkdfKey(kj::Array<kj::byte> keyData,
@@ -41,16 +42,17 @@ class HkdfKey final: public CryptoKey::Impl {
     const EVP_MD* hashType = lookupDigestAlgorithm(hashName).second;
 
     const auto& salt =
-        JSG_REQUIRE_NONNULL(algorithm.salt, TypeError, "Missing field \"salt\" in \"algorithm\".");
+        JSG_REQUIRE_NONNULL(algorithm.salt, TypeError, "Missing field \"salt\" in \"algorithm\".")
+            .asArrayPtr();
     const auto& info =
-        JSG_REQUIRE_NONNULL(algorithm.info, TypeError, "Missing field \"info\" in \"algorithm\".");
+        JSG_REQUIRE_NONNULL(algorithm.info, TypeError, "Missing field \"info\" in \"algorithm\".")
+            .asArrayPtr();
 
     uint32_t length = JSG_REQUIRE_NONNULL(
         maybeLength, DOMOperationError, "HKDF cannot derive a key with null length.");
 
-    JSG_REQUIRE(length != 0 && (length % 8) == 0, DOMOperationError,
-        "HKDF requires a derived key length that is a non-zero multiple of eight (requested ",
-        length, ").");
+    JSG_REQUIRE(length % 8 == 0, DOMOperationError,
+        "HKDF requires a derived key length that is a multiple of eight (requested ", length, ").");
 
     auto derivedLengthBytes = length / 8;
 
@@ -77,7 +79,6 @@ class HkdfKey final: public CryptoKey::Impl {
   ZeroOnFree keyData;
   CryptoKey::KeyAlgorithm keyAlgorithm;
 };
-
 }  // namespace
 
 kj::Maybe<jsg::BufferSource> hkdf(jsg::Lock& js,
@@ -86,12 +87,17 @@ kj::Maybe<jsg::BufferSource> hkdf(jsg::Lock& js,
     kj::ArrayPtr<const kj::byte> key,
     kj::ArrayPtr<const kj::byte> salt,
     kj::ArrayPtr<const kj::byte> info) {
-  auto buf = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, length);
-  if (HKDF(buf.asArrayPtr().begin(), length, digest, key.begin(), key.size(), salt.begin(),
-          salt.size(), info.begin(), info.size()) != 1) {
-    return kj::none;
+  // Because we want to be using the v8 sandbox, we need to allocate the result
+  // buffer in the v8 isolate heap then generate the HKDF result into that.
+  ncrypto::ClearErrorOnReturn clearErrorOnReturn;
+  auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, length);
+  auto buf = ToNcryptoBuffer(backing.asArrayPtr());
+  if (ncrypto::hkdfInfo(digest, ToNcryptoBuffer(key), ToNcryptoBuffer(info), ToNcryptoBuffer(salt),
+          length, &buf)) {
+    return jsg::BufferSource(js, kj::mv(backing));
   }
-  return jsg::BufferSource(js, kj::mv(buf));
+
+  return kj::none;
 }
 
 kj::Own<CryptoKey::Impl> CryptoKey::Impl::importHkdf(jsg::Lock& js,

@@ -1,5 +1,5 @@
 load("@aspect_rules_ts//ts:defs.bzl", "ts_config", "ts_project")
-load("@npm//:eslint/package_json.bzl", eslint_bin = "bin")
+load("@workerd//:build/lint_test.bzl", "lint_test")
 load("@workerd//:build/wd_js_bundle.bzl", "wd_js_bundle")
 
 def to_js(filenames):
@@ -27,7 +27,8 @@ def wd_ts_bundle(
         lint = True,
         deps = [],
         js_deps = [],
-        gen_compile_cache = False):
+        gen_compile_cache = False,
+        out_dir = ""):
     """Compiles typescript modules and generates api bundle with the result.
 
     Args:
@@ -51,6 +52,7 @@ def wd_ts_bundle(
     ts_config(
         name = name + "@tsconfig",
         src = tsconfig_json,
+        deps = ["@workerd//tools:base-tsconfig"],
     )
 
     srcs = modules + internal_modules
@@ -62,8 +64,9 @@ def wd_ts_bundle(
         srcs = ts_srcs,
         allow_js = True,
         declaration = True,
-        tsconfig = name + "@tsconfig",
+        tsconfig = ":" + name + "@tsconfig",
         deps = deps,
+        out_dir = out_dir.removesuffix("/"),
         visibility = ["//visibility:public"],
     )
 
@@ -71,10 +74,10 @@ def wd_ts_bundle(
         name = name,
         import_name = import_name,
         # builtin modules are accessible under "<import_name>:<module_name>" name
-        builtin_modules = [_to_js(m) for m in modules],
+        builtin_modules = [out_dir + _to_js(m) for m in modules],
         # internal modules are accessible under "<import_name>-internal:<module_name>" name
         # without "internal/" folder prefix.
-        internal_modules = [_to_js(m) for m in internal_modules if not m.endswith(".d.ts")],
+        internal_modules = [out_dir + _to_js(m) for m in internal_modules if not m.endswith(".d.ts")],
         internal_wasm_modules = internal_wasm_modules,
         internal_data_modules = internal_data_modules,
         internal_json_modules = internal_json_modules,
@@ -82,28 +85,13 @@ def wd_ts_bundle(
         schema_id = schema_id,
         deps = deps + js_deps,
         gen_compile_cache = gen_compile_cache,
+        out_dir = out_dir,
     )
 
     if lint:
-        # todo: lint js_srcs too, not just ts_srcs
-        eslint_bin.eslint_test(
-            size = "large",
-            name = name + "@eslint",
-            args = [
-                "--config $(location {})".format(eslintrc_json),
-                "--parser-options project:$(location {})".format(tsconfig_json),
-                "-f stylish",
-                "--report-unused-disable-directives",
-            ] + ["$(location " + src + ")" for src in ts_srcs],
-            data = srcs + [
-                eslintrc_json,
-                tsconfig_json,
-                "//tools:base-eslint",
-                "//:prettierrc",
-            ],
-            tags = ["lint"],
-            target_compatible_with = select({
-                "@platforms//os:windows": ["@platforms//:incompatible"],
-                "//conditions:default": [],
-            }),
+        lint_test(
+            name = name,
+            eslintrc_json = eslintrc_json,
+            tsconfig_json = tsconfig_json,
+            srcs = srcs,
         )

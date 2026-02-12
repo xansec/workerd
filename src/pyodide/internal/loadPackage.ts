@@ -10,75 +10,39 @@
  */
 
 import {
-  WORKERD_INDEX_URL,
   LOCKFILE,
-  LOAD_WHEELS_FROM_R2,
-  LOAD_WHEELS_FROM_ARTIFACT_BUNDLER,
   PACKAGES_VERSION,
+  USING_OLDEST_PACKAGES_VERSION,
 } from 'pyodide-internal:metadata';
 import {
-  SITE_PACKAGES,
-  getSitePackagesPath,
+  VIRTUALIZED_DIR,
+  STDLIB_PACKAGES,
 } from 'pyodide-internal:setupPackages';
 import { parseTarInfo } from 'pyodide-internal:tar';
-import { default as DiskCache } from 'pyodide-internal:disk_cache';
 import { createTarFS } from 'pyodide-internal:tarfs';
 import { default as ArtifactBundler } from 'pyodide-internal:artifacts';
+import {
+  PythonUserError,
+  PythonWorkersInternalError,
+} from 'pyodide-internal:util';
 
-async function decompressArrayBuffer(
-  arrBuf: ArrayBuffer
-): Promise<ArrayBuffer> {
-  const resp = new Response(arrBuf);
-  if (resp && resp.body) {
-    return await new Response(
-      resp.body.pipeThrough(new DecompressionStream('gzip'))
-    ).arrayBuffer();
-  } else {
-    throw new Error('Failed to decompress array buffer');
-  }
-}
-
-function getFilenameOfPackage(requirement: string): string {
+function getPackageMetadata(requirement: string): PackageDeclaration {
   const obj = LOCKFILE['packages'][requirement];
   if (!obj) {
-    throw new Error('Requirement ' + requirement + ' not found in lockfile');
+    throw new PythonUserError(
+      'Requirement ' + requirement + ' not found in lockfile'
+    );
   }
 
-  return obj.file_name;
+  return obj;
 }
 
-// loadBundleFromR2 loads the package from the internet (through fetch) and uses the DiskCache as
-// a backing store. This is only used in local dev.
-async function loadBundleFromR2(requirement: string): Promise<Reader> {
-  // first check if the disk cache has what we want
-  const filename = getFilenameOfPackage(requirement);
-  const cached = DiskCache.get(filename);
-  if (cached) {
-    const decompressed = await decompressArrayBuffer(cached);
-    const reader = new ArrayBufferReader(decompressed);
-    return reader;
-  }
-
-  // we didn't find it in the disk cache, continue with original fetch
-  const url = new URL(WORKERD_INDEX_URL + filename);
-  const response = await fetch(url);
-
-  const compressed = await response.arrayBuffer();
-  const decompressed = await decompressArrayBuffer(compressed);
-
-  DiskCache.put(filename, compressed);
-  const reader = new ArrayBufferReader(decompressed);
-  return reader;
-}
-
-async function loadBundleFromArtifactBundler(
-  requirement: string
-): Promise<Reader> {
-  const filename = getFilenameOfPackage(requirement);
-  const fullPath = 'python-package-bucket/' + PACKAGES_VERSION + '/' + filename;
+function loadBundleFromArtifactBundler(requirement: string): Reader {
+  const filename = getPackageMetadata(requirement).file_name;
+  const fullPath = `python-package-bucket/${PACKAGES_VERSION}/${filename}`;
   const reader = ArtifactBundler.getPackage(fullPath);
   if (!reader) {
-    throw new Error(
+    throw new PythonWorkersInternalError(
       'Failed to get package ' + fullPath + ' from ArtifactBundler'
     );
   }
@@ -86,58 +50,33 @@ async function loadBundleFromArtifactBundler(
 }
 
 /**
- * ArrayBufferReader wraps around an arrayBuffer in a way that tar.js is able to read from
+ * Downloads the requirements specified and loads them into Pyodide. Note that this does not
+ * do any dependency resolution, it just installs the requirements that are specified. See
+ * `getTransitiveRequirements` for the code that deals with this.
  */
-class ArrayBufferReader {
-  constructor(private arrayBuffer: ArrayBuffer) {}
-
-  read(offset: number, buf: Uint8Array): number {
-    const size = this.arrayBuffer.byteLength;
-    if (offset >= size || offset < 0) {
-      return 0;
-    }
-    let toCopy = buf.length;
-    if (size - offset < toCopy) {
-      toCopy = size - offset;
-    }
-    buf.set(new Uint8Array(this.arrayBuffer, offset, toCopy));
-    return toCopy;
-  }
-}
-
-async function loadPackagesImpl(
-  Module: Module,
-  requirements: Set<string>,
-  loadBundle: (req: string) => Promise<Reader>
-) {
-  let loadPromises: Promise<[string, Reader]>[] = [];
-  let loading = [];
-  for (const req of requirements) {
-    if (SITE_PACKAGES.loadedRequirements.has(req)) continue;
-    loadPromises.push(loadBundle(req).then((r) => [req, r]));
-    loading.push(req);
+export function loadPackages(Module: Module, requirements: Set<string>): void {
+  let pkgsToLoad = requirements;
+  // TODO: Package snapshot created with '20240829.4' needs the stdlib packages to be added here.
+  // We should remove this check once the next Python and packages versions are rolled
+  // out.
+  if (USING_OLDEST_PACKAGES_VERSION) {
+    pkgsToLoad = pkgsToLoad.union(new Set(STDLIB_PACKAGES));
   }
 
-  console.log('Loading ' + loading.join(', '));
+  for (const req of pkgsToLoad) {
+    if (req === 'test') {
+      continue; // Skip the test package, it is only useful for internal Python regression testing.
+    }
+    if (VIRTUALIZED_DIR.hasRequirementLoaded(req)) {
+      continue;
+    }
 
-  const buffers = await Promise.all(loadPromises);
-  for (const [requirement, reader] of buffers) {
+    const reader = loadBundleFromArtifactBundler(req);
     const [tarInfo, soFiles] = parseTarInfo(reader);
-    SITE_PACKAGES.addSmallBundle(tarInfo, soFiles, requirement);
+    const pkg = getPackageMetadata(req);
+    VIRTUALIZED_DIR.addSmallBundle(tarInfo, soFiles, req, pkg.install_dir);
   }
-
-  console.log('Loaded ' + loading.join(', '));
 
   const tarFS = createTarFS(Module);
-  const path = getSitePackagesPath(Module);
-  const info = SITE_PACKAGES.rootInfo;
-  Module.FS.mount(tarFS, { info }, path);
-}
-
-export async function loadPackages(Module: Module, requirements: Set<string>) {
-  if (LOAD_WHEELS_FROM_R2) {
-    await loadPackagesImpl(Module, requirements, loadBundleFromR2);
-  } else if (LOAD_WHEELS_FROM_ARTIFACT_BUNDLER) {
-    await loadPackagesImpl(Module, requirements, loadBundleFromArtifactBundler);
-  }
+  VIRTUALIZED_DIR.mount(Module, tarFS);
 }

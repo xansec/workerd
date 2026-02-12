@@ -7,6 +7,7 @@
 #include "util.h"
 
 #include <workerd/io/io-context.h>
+#include <workerd/util/own-util.h>
 
 #include <kj/encoding.h>
 
@@ -70,10 +71,20 @@ jsg::Unimplemented Cache::addAll(kj::Array<Request::Info> requests) {
   return {};
 }
 
-jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(
-    jsg::Lock& js, Request::Info requestOrUrl, jsg::Optional<CacheQueryOptions> options) {
+jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(jsg::Lock& js,
+    Request::Info requestOrUrl,
+    jsg::Optional<CacheQueryOptions> options,
+    CompatibilityFlags::Reader flags) {
   // TODO(someday): Implement Cache API in preview.
   auto& context = IoContext::current();
+  TraceContext traceContext = context.makeUserTraceSpan("cache_match"_kjc);
+
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(ignoreMethod, o.ignoreMethod) {
+      traceContext.setTag("cache.request.ignore_method"_kjc, ignoreMethod);
+    }
+  }
+
   if (context.isFiddle()) {
     context.logWarningOnce(CACHE_API_PREVIEW_WARNING);
     return js.resolvedPromise(jsg::Optional<jsg::Ref<Response>>());
@@ -84,26 +95,51 @@ jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(
   return js.evalNow([&]() -> jsg::Promise<jsg::Optional<jsg::Ref<Response>>> {
     auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), kj::none);
 
+    traceContext.setTag("cache.request.url"_kjc, jsRequest->getUrl());
+    traceContext.setTag("cache.request.method"_kjc, kj::str(jsRequest->getMethodEnum()));
+
     if (!options.orDefault({}).ignoreMethod.orDefault(false) &&
         jsRequest->getMethodEnum() != kj::HttpMethod::GET) {
       return js.resolvedPromise(jsg::Optional<jsg::Ref<Response>>());
     }
 
-    auto httpClient = getHttpClient(context, jsRequest->serializeCfBlobJson(js), "cache_match"_kjc);
+    auto httpClient = getHttpClient(
+        context, jsRequest->serializeCfBlobJson(js), traceContext, flags.getCacheApiCompatFlags());
     auto requestHeaders = kj::HttpHeaders(context.getHeaderTable());
     jsRequest->shallowCopyHeadersTo(requestHeaders);
-    requestHeaders.set(context.getHeaderIds().cacheControl, "only-if-cached");
-    auto nativeRequest = httpClient->request(
-        kj::HttpMethod::GET, validateUrl(jsRequest->getUrl()), requestHeaders, uint64_t(0));
+
+    auto headerIds = context.getHeaderIds();
+    // parse each of the request headers to add info to span
+    KJ_IF_SOME(range, requestHeaders.get(headerIds.range)) {
+      traceContext.setTag("cache.request.header.range"_kjc, range);
+    }
+    KJ_IF_SOME(ifModifiedSince, requestHeaders.get(headerIds.ifModifiedSince)) {
+      traceContext.setTag("cache.request.header.if_modified_since"_kjc, ifModifiedSince);
+    }
+    KJ_IF_SOME(ifNoneMatch, requestHeaders.get(headerIds.ifNoneMatch)) {
+      traceContext.setTag("cache.request.header.if_none_match"_kjc, ifNoneMatch);
+    }
+
+    requestHeaders.setPtr(context.getHeaderIds().cacheControl, "only-if-cached");
+    auto nativeRequest = httpClient->request(kj::HttpMethod::GET, validateUrl(jsRequest->getUrl()),
+        requestHeaders, static_cast<uint64_t>(0));
 
     return context.awaitIo(js, kj::mv(nativeRequest.response),
-        [httpClient = kj::mv(httpClient), &context](jsg::Lock& js,
+        [httpClient = kj::mv(httpClient), &context, traceContext = kj::mv(traceContext)](
+            jsg::Lock& js,
             kj::HttpClient::Response&& response) mutable -> jsg::Optional<jsg::Ref<Response>> {
       response.body = response.body.attach(kj::mv(httpClient));
+
+      traceContext.setTag(
+          "cache.response.status_code"_kjc, static_cast<int64_t>(response.statusCode));
+      KJ_IF_SOME(length, response.body->tryGetLength()) {
+        traceContext.setTag("cache.response.body.size"_kjc, static_cast<int64_t>(length));
+      }
 
       kj::StringPtr cacheStatus;
       KJ_IF_SOME(cs, response.headers->get(context.getHeaderIds().cfCacheStatus)) {
         cacheStatus = cs;
+        traceContext.setTag("cache.response.cache_status"_kjc, cacheStatus);
       } else {
         // This is an internal error representing a violation of the contract between us and
         // the cache. Since it is always conformant to return undefined from Cache::match()
@@ -111,6 +147,7 @@ jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(
         // script fail. However, it might be indicative of a larger problem, and should be
         // investigated.
         LOG_CACHE_ERROR_ONCE("Response to Cache API GET has no CF-Cache-Status: ", response);
+        traceContext.setTag("cache.response.success"_kjc, false);
         return kj::none;
       }
 
@@ -124,13 +161,16 @@ jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(
       //   this URL result in a 200, causing us to return true from Cache::delete_()? If so, that's
       //   a small inconsistency: we shouldn't have a match failure but a delete success.
       if (cacheStatus == "MISS" || cacheStatus == "EXPIRED" || cacheStatus == "UPDATING") {
+        traceContext.setTag("cache.response.success"_kjc, false);
         return kj::none;
       } else if (cacheStatus != "HIT") {
         // Another internal error. See above comment where we retrieve the CF-Cache-Status header.
         LOG_CACHE_ERROR_ONCE("Response to Cache API GET has invalid CF-Cache-Status: ", response);
+        traceContext.setTag("cache.response.success"_kjc, false);
         return kj::none;
       }
 
+      traceContext.setTag("cache.response.success"_kjc, true);
       return makeHttpResponse(js, kj::HttpMethod::GET, {}, response.statusCode, response.statusText,
           *response.headers, kj::mv(response.body), kj::none);
     });
@@ -152,6 +192,9 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
     Request::Info requestOrUrl,
     jsg::Ref<Response> jsResponse,
     CompatibilityFlags::Reader flags) {
+
+  JSG_REQUIRE(
+      jsResponse->getType() != "error"_kj, TypeError, "Cache is unable to store an error response");
 
   // Fake kj::HttpService::Response implementation that allows us to reuse jsResponse->send() to
   // serialize the response (headers + body) in the format needed to serve as the payload of
@@ -238,6 +281,14 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
   return js.evalNow([&] {
     auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), kj::none);
 
+    auto& context = IoContext::current();
+    TraceContext traceContext = context.makeUserTraceSpan("cache_put"_kjc);
+
+    traceContext.setTag("cache.request.url"_kjc, jsRequest->getUrl());
+    traceContext.setTag("cache.request.method"_kjc, kj::str(jsRequest->getMethodEnum()));
+    traceContext.setTag(
+        "cache.request.payload.status_code"_kjc, static_cast<int64_t>(jsResponse->getStatus()));
+
     // TODO(conform): Require that jsRequest's url has an http or https scheme. This is only
     //   important if api::Request is changed to parse its URL eagerly (as required by spec), rather
     //   than at fetch()-time.
@@ -249,12 +300,30 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
         "Cannot cache response to a range request (206 Partial Content).");
 
     auto responseHeadersRef = jsResponse->getHeaders(js);
-    KJ_IF_SOME(vary, responseHeadersRef->get(jsg::ByteString(kj::str("vary")))) {
+    auto cacheControl = responseHeadersRef->getCommon(js, capnp::CommonHeaderName::CACHE_CONTROL);
+
+    KJ_IF_SOME(vary, responseHeadersRef->getCommon(js, capnp::CommonHeaderName::VARY)) {
       JSG_REQUIRE(vary.findFirst('*') == kj::none, TypeError,
           "Cannot cache response with 'Vary: *' header.");
     }
 
-    auto& context = IoContext::current();
+    KJ_IF_SOME(cacheControl,
+        responseHeadersRef->getCommon(js, capnp::CommonHeaderName::CACHE_CONTROL)) {
+      traceContext.setTag("cache.request.payload.header.cache_control"_kjc, cacheControl.asPtr());
+    }
+    KJ_IF_SOME(cacheTag, responseHeadersRef->getPtr(js, "cache-tag"_kj)) {
+      traceContext.setTag("cache.request.payload.header.cache_tag"_kjc, cacheTag.asPtr());
+    }
+    KJ_IF_SOME(etag, responseHeadersRef->getCommon(js, capnp::CommonHeaderName::ETAG)) {
+      traceContext.setTag("cache.request.payload.header.etag"_kjc, etag.asPtr());
+    }
+    KJ_IF_SOME(expires, responseHeadersRef->getCommon(js, capnp::CommonHeaderName::EXPIRES)) {
+      traceContext.setTag("cache.request.payload.header.expires"_kjc, expires.asPtr());
+    }
+    KJ_IF_SOME(lastModified,
+        responseHeadersRef->getCommon(js, capnp::CommonHeaderName::LAST_MODIFIED)) {
+      traceContext.setTag("cache.request.payload.header.last_modified"_kjc, lastModified.asPtr());
+    }
 
     if (jsResponse->getStatus() == 304) {
       // Silently discard 304 status responses to conditional requests. Caching 304s could be a
@@ -283,6 +352,10 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
     auto serializePromise = jsResponse->send(js, serializer, {}, kj::none);
     auto payload = serializer.getPayload();
 
+    KJ_IF_SOME(length, payload.stream->tryGetLength()) {
+      traceContext.setTag("cache.request.payload.size"_kjc, static_cast<int64_t>(length));
+    }
+
     // TODO(someday): Implement Cache API in preview. This bail-out lives all the way down here,
     //   after all KJ_REQUIRE checks and the start of response serialization, so that Cache.put()
     //   fulfills its contract, even in the preview. This prevents buggy code from working in the
@@ -308,12 +381,15 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
 
     return startStreamPromise.then(js,
         context.addFunctor(
-            [this, &context, jsRequest = kj::mv(jsRequest),
+            [this, &context, jsRequest = kj::mv(jsRequest), cacheControl = kj::mv(cacheControl),
                 serializePromise = kj::mv(serializePromise),
-                writePayloadHeadersPromise = kj::mv(payload.writeHeadersPromise)](jsg::Lock& js,
+                writePayloadHeadersPromise = kj::mv(payload.writeHeadersPromise),
+                enableCompatFlags = flags.getCacheApiCompatFlags(),
+                traceContext = kj::mv(traceContext)](jsg::Lock& js,
                 IoOwn<kj::AsyncInputStream> payloadStream) mutable -> jsg::Promise<void> {
       // Make the PUT request to cache.
-      auto httpClient = getHttpClient(context, jsRequest->serializeCfBlobJson(js), "cache_put"_kjc);
+      auto httpClient = getHttpClient(
+          context, jsRequest->serializeCfBlobJson(js), traceContext, enableCompatFlags);
       auto requestHeaders = kj::HttpHeaders(context.getHeaderTable());
       jsRequest->shallowCopyHeadersTo(requestHeaders);
       auto nativeRequest = httpClient->request(kj::HttpMethod::PUT,
@@ -361,7 +437,7 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
       // backend to respond. At that point, we *are* awaiting I/O, and want to record that
       // correctly.
       //
-      // So basically, we have an asynchorous promise we need to wait for, and for the first part
+      // So basically, we have an asynchronous promise we need to wait for, and for the first part
       // of that wait, we don't want to count it as pending I/O, but for the second part, we do.
       // How do we accomplish this?
       //
@@ -388,7 +464,8 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
               kj::Promise<kj::HttpClient::Response> responsePromise,
               kj::Own<kj::AsyncOutputStream> bodyStream, kj::Promise<void> pumpRequestBodyPromise,
               kj::Promise<void> writePayloadHeadersPromise,
-              kj::Own<kj::AsyncInputStream> payloadStream) -> kj::Promise<DeferredProxy<void>> {
+              kj::Own<kj::AsyncInputStream> payloadStream,
+              TraceContext traceContext) -> kj::Promise<DeferredProxy<void>> {
         // This is extremely odd and a bit annoying but we have to make sure
         // these are destroyed in a particular order due to cross-dependencies
         // for each. If the kj::Promise returned by handleSerialize is dropped
@@ -437,8 +514,13 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
           // ephemeral K/V store, and we never guaranteed the script we'd actually cache anything.
           if (response.statusCode != 204 && response.statusCode != 413) {
             LOG_CACHE_ERROR_ONCE("Response to Cache API PUT was neither 204 nor 413: ", response);
+          } else if (response.statusCode == 204) {
+            traceContext.setTag("cache.response.success"_kjc, true);
+          } else if (response.statusCode == 413) {
+            traceContext.setTag("cache.response.success"_kjc, false);
           }
         } catch (...) {
+          traceContext.setTag("cache.response.success"_kjc, false);
           auto exception = kj::getCaughtExceptionAsKj();
           if (exception.getType() != kj::Exception::Type::DISCONNECTED) {
             kj::throwFatalException(kj::mv(exception));
@@ -446,7 +528,7 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
           // If the origin or the cache disconnected, we don't treat this as an error, as put()
           // doesn't guarantee that it stores anything anyway.
           //
-          // TODO(someday): I (Kenton) don't undestand why we'd explicitly want to hide this
+          // TODO(someday): I (Kenton) don't understand why we'd explicitly want to hide this
           //   error, even though hiding it is technically not a violation of the contract. To me
           //   this seems undesirable, especially when it was the origin that failed. The caller
           //   can always choose to ignore errors if they want (and many do, by passing to
@@ -459,15 +541,25 @@ jsg::Promise<void> Cache::put(jsg::Lock& js,
           handleSerialize(kj::mv(serializePromise), kj::mv(httpClient),
               kj::mv(nativeRequest.response), kj::mv(nativeRequest.body),
               kj::mv(pumpRequestBodyPromise), kj::mv(writePayloadHeadersPromise),
-              kj::mv(payloadStream)));
+              kj::mv(payloadStream), kj::mv(traceContext)));
     }));
   });
 }
 
-jsg::Promise<bool> Cache::delete_(
-    jsg::Lock& js, Request::Info requestOrUrl, jsg::Optional<CacheQueryOptions> options) {
+jsg::Promise<bool> Cache::delete_(jsg::Lock& js,
+    Request::Info requestOrUrl,
+    jsg::Optional<CacheQueryOptions> options,
+    CompatibilityFlags::Reader flags) {
   // TODO(someday): Implement Cache API in preview.
   auto& context = IoContext::current();
+  TraceContext traceContext = context.makeUserTraceSpan("cache_delete"_kjc);
+
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(ignoreMethod, o.ignoreMethod) {
+      traceContext.setTag("cache.request.ignore_method"_kjc, ignoreMethod);
+    }
+  }
+
   if (context.isFiddle()) {
     context.logWarningOnce(CACHE_API_PREVIEW_WARNING);
     return js.resolvedPromise(false);
@@ -478,6 +570,8 @@ jsg::Promise<bool> Cache::delete_(
   return js.evalNow([&]() -> jsg::Promise<bool> {
     auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), kj::none);
 
+    traceContext.setTag("cache.request.url"_kjc, jsRequest->getUrl());
+    traceContext.setTag("cache.request.method"_kjc, kj::str(jsRequest->getMethodEnum()));
     if (!options.orDefault({}).ignoreMethod.orDefault(false) &&
         jsRequest->getMethodEnum() != kj::HttpMethod::GET) {
       return js.resolvedPromise(false);
@@ -485,8 +579,8 @@ jsg::Promise<bool> Cache::delete_(
 
     // Make the PURGE request to cache.
 
-    auto httpClient =
-        getHttpClient(context, jsRequest->serializeCfBlobJson(js), "cache_delete"_kjc);
+    auto httpClient = getHttpClient(
+        context, jsRequest->serializeCfBlobJson(js), traceContext, flags.getCacheApiCompatFlags());
     auto requestHeaders = kj::HttpHeaders(context.getHeaderTable());
     jsRequest->shallowCopyHeadersTo(requestHeaders);
     // HACK: The cache doesn't permit PURGE requests from the outside world. It does this by
@@ -495,17 +589,23 @@ jsg::Promise<bool> Cache::delete_(
     //   your own origin isn't a security flaw. Also, a Worker sending PURGE requests to its own
     //   origin's cache is not a security flaw (that's what this very API is implementing after
     //   all) so it all lines up nicely.
-    requestHeaders.add("X-Real-IP"_kj, "127.0.0.1"_kj);
-    auto nativeRequest = httpClient->request(
-        kj::HttpMethod::PURGE, validateUrl(jsRequest->getUrl()), requestHeaders, uint64_t(0));
+    requestHeaders.addPtrPtr("X-Real-IP"_kj, "127.0.0.1"_kj);
+    auto nativeRequest = httpClient->request(kj::HttpMethod::PURGE,
+        validateUrl(jsRequest->getUrl()), requestHeaders, static_cast<uint64_t>(0));
 
     return context.awaitIo(js, kj::mv(nativeRequest.response),
-        [httpClient = kj::mv(httpClient)](jsg::Lock&, kj::HttpClient::Response&& response) -> bool {
+        [httpClient = kj::mv(httpClient), traceContext = kj::mv(traceContext)](
+            jsg::Lock&, kj::HttpClient::Response&& response) mutable -> bool {
+      traceContext.setTag(
+          "cache.response.status_code"_kjc, static_cast<int64_t>(response.statusCode));
       if (response.statusCode == 200) {
+        traceContext.setTag("cache.response.success"_kjc, true);
         return true;
       } else if (response.statusCode == 404) {
+        traceContext.setTag("cache.response.success"_kjc, false);
         return false;
       } else if (response.statusCode == 429) {
+        traceContext.setTag("cache.response.success"_kjc, false);
         // Throw, but do not log the response to Sentry, as rate-limited subrequests are normal
         JSG_FAIL_REQUIRE(
             Error, "Unable to delete cached response. Subrequests are being rate-limited.");
@@ -516,24 +616,31 @@ jsg::Promise<bool> Cache::delete_(
   });
 }
 
-kj::Own<kj::HttpClient> Cache::getHttpClient(
-    IoContext& context, kj::Maybe<kj::String> cfBlobJson, kj::LiteralStringConst operationName) {
-  auto span = context.makeTraceSpan(operationName);
-  auto userSpan = context.makeUserTraceSpan(operationName);
-
+kj::Own<kj::HttpClient> Cache::getHttpClient(IoContext& context,
+    kj::Maybe<kj::String> cfBlobJson,
+    TraceContext& traceContext,
+    bool enableCompatFlags) {
   auto cacheClient = context.getCacheClient();
-  auto httpClient = cacheName
-                        .map([&](kj::String& n) {
-    return cacheClient->getNamespace(n, kj::mv(cfBlobJson), span);
-  }).orDefault([&]() { return cacheClient->getDefault(kj::mv(cfBlobJson), span); });
-  httpClient = httpClient.attach(kj::mv(span), kj::mv(cacheClient));
-  return httpClient;
+  auto metadata = CacheClient::SubrequestMetadata{
+    .cfBlobJson = kj::mv(cfBlobJson),
+    .parentSpan = traceContext.getInternalSpanParent(),
+    .featureFlagsForFl = kj::none,
+  };
+  if (enableCompatFlags) {
+    metadata.featureFlagsForFl =
+        mapCopyString(context.getWorker().getIsolate().getFeatureFlagsForFl());
+  }
+  auto httpClient =
+      cacheName.map([&](kj::String& n) {
+    return cacheClient->getNamespace(n, kj::mv(metadata));
+  }).orDefault([&]() { return cacheClient->getDefault(kj::mv(metadata)); });
+  return httpClient.attach(kj::mv(cacheClient));
 }
 
 // =======================================================================================
 // CacheStorage
 
-CacheStorage::CacheStorage(): default_(jsg::alloc<Cache>(nullptr)) {}
+CacheStorage::CacheStorage(jsg::Lock& js): default_(js.alloc<Cache>(kj::none)) {}
 
 jsg::Promise<jsg::Ref<Cache>> CacheStorage::open(jsg::Lock& js, kj::String cacheName) {
   // Set some reasonable limit to prevent scripts from blowing up our control header size.
@@ -544,16 +651,15 @@ jsg::Promise<jsg::Ref<Cache>> CacheStorage::open(jsg::Lock& js, kj::String cache
   // TODO(someday): Implement Cache API in preview.
 
   // It is possible here that open() will be called in the global scope in fiddle
-  // mode in which case the warning will not be emitted. But that's ok? The warning
+  // mode in which case the warning will not be emitted. But that's OK? The warning
   // is not critical by any stretch.
-  if (IoContext::hasCurrent()) {
-    auto& context = IoContext::current();
+  KJ_IF_SOME(context, IoContext::tryCurrent()) {
     if (context.isFiddle()) {
       context.logWarningOnce(CACHE_API_PREVIEW_WARNING);
     }
   }
 
-  return js.resolvedPromise(jsg::alloc<Cache>(kj::mv(cacheName)));
+  return js.resolvedPromise(js.alloc<Cache>(kj::mv(cacheName)));
 }
 
 }  // namespace workerd::api

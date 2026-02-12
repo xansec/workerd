@@ -4,33 +4,53 @@
 
 import entrypoints from 'cloudflare-internal:workers';
 
+/**
+ * Reads a stream line by line, yielding each line as it becomes available.
+ *
+ * This function consumes a ReadableStream of Uint8Array chunks (binary data),
+ * converts it to text using TextDecoderStream, and yields each line
+ * encountered. Lines are delimited by newline characters ('\n'). The final
+ * line is yielded even if it doesn't end with a newline.
+ *
+ * @param stream - A ReadableStream containing binary data to be decoded as text
+ * @returns An AsyncGenerator that yields each line from the stream
+ */
 async function* readLines(
-  stream: ReadableStream<string>
+  stream: ReadableStream<Uint8Array>
 ): AsyncGenerator<string> {
-  let start = 0;
-  let end = 0;
-  let partial = '';
+  // @ts-expect-error TS2345 TODO(soon): Fix this.
+  const textStream = stream.pipeThrough(new TextDecoderStream());
+  const reader = textStream.getReader();
 
-  // @ts-expect-error must have a '[Symbol.asyncIterator]()' method
-  for await (const chunk of stream) {
-    const full = partial + (chunk as string);
-    for (const char of full) {
-      if (char === '\n') {
-        yield full.substring(start, end);
-        end++;
-        start = end;
-      } else {
-        end++;
+  let buffer = '';
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    while (true) {
+      const { done, value } = await reader.read();
+
+      // Add any new content to the buffer
+      if (value) buffer += value;
+
+      // Process complete lines
+      let lineEndIndex = buffer.indexOf('\n');
+      while (lineEndIndex >= 0) {
+        yield buffer.substring(0, lineEndIndex);
+        buffer = buffer.substring(lineEndIndex + 1);
+        lineEndIndex = buffer.indexOf('\n');
+      }
+
+      // If we're done and have processed all complete lines,
+      // yield any remaining content and exit
+      if (done) {
+        if (buffer.length > 0) {
+          yield buffer;
+        }
+        break;
       }
     }
-
-    partial = full.substring(start, end);
-    start = 0;
-    end = 0;
-  }
-
-  if (partial.length > 0) {
-    yield partial;
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -39,7 +59,7 @@ type Batch = {
   shard: string; // assigned shard
   ts: number; // creation timestamp of the batch
 
-  format: Format;
+  format: FormatType;
   size: {
     bytes: number;
     rows: number;
@@ -47,35 +67,49 @@ type Batch = {
   data: unknown;
 };
 
+const Format = {
+  JSON_STREAM: 'json_stream' as const, // jsonl
+};
+type FormatType = (typeof Format)[keyof typeof Format];
+
 type JsonStream = Batch & {
-  format: Format.JSON_STREAM;
+  format: typeof Format.JSON_STREAM;
   data: ReadableStream<Uint8Array>;
 };
 
-enum Format {
-  JSON_STREAM = 'json_stream', // jsonl
-}
+type PipelineBatchMetadata = {
+  pipelineId: string;
+  pipelineName: string;
+};
 
-export class PipelineTransformImpl extends entrypoints.WorkerEntrypoint {
+type PipelineRecord = Record<string, unknown>;
+
+export class PipelineTransformImpl<
+  I extends PipelineRecord,
+  O extends PipelineRecord,
+>
+  extends entrypoints.WorkerEntrypoint
+{
   #batch?: Batch;
   #initalized: boolean = false;
 
-  // stub overriden on the sub class
+  // stub overridden on the subclass
   // eslint-disable-next-line @typescript-eslint/require-await
-  public async transformJson(_data: object[]): Promise<object[]> {
+  async run(_records: I[], _metadata: PipelineBatchMetadata): Promise<O[]> {
     throw new Error('should be implemented by parent');
   }
 
-  // called by the dispatcher which then calls the subclass methods
-  // @ts-expect-error thinks ping is never used
-  private _ping(): Promise<void> {
-    // making sure the function was overriden by an implementing subclass
-    if (this.transformJson !== PipelineTransformImpl.prototype.transformJson) {
+  // called by the dispatcher to validate that run is properly implemented by the subclass
+  // @ts-expect-error This is OK. We use this method in tests.
+  // eslint-disable-next-line no-restricted-syntax
+  private async _ping(): Promise<void> {
+    // making sure the function was overridden by an implementing subclass
+    if (this.run !== PipelineTransformImpl.prototype.run) {
       return Promise.resolve();
     } else {
       return Promise.reject(
         new Error(
-          'the transformJson method must be overridden by the PipelineTransform subclass'
+          'the run method must be overridden by the PipelineTransformationEntrypoint subclass'
         )
       );
     }
@@ -84,8 +118,12 @@ export class PipelineTransformImpl extends entrypoints.WorkerEntrypoint {
   // called by the dispatcher which then calls the subclass methods
   // the reason this is typescript private and not javascript private is that this must be
   // able to be called by the dispatcher but should not be called by the class implementer
-  // @ts-expect-error _transform is called by rpc
-  private async _transform(batch: Batch): Promise<JsonStream> {
+  // @ts-expect-error This is OK. We use this method in tests.
+  // eslint-disable-next-line no-restricted-syntax
+  private async _run(
+    batch: Batch,
+    metadata: PipelineBatchMetadata
+  ): Promise<JsonStream> {
     if (this.#initalized) {
       throw new Error('pipeline entrypoint has already been initialized');
     }
@@ -93,45 +131,47 @@ export class PipelineTransformImpl extends entrypoints.WorkerEntrypoint {
     this.#batch = batch;
     this.#initalized = true;
 
-    switch (this.#batch.format) {
-      case Format.JSON_STREAM: {
-        const data = await this.#readJsonStream();
-        const transformed = await this.transformJson(data);
-        return this.#sendJson(transformed);
-      }
-      default:
-        throw new Error('unsupported batch format');
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if (this.#batch.format === Format.JSON_STREAM) {
+      const records: I[] = await this.#readJsonStream();
+      const transformed = await this.run(records, metadata);
+      return this.#sendJson(transformed);
+    } else {
+      throw new Error(
+        'PipelineTransformationEntrypoint run supports only the JSON_STREAM batch format'
+      );
     }
   }
 
-  async #readJsonStream(): Promise<object[]> {
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-    if (this.#batch!.format !== Format.JSON_STREAM) {
-      throw new Error(`expected JSON_STREAM not ${this.#batch!.format}`);
+  async #readJsonStream(): Promise<I[]> {
+    if (this.#batch?.format !== Format.JSON_STREAM) {
+      throw new Error(`expected JSON_STREAM not ${this.#batch?.format}`);
     }
 
-    const batch = this.#batch!.data as ReadableStream<Uint8Array>;
-    const decoder = batch.pipeThrough(new TextDecoderStream());
+    const batch = this.#batch.data as ReadableStream<Uint8Array>;
 
-    const data: object[] = [];
-    for await (const line of readLines(decoder)) {
-      data.push(JSON.parse(line) as object);
+    const data: I[] = [];
+    for await (const line of readLines(batch)) {
+      if (line.trim().length > 0) {
+        // guard against empty lines
+        data.push(JSON.parse(line) as I);
+      }
     }
 
     return data;
   }
 
-  #sendJson(data: object[]): JsonStream {
-    if (!(data instanceof Array)) {
-      throw new Error('transformJson must return an array of objects');
+  #sendJson(records: O[]): JsonStream {
+    if (!(records instanceof Array)) {
+      throw new Error('transformations must return an array of PipelineRecord');
     }
 
     let written = 0;
     const encoder = new TextEncoder();
     const readable = new ReadableStream<Uint8Array>({
       start(controller): void {
-        for (const obj of data) {
-          const encoded = encoder.encode(`${JSON.stringify(obj)}\n`);
+        for (const record of records) {
+          const encoded = encoder.encode(`${JSON.stringify(record)}\n`);
           written += encoded.length;
           controller.enqueue(encoded);
         }
@@ -140,14 +180,18 @@ export class PipelineTransformImpl extends entrypoints.WorkerEntrypoint {
       },
     });
 
+    if (!this.#batch) {
+      throw new Error('Batch should have been defined. Assertion error.');
+    }
+
     return {
-      id: this.#batch!.id,
-      shard: this.#batch!.shard,
-      ts: this.#batch!.ts,
+      id: this.#batch.id,
+      shard: this.#batch.shard,
+      ts: this.#batch.ts,
       format: Format.JSON_STREAM,
       size: {
         bytes: written,
-        rows: data.length,
+        rows: records.length,
       },
       data: readable,
     };

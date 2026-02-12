@@ -1,4 +1,4 @@
-declare module "cloudflare:workflows" {
+declare module 'cloudflare:workflows' {
   /**
    * NonRetryableError allows for a user to throw a fatal error
    * that makes a Workflow instance fail immediately without triggering a retry
@@ -24,7 +24,32 @@ declare abstract class Workflow<PARAMS = unknown> {
   public create(
     options?: WorkflowInstanceCreateOptions<PARAMS>
   ): Promise<WorkflowInstance>;
+
+  /**
+   * Create a batch of instances and return handle for all of them. If a provided id exists, an error will be thrown.
+   * `createBatch` is limited at 100 instances at a time or when the RPC limit for the batch (1MiB) is reached.
+   * @param batch List of Options when creating an instance including name and params
+   * @returns A promise that resolves with a list of handles for the created instances.
+   */
+  public createBatch(
+    batch: WorkflowInstanceCreateOptions<PARAMS>[]
+  ): Promise<WorkflowInstance[]>;
 }
+
+type WorkflowDurationLabel =
+  | 'second'
+  | 'minute'
+  | 'hour'
+  | 'day'
+  | 'week'
+  | 'month'
+  | 'year';
+
+type WorkflowSleepDuration =
+  | `${number} ${WorkflowDurationLabel}${'s' | ''}`
+  | number;
+
+type WorkflowRetentionDuration = WorkflowSleepDuration;
 
 interface WorkflowInstanceCreateOptions<PARAMS = unknown> {
   /**
@@ -35,21 +60,32 @@ interface WorkflowInstanceCreateOptions<PARAMS = unknown> {
    * The event payload the Workflow instance is triggered with
    */
   params?: PARAMS;
+  /**
+   * The retention policy for Workflow instance.
+   * Defaults to the maximum retention period available for the owner's account.
+   */
+  retention?: {
+    successRetention?: WorkflowRetentionDuration,
+    errorRetention?: WorkflowRetentionDuration,
+  };
 }
 
 type InstanceStatus = {
   status:
-    | "queued" // means that instance is waiting to be started (see concurrency limits)
-    | "running"
-    | "paused"
-    | "errored"
-    | "terminated" // user terminated the instance while it was running
-    | "complete"
-    | "waiting" // instance is hibernating and waiting for sleep or event to finish
-    | "waitingForPause" // instance is finishing the current work to pause
-    | "unknown";
-  error?: string;
-  output?: object;
+    | 'queued' // means that instance is waiting to be started (see concurrency limits)
+    | 'running'
+    | 'paused'
+    | 'errored'
+    | 'terminated' // user terminated the instance while it was running
+    | 'complete'
+    | 'waiting' // instance is hibernating and waiting for sleep or event to finish
+    | 'waitingForPause' // instance is finishing the current work to pause
+    | 'unknown';
+  error?: {
+    name: string;
+    message: string;
+  };
+  output?: unknown;
 };
 
 interface WorkflowError {
@@ -84,4 +120,15 @@ declare abstract class WorkflowInstance {
    * Returns the current status of the instance.
    */
   public status(): Promise<InstanceStatus>;
+
+  /**
+   * Send an event to this instance.
+   */
+  public sendEvent({
+    type,
+    payload,
+  }: {
+    type: string;
+    payload: unknown;
+  }): Promise<void>;
 }

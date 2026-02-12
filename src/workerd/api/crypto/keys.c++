@@ -31,7 +31,7 @@ AsymmetricKeyCryptoKeyImpl::AsymmetricKeyCryptoKeyImpl(AsymmetricKeyData&& key, 
 }
 
 jsg::BufferSource AsymmetricKeyCryptoKeyImpl::signatureSslToWebCrypto(
-    jsg::Lock& js, kj::Array<kj::byte> signature) const {
+    jsg::Lock& js, kj::ArrayPtr<kj::byte> signature) const {
   auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, signature.size());
   backing.asArrayPtr().copyFrom(signature);
   return jsg::BufferSource(js, kj::mv(backing));
@@ -51,6 +51,9 @@ SubtleCrypto::ExportKeyData AsymmetricKeyCryptoKeyImpl::exportKey(
   // DER is the binary format which *should* work to export any EVP_PKEY.
 
   uint8_t* der = nullptr;
+  // The caller takes ownership of the buffer and, unless the buffer was fixed with CBB_init_fixed,
+  // must call OPENSSL_free when done.
+  // https://commondatastorage.googleapis.com/chromium-boringssl-docs/bytestring.h.html#CBB_finish
   KJ_DEFER(if (der != nullptr) { OPENSSL_free(der); });
   size_t derLen;
   bssl::ScopedCBB cbb;
@@ -226,7 +229,7 @@ jsg::BufferSource AsymmetricKeyCryptoKeyImpl::sign(jsg::Lock& js,
   auto type = lookupDigestAlgorithm(chooseHash(algorithm.hash)).second;
   if (getAlgorithmName() == "RSASSA-PKCS1-v1_5") {
     // RSASSA-PKCS1-v1_5 requires the RSA key to be at least as big as the digest size
-    // plus a 15 to 19 byte digest-specific prefix (see boringssl's RSA_add_pkcs1_prefix) plus 11
+    // plus a 15 to 19 byte digest-specific prefix (see BoringSSL's RSA_add_pkcs1_prefix) plus 11
     // bytes for padding (see RSA_PKCS1_PADDING_SIZE). For simplicity, require the key to be at
     // least 32 bytes larger than the hash digest.
     // Similar checks could also be adopted for more detailed error handling in verify(), but the
@@ -261,15 +264,15 @@ jsg::BufferSource AsymmetricKeyCryptoKeyImpl::sign(jsg::Lock& js,
   size_t signatureSize = 0;
   OSSLCALL(EVP_DigestSignFinal(digestCtx.get(), nullptr, &signatureSize));
 
-  auto signature = kj::heapArray<kj::byte>(signatureSize);
+  KJ_STACK_ARRAY(kj::byte, signature, signatureSize, 256, 256);
   OSSLCALL(EVP_DigestSignFinal(digestCtx.get(), signature.begin(), &signatureSize));
 
   KJ_ASSERT(signatureSize <= signature.size());
   if (signatureSize < signature.size()) {
-    signature = kj::heapArray<kj::byte>(signature.first(signatureSize));
+    return signatureSslToWebCrypto(js, signature.first(signatureSize));
   }
 
-  return signatureSslToWebCrypto(js, kj::mv(signature));
+  return signatureSslToWebCrypto(js, signature);
 }
 
 bool AsymmetricKeyCryptoKeyImpl::verify(jsg::Lock& js,

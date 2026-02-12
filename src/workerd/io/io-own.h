@@ -1,18 +1,20 @@
 #pragma once
 
-#include <workerd/jsg/util.h>
 #include <workerd/util/weak-refs.h>
 
-#include <kj/async-io.h>
+#include <kj/async.h>
 #include <kj/common.h>
+#include <kj/function.h>
 #include <kj/mutex.h>
 #include <kj/refcount.h>
-#include <kj/string.h>
 #include <kj/vector.h>
 
 #include <typeinfo>
 
 namespace workerd {
+namespace jsg {
+class Lock;
+}
 
 class IoContext;
 
@@ -25,12 +27,12 @@ class ReverseIoOwn;
 
 template <typename T>
 struct RemoveIoOwn_ {
-  typedef T Type;
+  using Type = T;
   static constexpr bool is = false;
 };
 template <typename T>
 struct RemoveIoOwn_<IoOwn<T>> {
-  typedef T Type;
+  using Type = T;
   static constexpr bool is = true;
 };
 
@@ -41,49 +43,9 @@ constexpr bool isIoOwn() {
 template <typename T>
 using RemoveIoOwn = typename RemoveIoOwn_<T>::Type;
 
-// If an object passed to addObject(Own<T>) implements Finalizeable, then once it is known to
-// be the case that no code will ever run in the context of this IoContext again,
-// finalize() will be called.
-//
-// This is primarily used to proactively fail out hanging promises once we know they can never
-// be fulfilled, so that requests fail fast rather than hang forever.
-//
-// Finalizers should NOT call into JavaScript or really do much of anything except for calling
-// reject() on some Fulfiller object. It can optionally return a warning which should be
-// logged if the inspector is attached.
-class Finalizeable {
- public:
-  KJ_DISALLOW_COPY_AND_MOVE(Finalizeable);
-
-#ifdef KJ_DEBUG
-  Finalizeable();
-  ~Finalizeable() noexcept(false);
-  // In debug mode, we assert that this object was actually finalized. A Finalizeable object that
-  // doesn't get finalized typically arises when a derived class multiply-inherits from
-  // Finalizeable and some other non-Finalizeable class T, then gets passed to
-  // `IoContext::addObject()` as a T. This can be a source of baffling bugs.
-#else
-  Finalizeable() = default;
-#endif
-
- private:
-  virtual kj::Maybe<kj::StringPtr> finalize() = 0;
-  friend class IoContext;
-
-#ifdef KJ_DEBUG
-  IoContext& context;
-
-  // Set true by IoContext::runFinalizers();
-  bool finalized = false;
-#endif
-
-  friend class OwnedObjectList;
-};
-
 struct OwnedObject {
   kj::Maybe<kj::Own<OwnedObject>> next;
   kj::Maybe<kj::Own<OwnedObject>>* prev;
-  kj::Maybe<Finalizeable&> finalizer;
 };
 
 template <typename T>
@@ -101,18 +63,8 @@ class OwnedObjectList {
   void link(kj::Own<OwnedObject> object);
   static void unlink(OwnedObject& object);
 
-  // Runs the finalizer for each object in forward order and returns a vector of any warnings
-  // returned from those finalizers.
-  kj::Vector<kj::StringPtr> finalize();
-
-  bool isFinalized() {
-    return finalizersRan;
-  }
-
  private:
   kj::Maybe<kj::Own<OwnedObject>> head;
-
-  bool finalizersRan = false;
 };
 
 // Object which receives possibly-cross-thread deletions of owned objects.
@@ -146,32 +98,32 @@ class DeleteQueue: public kj::AtomicRefcounted {
 
   // Implements the corresponding methods of IoContext and ActorContext.
   template <typename T>
-  IoOwn<T> addObject(kj::Own<T> obj, OwnedObjectList& ownedObjects);
+  IoOwn<T> addObject(kj::Own<T> obj, OwnedObjectList& ownedObjects) const;
 
   template <typename T>
-  ReverseIoOwn<T> addObjectReverse(
-      kj::Own<workerd::WeakRef<IoContext>> weakRef, kj::Own<T> obj, OwnedObjectList& ownedObjects);
+  ReverseIoOwn<T> addObjectReverse(kj::Own<workerd::WeakRef<IoContext>> weakRef,
+      kj::Own<T> obj,
+      OwnedObjectList& ownedObjects) const;
 
-  static void checkFarGet(const DeleteQueue* deleteQueue, const std::type_info& type);
+  static void checkFarGet(const DeleteQueue& deleteQueue, const std::type_info& type);
   static void checkWeakGet(workerd::WeakRef<IoContext>& weak);
 
  private:
   template <typename T>
-  SpecificOwnedObject<T>* addObjectImpl(kj::Own<T> obj, OwnedObjectList& ownedObjects);
+  SpecificOwnedObject<T>* addObjectImpl(kj::Own<T> obj, OwnedObjectList& ownedObjects) const;
 
-  kj::Promise<void> resetCrossThreadSignal();
+  kj::Promise<void> resetCrossThreadSignal() const;
 
   friend class IoContext;
 };
 
-// Object which can push actions into a specific DeleteQueue then signal it's
+// Object which can push actions into a specific DeleteQueue then signal its
 // owning IoContext to wake up to process the queue. This is a bit of a hack of
 // the DeleteQueue concept that allows us to use the same queue for more than
 // just deletions.
 class IoCrossContextExecutor {
  public:
-  IoCrossContextExecutor(kj::Own<const DeleteQueue> deleteQueue)
-      : deleteQueue(kj::mv(deleteQueue)) {}
+  IoCrossContextExecutor(kj::Arc<DeleteQueue> deleteQueue): deleteQueue(kj::mv(deleteQueue)) {}
 
   // Tries to execute the specified action to the owning IoContext.
   // The target IoContext will be signaled to run the action as soon as it is able.
@@ -181,14 +133,12 @@ class IoCrossContextExecutor {
   friend class IoContext;
   friend class DeleteQueue;
 
-  kj::Own<const DeleteQueue> deleteQueue;
+  kj::Arc<DeleteQueue> deleteQueue;
 };
 
 template <typename T>
 inline SpecificOwnedObject<T>* DeleteQueue::addObjectImpl(
-    kj::Own<T> obj, OwnedObjectList& ownedObjects) {
-  auto& ref = *obj;
-
+    kj::Own<T> obj, OwnedObjectList& ownedObjects) const {
   // HACK: We need an Own<OwnedObject>, but we actually need to allocate it as the subclass
   //   SpecificOwnedObject<T>. OwnedObject is not polymorphic, which means kj::Own will refuse
   //   to upcast kj::Own<SpecificOwnedObject<T>> to kj::Own<OwnedObject> since it can't guarantee
@@ -201,23 +151,20 @@ inline SpecificOwnedObject<T>* DeleteQueue::addObjectImpl(
   kj::Own<OwnedObject> ownedObject(new SpecificOwnedObject<T>(kj::mv(obj)),
       kj::_::HeapDisposer<SpecificOwnedObject<T>>::instance);
 
-  if constexpr (kj::canConvert<T&, Finalizeable&>()) {
-    ownedObject->finalizer = ref;
-  }
-
   auto result = static_cast<SpecificOwnedObject<T>*>(ownedObject.get());
   ownedObjects.link(kj::mv(ownedObject));
   return result;
 }
 
 template <typename T>
-inline IoOwn<T> DeleteQueue::addObject(kj::Own<T> obj, OwnedObjectList& ownedObjects) {
-  return IoOwn<T>(kj::atomicAddRef(*this), addObjectImpl(kj::mv(obj), ownedObjects));
+inline IoOwn<T> DeleteQueue::addObject(kj::Own<T> obj, OwnedObjectList& ownedObjects) const {
+  return IoOwn<T>(addRefToThis(), addObjectImpl(kj::mv(obj), ownedObjects));
 }
 
 template <typename T>
-inline ReverseIoOwn<T> DeleteQueue::addObjectReverse(
-    kj::Own<workerd::WeakRef<IoContext>> weakRef, kj::Own<T> obj, OwnedObjectList& ownedObjects) {
+inline ReverseIoOwn<T> DeleteQueue::addObjectReverse(kj::Own<workerd::WeakRef<IoContext>> weakRef,
+    kj::Own<T> obj,
+    OwnedObjectList& ownedObjects) const {
   return ReverseIoOwn<T>(kj::mv(weakRef), addObjectImpl(kj::mv(obj), ownedObjects));
 }
 
@@ -225,12 +172,12 @@ inline ReverseIoOwn<T> DeleteQueue::addObjectReverse(
 // matters a bit, we need to cancel all tasks (destroy the TaskSet) before this happens, so
 // we can't just do it in IoContext's destructor. As a hack, we customize our pointer
 // to the delete queue to get the tear-down order right.
-class DeleteQueuePtr: public kj::Own<DeleteQueue> {
+class DeleteQueuePtr {
  public:
-  DeleteQueuePtr(kj::Own<DeleteQueue> value): kj::Own<DeleteQueue>(kj::mv(value)) {}
+  DeleteQueuePtr(kj::Arc<DeleteQueue> queue): queue(kj::mv(queue)) {}
   KJ_DISALLOW_COPY_AND_MOVE(DeleteQueuePtr);
   ~DeleteQueuePtr() noexcept(false) {
-    auto ptr = get();
+    auto ptr = queue.get();
     if (ptr != nullptr) {
       auto lock = ptr->crossThreadDeleteQueue.lockExclusive();
       KJ_IF_SOME(state, *lock) {
@@ -244,6 +191,7 @@ class DeleteQueuePtr: public kj::Own<DeleteQueue> {
       *lock = kj::none;
     }
   }
+  kj::Arc<DeleteQueue> queue;
 };
 
 // Owned pointer held by a V8 heap object, pointing to a KJ event loop object. Cannot be
@@ -283,10 +231,10 @@ class IoOwn {
   friend class IoContext;
   friend class DeleteQueue;
 
-  kj::Own<const DeleteQueue> deleteQueue;
+  kj::Arc<DeleteQueue> deleteQueue;
   SpecificOwnedObject<T>* item;
 
-  IoOwn(kj::Own<const DeleteQueue> deleteQueue, SpecificOwnedObject<T>* item)
+  IoOwn(kj::Arc<DeleteQueue> deleteQueue, SpecificOwnedObject<T>* item)
       : deleteQueue(kj::mv(deleteQueue)),
         item(item) {}
 };
@@ -296,7 +244,7 @@ class IoOwn {
 template <typename T>
 class IoPtr {
  public:
-  IoPtr(const IoPtr& other): deleteQueue(kj::atomicAddRef(*other.deleteQueue)), ptr(other.ptr) {}
+  IoPtr(const IoPtr& other): deleteQueue(other.deleteQueue.addRef()), ptr(other.ptr) {}
   IoPtr(IoPtr&& other) = default;
 
   T* operator->();
@@ -309,12 +257,10 @@ class IoPtr {
   friend class IoContext;
   friend class DeleteQueue;
 
-  kj::Own<const DeleteQueue> deleteQueue;
+  kj::Arc<DeleteQueue> deleteQueue;
   T* ptr;
 
-  IoPtr(kj::Own<const DeleteQueue> deleteQueue, T* ptr)
-      : deleteQueue(kj::mv(deleteQueue)),
-        ptr(ptr) {}
+  IoPtr(kj::Arc<DeleteQueue> deleteQueue, T* ptr): deleteQueue(kj::mv(deleteQueue)), ptr(ptr) {}
 };
 
 // Owned pointer held by a KJ I/O object living in the same thread as an IoContext. The underlying
@@ -342,6 +288,16 @@ class ReverseIoOwn {
   operator kj::Own<T>() &&;
   ReverseIoOwn& operator=(ReverseIoOwn&& other);
   ReverseIoOwn& operator=(decltype(nullptr));
+
+  // Try to get the underlying object if safe to dereference.
+  // Returns kj::none if the IoContext has been destroyed or if this is null.
+  // This is a safe alternative to operator->() that won't throw or crash.
+  kj::Maybe<T&> tryGet() {
+    if (item != nullptr && weakRef->isValid()) {
+      return *item->ptr.get();
+    }
+    return kj::none;
+  }
 
  private:
   friend class IoContext;
@@ -406,13 +362,13 @@ IoPtr<T>& IoPtr<T>::operator=(decltype(nullptr)) {
 
 template <typename T>
 inline T* IoOwn<T>::operator->() {
-  DeleteQueue::checkFarGet(deleteQueue, typeid(T));
+  DeleteQueue::checkFarGet(*deleteQueue.get(), typeid(T));
   return item->ptr;
 }
 
 template <typename T>
 inline IoOwn<T>::operator kj::Own<T>() && {
-  DeleteQueue::checkFarGet(deleteQueue, typeid(T));
+  DeleteQueue::checkFarGet(*deleteQueue.get(), typeid(T));
   auto result = kj::mv(item->ptr);
   OwnedObjectList::unlink(*item);
   item = nullptr;
@@ -422,7 +378,7 @@ inline IoOwn<T>::operator kj::Own<T>() && {
 
 template <typename T>
 inline T* IoPtr<T>::operator->() {
-  DeleteQueue::checkFarGet(deleteQueue, typeid(T));
+  DeleteQueue::checkFarGet(*deleteQueue.get(), typeid(T));
   return ptr;
 }
 

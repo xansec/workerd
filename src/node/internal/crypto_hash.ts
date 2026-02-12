@@ -23,9 +23,6 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-/* todo: the following is adopted code, enabling linting one day */
-/* eslint-disable */
-
 import { default as cryptoImpl } from 'node-internal:crypto';
 type ArrayLike = cryptoImpl.ArrayLike;
 
@@ -56,8 +53,8 @@ import {
 
 import {
   Transform,
-  TransformOptions,
-  TransformCallback,
+  type TransformOptions,
+  type TransformCallback,
 } from 'node-internal:streams_transform';
 
 import { KeyObject } from 'node-internal:crypto_keys';
@@ -70,9 +67,18 @@ interface _kState {
   [kFinalized]: boolean;
 }
 
-interface Hash extends Transform {
+declare class Hash extends Transform {
   [kHandle]: cryptoImpl.HashHandle;
   [kState]: _kState;
+
+  constructor(algorithm: string | cryptoImpl.HashHandle, options?: HashOptions);
+
+  copy(options?: HashOptions): Hash;
+  update(
+    data: string | Buffer | ArrayBufferView,
+    encoding?: string
+  ): Hash | Hmac;
+  digest(outputEncoding?: string): Buffer | string;
 }
 
 // These helper functions are needed because the constructors can
@@ -81,12 +87,14 @@ export function createHash(algorithm: string, options?: HashOptions): Hash {
   return new Hash(algorithm, options);
 }
 
-let Hash = function (
-  this: Hash,
+function Hash(
+  this: unknown,
   algorithm: string | cryptoImpl.HashHandle,
   options?: HashOptions
 ): Hash {
-  if (!(this instanceof Hash)) return new Hash(algorithm, options);
+  if (!(this instanceof Hash)) {
+    return new Hash(algorithm, options);
+  }
 
   const xofLen = typeof options === 'object' ? options.outputLength : undefined;
   if (xofLen !== undefined) validateUint32(xofLen, 'options.outputLength');
@@ -102,9 +110,7 @@ let Hash = function (
 
   Transform.call(this, options);
   return this;
-} as any as {
-  new (algorithm: string | cryptoImpl.HashHandle, options?: HashOptions): Hash;
-};
+}
 
 Object.setPrototypeOf(Hash.prototype, Transform.prototype);
 Object.setPrototypeOf(Hash, Transform);
@@ -183,20 +189,31 @@ Hash.prototype.digest = function (
 
 ///////////////////////////
 
-interface Hmac extends Transform {
+declare class Hmac extends Transform {
   [kHandle]: cryptoImpl.HmacHandle;
   [kState]: _kState;
+  constructor(
+    hmac: string,
+    key: ArrayLike | KeyObject | CryptoKey,
+    options?: TransformOptions
+  );
+  copy(options?: HashOptions): Hash;
+  update(
+    data: string | Buffer | ArrayBufferView,
+    encoding?: string
+  ): Hash | Hmac;
+  digest(outputEncoding?: string): Buffer | string;
 }
 
 export function createHmac(
   hmac: string,
-  key: ArrayLike | KeyObject | CryptoKey,
+  key: CryptoKey,
   options?: TransformOptions
 ): Hmac {
   return new Hmac(hmac, key, options);
 }
 
-let Hmac = function (
+function Hmac(
   this: Hmac,
   hmac: string,
   key: CryptoKey,
@@ -247,17 +264,11 @@ let Hmac = function (
   };
   Transform.call(this, options);
   return this;
-} as any as {
-  new (
-    hmac: string,
-    key: ArrayLike | KeyObject | CryptoKey,
-    options?: TransformOptions
-  ): Hmac;
-};
-
+}
 Object.setPrototypeOf(Hmac.prototype, Transform.prototype);
 Object.setPrototypeOf(Hmac, Transform);
 
+// eslint-disable-next-line @typescript-eslint/unbound-method
 Hmac.prototype.update = Hash.prototype.update;
 
 Hmac.prototype.digest = function (
@@ -281,7 +292,34 @@ Hmac.prototype.digest = function (
   }
 };
 
+// eslint-disable-next-line @typescript-eslint/unbound-method
 Hmac.prototype._flush = Hash.prototype._flush;
+// eslint-disable-next-line @typescript-eslint/unbound-method
 Hmac.prototype._transform = Hash.prototype._transform;
+
+export function hash(
+  algorithm: string,
+  data: string | ArrayBufferView,
+  outputEncoding: string = 'hex'
+): string | Buffer {
+  validateString(algorithm, 'algorithm');
+  validateString(outputEncoding, 'outputEncoding');
+
+  if (typeof data === 'string') {
+    const hash = createHash(algorithm);
+    hash.update(data, 'utf8');
+    return hash.digest(outputEncoding);
+  } else if (isArrayBufferView(data)) {
+    const hash = createHash(algorithm);
+    hash.update(data, 'utf8');
+    return hash.digest(outputEncoding);
+  }
+
+  throw new ERR_INVALID_ARG_TYPE(
+    'data',
+    ['string', 'Buffer', 'TypedArray', 'DataView'],
+    data
+  );
+}
 
 export { Hash, Hmac };

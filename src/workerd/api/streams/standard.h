@@ -8,9 +8,8 @@
 #include "queue.h"
 
 #include <workerd/jsg/jsg.h>
+#include <workerd/util/ring-buffer.h>
 #include <workerd/util/weak-refs.h>
-
-#include <list>
 
 namespace workerd::api {
 
@@ -156,7 +155,7 @@ class ReadableImpl {
   void close(jsg::Lock& js);
 
   // Push a chunk of data into the queue.
-  void enqueue(jsg::Lock& js, kj::Own<Entry> entry, jsg::Ref<Self> self);
+  void enqueue(jsg::Lock& js, kj::Rc<Entry> entry, jsg::Ref<Self> self);
 
   void doClose(jsg::Lock& js);
 
@@ -172,8 +171,18 @@ class ReadableImpl {
   // queue is below the watermark and we actually need data right now.
   void pullIfNeeded(jsg::Lock& js, jsg::Ref<Self> self);
 
+  // Like pullIfNeeded but bypasses the shouldCallPull() check. Used for draining reads
+  // which need to pull all available data regardless of backpressure settings.
+  void forcePullIfNeeded(jsg::Lock& js, jsg::Ref<Self> self);
+
   // True if the queue is current below the highwatermark.
   bool shouldCallPull();
+
+  // True if a pull is currently in progress (the pull promise is pending).
+  // Used by draining reads to determine if pumping completed synchronously.
+  bool isPulling() const {
+    return flags.pulling;
+  }
 
   // The consumer can be used to read from this readables queue so long as the queue
   // is open. The consumer instance may outlive the readable but will be put into
@@ -222,11 +231,6 @@ class ReadableImpl {
   kj::OneOf<StreamStates::Closed, StreamStates::Errored, Queue> state;
   Algorithms algorithms;
 
-  bool disturbed = false;
-  bool pullAgain = false;
-  bool pulling = false;
-  bool started = false;
-  bool starting = false;
   size_t highWaterMark = 1;
 
   struct PendingCancel {
@@ -238,6 +242,14 @@ class ReadableImpl {
     }
   };
   kj::Maybe<PendingCancel> maybePendingCancel;
+
+  struct Flags {
+    uint8_t pullAgain : 1 = 0;
+    uint8_t pulling : 1 = 0;
+    uint8_t started : 1 = 0;
+    uint8_t starting : 1 = 0;
+  };
+  Flags flags{};
 
   friend Self;
 };
@@ -266,7 +278,7 @@ class WritableImpl {
     }
   };
 
-  WritableImpl(WritableStream& owner);
+  WritableImpl(jsg::Lock& js, WritableStream& owner, jsg::Ref<AbortSignal> abortSignal);
 
   jsg::Promise<void> abort(jsg::Lock& js, jsg::Ref<Self> self, v8::Local<v8::Value> reason);
 
@@ -313,7 +325,7 @@ class WritableImpl {
   // is equal to or above the highwatermark, then backpressure is applied.
   void updateBackpressure(jsg::Lock& js);
 
-  // Writes a chunk to the Writable, possibly queueing the chunk in the internal buffer
+  // Writes a chunk to the Writable, possibly queuing the chunk in the internal buffer
   // if there are already other writes pending.
   jsg::Promise<void> write(jsg::Lock& js, jsg::Ref<Self> self, v8::Local<v8::Value> value);
 
@@ -336,6 +348,10 @@ class WritableImpl {
     kj::Maybe<jsg::Function<StreamQueuingStrategy::SizeAlgorithm>> size;
 
     Algorithms() {};
+    ~Algorithms() {
+      // Clear all algorithm references to break circular references
+      clear();
+    }
     Algorithms(Algorithms&& other) = default;
     Algorithms& operator=(Algorithms&& other) = default;
 
@@ -354,7 +370,7 @@ class WritableImpl {
   struct Writable {};
 
   // Sadly, we have to use a weak ref here rather than jsg::Ref. This is because
-  // the jsg::Ref<WritableStream> (via it's internal WritableStreamJsController)
+  // the jsg::Ref<WritableStream> (via its internal WritableStreamJsController)
   // holds a strong reference to the jsg::Ref<WritableStreamDefaultController> that
   // uses this WritableImpl. This creates a strong circular reference between jsg::Refs
   // that isn't allowed. GcTracing ends up with a stack overflow as the two jsg::Refs
@@ -364,22 +380,24 @@ class WritableImpl {
   kj::OneOf<StreamStates::Closed, StreamStates::Errored, StreamStates::Erroring, Writable> state =
       Writable();
   Algorithms algorithms;
-  bool started = false;
-  bool starting = false;
-  bool backpressure = false;
-  size_t highWaterMark = 1;
 
-  // `writeRequests` is often going to be empty in common usage patterns, in which case std::list
-  // is more memory efficient than a std::deque, for example.
-  std::list<WriteRequest> writeRequests;
+  size_t highWaterMark = 1;
   size_t amountBuffered = 0;
-  bool warnAboutExcessiveBackpressure = true;
-  size_t excessiveBackpressureWarningCount = 0;
+
+  RingBuffer<WriteRequest, 8> writeRequests;
 
   kj::Maybe<WriteRequest> inFlightWrite;
   kj::Maybe<jsg::Promise<void>::Resolver> inFlightClose;
   kj::Maybe<jsg::Promise<void>::Resolver> closeRequest;
   kj::Maybe<kj::Own<PendingAbort>> maybePendingAbort;
+
+  struct Flags {
+    uint8_t started : 1 = 0;
+    uint8_t starting : 1 = 0;
+    uint8_t backpressure : 1 = 0;
+    uint8_t pedanticWpt : 1 = 0;
+  };
+  Flags flags{};
 
   friend Self;
 };
@@ -412,6 +430,15 @@ class ReadableStreamDefaultController: public jsg::Object {
   void error(jsg::Lock& js, v8::Local<v8::Value> reason);
 
   void pull(jsg::Lock& js);
+
+  // Like pull(), but bypasses backpressure checks. Used for draining reads
+  // which need to pull all available data regardless of highWaterMark.
+  void forcePull(jsg::Lock& js);
+
+  // True if a pull is currently in progress (the pull promise is pending).
+  bool isPulling() const {
+    return impl.isPulling();
+  }
 
   kj::Own<ValueQueue::Consumer> getConsumer(
       kj::Maybe<ValueQueue::ConsumerImpl::StateListener&> stateListener);
@@ -457,7 +484,7 @@ class ReadableStreamBYOBRequest: public jsg::Object {
  public:
   ReadableStreamBYOBRequest(jsg::Lock& js,
       kj::Own<ByteQueue::ByobRequest> readRequest,
-      jsg::Ref<ReadableByteStreamController> controller);
+      kj::Rc<WeakRef<ReadableByteStreamController>> controller);
 
   KJ_DISALLOW_COPY_AND_MOVE(ReadableStreamBYOBRequest);
 
@@ -491,12 +518,12 @@ class ReadableStreamBYOBRequest: public jsg::Object {
  private:
   struct Impl {
     kj::Own<ByteQueue::ByobRequest> readRequest;
-    jsg::Ref<ReadableByteStreamController> controller;
+    kj::Rc<WeakRef<ReadableByteStreamController>> controller;
     jsg::V8Ref<v8::Uint8Array> view;
 
     Impl(jsg::Lock& js,
         kj::Own<ByteQueue::ByobRequest> readRequest,
-        jsg::Ref<ReadableByteStreamController> controller);
+        kj::Rc<WeakRef<ReadableByteStreamController>> controller);
 
     void updateView(jsg::Lock& js);
   };
@@ -517,6 +544,11 @@ class ReadableByteStreamController: public jsg::Object {
 
   ReadableByteStreamController(
       UnderlyingSource underlyingSource, StreamQueuingStrategy queuingStrategy);
+  ~ReadableByteStreamController() noexcept(false);
+
+  jsg::Ref<ReadableByteStreamController> getSelf() {
+    return JSG_THIS;
+  }
 
   void start(jsg::Lock& js);
 
@@ -536,6 +568,15 @@ class ReadableByteStreamController: public jsg::Object {
 
   void pull(jsg::Lock& js);
 
+  // Like pull(), but bypasses backpressure checks. Used for draining reads
+  // which need to pull all available data regardless of highWaterMark.
+  void forcePull(jsg::Lock& js);
+
+  // True if a pull is currently in progress (the pull promise is pending).
+  bool isPulling() const {
+    return impl.isPulling();
+  }
+
   kj::Own<ByteQueue::Consumer> getConsumer(
       kj::Maybe<ByteQueue::ConsumerImpl::StateListener&> stateListener);
 
@@ -553,6 +594,7 @@ class ReadableByteStreamController: public jsg::Object {
   }
 
  private:
+  kj::Rc<WeakRef<ReadableByteStreamController>> weakSelf;
   kj::Maybe<IoContext&> ioContext;
   ReadableImpl impl;
   kj::Maybe<jsg::Ref<ReadableStreamBYOBRequest>> maybeByobRequest;
@@ -573,7 +615,10 @@ class WritableStreamDefaultController: public jsg::Object {
  public:
   using WritableImpl = WritableImpl<WritableStreamDefaultController>;
 
-  explicit WritableStreamDefaultController(WritableStream& owner);
+  explicit WritableStreamDefaultController(
+      jsg::Lock& js, WritableStream& owner, jsg::Ref<AbortSignal> abortSignal);
+
+  ~WritableStreamDefaultController() noexcept(false);
 
   jsg::Promise<void> abort(jsg::Lock& js, v8::Local<v8::Value> reason);
 
@@ -581,14 +626,19 @@ class WritableStreamDefaultController: public jsg::Object {
 
   void error(jsg::Lock& js, jsg::Optional<v8::Local<v8::Value>> reason);
 
-  ssize_t getDesiredSize();
+  kj::Maybe<ssize_t> getDesiredSize();
 
   jsg::Ref<AbortSignal> getSignal();
 
   kj::Maybe<v8::Local<v8::Value>> isErroring(jsg::Lock& js);
 
+  // Returns true if the stream is in the erroring state. Unlike the overload
+  // that takes a lock, this method does not require a lock since it doesn't
+  // return the error reason.
+  bool isErroring() const;
+
   bool isStarted() {
-    return impl.started;
+    return impl.flags.started;
   }
 
   void setup(jsg::Lock& js, UnderlyingSink underlyingSink, StreamQueuingStrategy queuingStrategy);
@@ -603,6 +653,9 @@ class WritableStreamDefaultController: public jsg::Object {
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
 
   void cancelPendingWrites(jsg::Lock& js, jsg::JsValue reason);
+
+  // Clear algorithms to break circular references during destruction
+  void clearAlgorithms();
 
  private:
   kj::Maybe<IoContext&> ioContext;
@@ -620,7 +673,7 @@ class WritableStreamDefaultController: public jsg::Object {
 // JSG_VISITABLE_LAMBDAs. When those algorithms are cleared, the strong
 // references holding the TransformStreamDefaultController are freed.
 // However, user code can do silly things like hold the Transform controller
-// long after both the readable and writable sides have been gc'd.
+// long after both the readable and writable sides have been GC'ed.
 class TransformStreamDefaultController: public jsg::Object {
  public:
   TransformStreamDefaultController(jsg::Lock& js);

@@ -7,18 +7,24 @@
 #include <workerd/api/actor-state.h>
 #include <workerd/api/actor.h>
 #include <workerd/api/analytics-engine.h>
+#include <workerd/api/base64.h>
 #include <workerd/api/cache.h>
 #include <workerd/api/crypto/crypto.h>
 #include <workerd/api/encoding.h>
 #include <workerd/api/events.h>
 #include <workerd/api/eventsource.h>
+#include <workerd/api/export-loopback.h>
+#include <workerd/api/filesystem.h>
 #include <workerd/api/global-scope.h>
 #include <workerd/api/html-rewriter.h>
 #include <workerd/api/hyperdrive.h>
 #include <workerd/api/kv.h>
 #include <workerd/api/memory-cache.h>
+#include <workerd/api/messagechannel.h>
 #include <workerd/api/modules.h>
 #include <workerd/api/node/node.h>
+#include <workerd/api/performance.h>
+#include <workerd/api/pyodide/pyodide.h>
 #include <workerd/api/queue.h>
 #include <workerd/api/r2-admin.h>
 #include <workerd/api/r2.h>
@@ -27,24 +33,21 @@
 #include <workerd/api/sql.h>
 #include <workerd/api/streams.h>
 #include <workerd/api/streams/standard.h>
+#include <workerd/api/sync-kv.h>
 #include <workerd/api/trace.h>
+#include <workerd/api/tracing-module.h>
 #include <workerd/api/unsafe.h>
 #include <workerd/api/url-standard.h>
+#include <workerd/api/urlpattern-standard.h>
 #include <workerd/api/urlpattern.h>
+#include <workerd/api/worker-loader.h>
 #include <workerd/api/worker-rpc.h>
+#include <workerd/api/workers-module.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/jsg/modules.capnp.h>
+#include <workerd/jsg/rtti.h>
 
-#include <cloudflare/cloudflare.capnp.h>
-
-#include <capnp/serialize-packed.h>
-#include <kj/map.h>
-
-#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
-#include <workerd/api/gpu/gpu.h>
-#else
-#define EW_WEBGPU_ISOLATE_TYPES
-#endif
+#include <kj/vector.h>
 
 #define EW_TYPE_GROUP_FOR_EACH(F)                                                                  \
   F("dom-exception", jsg::DOMException)                                                            \
@@ -76,13 +79,23 @@
   F("url", EW_URL_ISOLATE_TYPES)                                                                   \
   F("url-standard", EW_URL_STANDARD_ISOLATE_TYPES)                                                 \
   F("url-pattern", EW_URLPATTERN_ISOLATE_TYPES)                                                    \
+  F("url-pattern-standard", EW_URLPATTERN_STANDARD_ISOLATE_TYPES)                                  \
   F("websocket", EW_WEBSOCKET_ISOLATE_TYPES)                                                       \
   F("sql", EW_SQL_ISOLATE_TYPES)                                                                   \
   F("sockets", EW_SOCKETS_ISOLATE_TYPES)                                                           \
+  F("base64", EW_BASE64_ISOLATE_TYPES)                                                             \
   F("node", EW_NODE_ISOLATE_TYPES)                                                                 \
   F("rtti", EW_RTTI_ISOLATE_TYPES)                                                                 \
-  F("webgpu", EW_WEBGPU_ISOLATE_TYPES)                                                             \
-  F("eventsource", EW_EVENTSOURCE_ISOLATE_TYPES)
+  F("eventsource", EW_EVENTSOURCE_ISOLATE_TYPES)                                                   \
+  F("container", EW_CONTAINER_ISOLATE_TYPES)                                                       \
+  F("webfs", EW_WEB_FILESYSTEM_ISOLATE_TYPE)                                                       \
+  F("messagechannel", EW_MESSAGECHANNEL_ISOLATE_TYPES)                                             \
+  F("workers-module", EW_WORKERS_MODULE_ISOLATE_TYPES)                                             \
+  F("export-loopback", EW_EXPORT_LOOPBACK_ISOLATE_TYPES)                                           \
+  F("sync-kv", EW_SYNC_KV_ISOLATE_TYPES)                                                           \
+  F("worker-loader", EW_WORKER_LOADER_ISOLATE_TYPES)                                               \
+  F("performance", EW_PERFORMANCE_ISOLATE_TYPES)                                                   \
+  F("tracing-module", EW_TRACING_MODULE_ISOLATE_TYPES)
 
 namespace workerd::api {
 
@@ -119,10 +132,25 @@ struct EncoderModuleRegistryImpl {
     }
   }
 
+  template <typename Func>
+  void addBuiltinBundleFiltered(jsg::Bundle::Reader bundle, Func filter) {
+    for (auto module: bundle.getModules()) {
+      if (filter(module)) {
+        addBuiltinModule(module);
+      }
+    }
+  }
+
   void addBuiltinModule(jsg::Module::Reader module) {
     TypeScriptModuleContents contents(module.getTsDeclaration());
     ModuleInfo info(module.getName(), module.getType(), kj::mv(contents));
     modules.add(kj::mv(info));
+  }
+
+  void addBuiltinModule(kj::StringPtr specifier,
+      jsg::ModuleRegistry::ModuleCallback callback,
+      jsg::ModuleRegistry::Type type = jsg::ModuleRegistry::Type::BUILTIN) {
+    // TODO(soon): Implement this function
   }
 
   template <typename T>

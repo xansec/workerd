@@ -12,8 +12,13 @@ export function checkPrimeSync(
 export function randomPrime(
   size: number,
   safe: boolean,
-  add?: ArrayBufferView | undefined,
-  rem?: ArrayBufferView | undefined
+  add?: ArrayBufferView,
+  rem?: ArrayBufferView
+): ArrayBuffer;
+
+export function statelessDH(
+  privateKey: CryptoKey,
+  publicKey: CryptoKey
 ): ArrayBuffer;
 
 // X509Certificate
@@ -26,46 +31,176 @@ export interface CheckOptions {
 }
 
 export class X509Certificate {
-  public static parse(data: ArrayBuffer | ArrayBufferView): X509Certificate;
-  public get subject(): string | undefined;
-  public get subjectAltName(): string | undefined;
-  public get infoAccess(): string | undefined;
-  public get issuer(): string | undefined;
-  public get issuerCert(): X509Certificate | undefined;
-  public get validFrom(): string | undefined;
-  public get validTo(): string | undefined;
-  public get fingerprint(): string | undefined;
-  public get fingerprint256(): string | undefined;
-  public get fingerprint512(): string | undefined;
-  public get keyUsage(): string[] | undefined;
-  public get serialNumber(): string | undefined;
-  public get pem(): string | undefined;
-  public get raw(): ArrayBuffer | undefined;
-  public get publicKey(): CryptoKey | undefined;
-  public get isCA(): boolean;
-  public checkHost(host: string, options?: CheckOptions): string | undefined;
-  public checkEmail(email: string, options?: CheckOptions): string | undefined;
-  public checkIp(ip: string, options?: CheckOptions): string | undefined;
-  public checkIssued(cert: X509Certificate): boolean;
-  public checkPrivateKey(key: CryptoKey): boolean;
-  public verify(key: CryptoKey): boolean;
-  public toLegacyObject(): object;
+  static parse(data: ArrayBuffer | ArrayBufferView): X509Certificate;
+  get subject(): string | undefined;
+  get subjectAltName(): string | undefined;
+  get infoAccess(): string | undefined;
+  get issuer(): string | undefined;
+  get issuerCert(): X509Certificate | undefined;
+  get validFrom(): string | undefined;
+  get validTo(): string | undefined;
+  get fingerprint(): string | undefined;
+  get fingerprint256(): string | undefined;
+  get fingerprint512(): string | undefined;
+  get keyUsage(): string[] | undefined;
+  get serialNumber(): string | undefined;
+  get pem(): string | undefined;
+  get raw(): ArrayBuffer | undefined;
+  get publicKey(): CryptoKey | undefined;
+  get isCA(): boolean;
+  checkHost(host: string, options?: CheckOptions): string | undefined;
+  checkEmail(email: string, options?: CheckOptions): string | undefined;
+  checkIp(ip: string, options?: CheckOptions): string | undefined;
+  checkIssued(cert: X509Certificate): boolean;
+  checkPrivateKey(key: CryptoKey): boolean;
+  verify(key: CryptoKey): boolean;
+  toLegacyObject(): object;
 }
 
 // Hash and Hmac
 export class HashHandle {
-  public constructor(algorithm: string, xofLen: number);
-  public update(data: Buffer | ArrayBufferView): number;
-  public digest(): ArrayBuffer;
-  public copy(xofLen: number): HashHandle;
+  constructor(algorithm: string, xofLen: number);
+  update(data: Buffer | ArrayBufferView): number;
+  digest(): ArrayBuffer;
+  copy(xofLen: number): HashHandle;
 }
+
+export class SignHandle {
+  constructor(algorithm: string);
+  update(data: Buffer | ArrayBufferView): void;
+  sign(
+    key: CryptoKey,
+    rsaPadding?: number,
+    pssSaltLength?: number,
+    dsaSigEnc?: number
+  ): Uint8Array;
+}
+
+export class VerifyHandle {
+  constructor(algorithm: string);
+  update(data: Buffer | ArrayBufferView): void;
+  verify(
+    key: CryptoKey,
+    signature: ArrayBufferView,
+    rsaPadding?: number,
+    pssSaltLength?: number,
+    dsaSigEnc?: number
+  ): boolean;
+}
+
+export function signOneShot(
+  key: CryptoKey,
+  algorithm: string | undefined,
+  data: ArrayBufferView,
+  rsaPadding?: number,
+  pssSaltLength?: number,
+  dsaSigEnc?: number
+): ArrayBuffer;
+export function verifyOneShot(
+  key: CryptoKey,
+  algorithm: string | undefined,
+  data: ArrayBufferView,
+  signature: ArrayBufferView,
+  rsaPadding?: number,
+  pssSaltLength?: number,
+  dsaSigEnc?: number
+): boolean;
+
+export class CipherHandle {
+  update(data: ArrayBuffer | ArrayBufferView): ArrayBuffer;
+  final(): ArrayBuffer;
+  setAAD(data: ArrayBuffer | ArrayBufferView, plaintextLength?: number): void;
+  setAutoPadding(autoPadding: boolean): void;
+  getAuthTag(): ArrayBuffer | undefined;
+  setAuthTag(tag: ArrayBuffer | ArrayBufferView): void;
+}
+
+export class AeadHandle {
+  update(data: ArrayBuffer | ArrayBufferView): ArrayBuffer;
+  final(): ArrayBuffer;
+  setAAD(data: ArrayBuffer | ArrayBufferView, plaintextLength?: number): void;
+  setAutoPadding(autoPadding: boolean): void;
+  getAuthTag(): ArrayBuffer | undefined;
+  setAuthTag(tag: ArrayBuffer | ArrayBufferView): void;
+}
+
+export type CipherMode = {
+  CIPHER: 0;
+  DECIPHER: 1;
+};
+
+export function newHandle(
+  mode: (typeof CipherMode)[keyof typeof CipherMode],
+  algorithm: string,
+  key: CryptoKey,
+  iv: ArrayBuffer | ArrayBufferView,
+  authTagLength?: number
+): CipherHandle | AeadHandle;
+export interface PublicPrivateCipherOptions {
+  padding: number;
+  oaepHash: string;
+  oaepLabel: ArrayBuffer | ArrayBufferView | undefined;
+}
+
+export function publicEncrypt(
+  key: CryptoKey,
+  buffer: ArrayBuffer | ArrayBufferView,
+  options: PublicPrivateCipherOptions
+): Buffer;
+export function publicDecrypt(
+  key: CryptoKey,
+  buffer: ArrayBuffer | ArrayBufferView,
+  options: PublicPrivateCipherOptions
+): Buffer;
+export function privateEncrypt(
+  key: CryptoKey,
+  buffer: ArrayBuffer | ArrayBufferView,
+  options: PublicPrivateCipherOptions
+): Buffer;
+export function privateDecrypt(
+  key: CryptoKey,
+  buffer: ArrayBuffer | ArrayBufferView,
+  options: PublicPrivateCipherOptions
+): Buffer;
+
+interface CipherInfo {
+  name: string;
+  nid: number;
+  blockSize?: number;
+  ivLength?: number;
+  keyLength: number;
+  mode:
+    | 'cbc'
+    | 'ccm'
+    | 'cfb'
+    | 'ctr'
+    | 'ecb'
+    | 'gcm'
+    | 'ocb'
+    | 'ofb'
+    | 'stream'
+    | 'wrap'
+    | 'xts';
+}
+
+interface GetCipherInfoOptions {
+  ivLength?: number;
+  keyLength?: number;
+}
+
+export function getCipherInfo(
+  nameOrId: string | number,
+  options: GetCipherInfoOptions
+): CipherInfo | undefined;
+
+export function getCiphers(): string[];
 
 export type ArrayLike = ArrayBuffer | string | Buffer | ArrayBufferView;
 
 export class HmacHandle {
-  public constructor(algorithm: string, key: ArrayLike | CryptoKey);
-  public update(data: Buffer | ArrayBufferView): number;
-  public digest(): ArrayBuffer;
+  constructor(algorithm: string, key: ArrayLike | CryptoKey);
+  update(data: Buffer | ArrayBufferView): number;
+  digest(): ArrayBuffer;
 }
 
 // hkdf
@@ -112,6 +247,40 @@ export function createPrivateKey(
 export function createPublicKey(
   key: InnerCreateAsymmetricKeyOptions
 ): CryptoKey;
+
+export interface RsaKeyPairOptions {
+  type: string;
+  modulusLength: number;
+  publicExponent: number;
+  saltLength?: number;
+  hashAlgorithm?: string;
+  mgf1HashAlgorithm?: string;
+}
+
+export interface DsaKeyPairOptions {
+  modulusLength: number;
+  divisorLength: number;
+}
+
+export interface EcKeyPairOptions {
+  namedCurve: string;
+  paramEncoding: ParamEncoding;
+}
+
+export interface EdKeyPairOptions {
+  type: string;
+}
+
+export interface DhKeyPairOptions {
+  primeOrGroup: BufferSource | number | string;
+  generator?: number | undefined;
+}
+
+export function generateRsaKeyPair(options: RsaKeyPairOptions): CryptoKeyPair;
+export function generateDsaKeyPair(options: DsaKeyPairOptions): CryptoKeyPair;
+export function generateEcKeyPair(options: EcKeyPairOptions): CryptoKeyPair;
+export function generateEdKeyPair(options: EdKeyPairOptions): CryptoKeyPair;
+export function generateDhKeyPair(options: DhKeyPairOptions): CryptoKeyPair;
 
 // Spkac
 export function verifySpkac(input: ArrayBufferView | ArrayBuffer): boolean;
@@ -206,14 +375,7 @@ export type SecretKeyFormat = 'buffer' | 'jwk';
 export type AsymmetricKeyFormat = 'pem' | 'der' | 'jwk';
 export type PublicKeyEncoding = 'pkcs1' | 'spki';
 export type PrivateKeyEncoding = 'pkcs1' | 'pkcs8' | 'sec1';
-export type AsymmetricKeyType =
-  | 'rsa'
-  | 'rsa-pss'
-  | 'dsa'
-  | 'ec'
-  | 'x25519'
-  | 'ed25519'
-  | 'dh';
+export type AsymmetricKeyType = 'rsa' | 'ec' | 'x25519' | 'ed25519' | 'dh';
 export type SecretKeyType = 'hmac' | 'aes';
 export type ParamEncoding = 'named' | 'explicit';
 
@@ -261,19 +423,27 @@ export interface AsymmetricKeyDetails {
   namedCurve?: string;
 }
 
+// The user-provided options passed to createPrivateKey or createPublicKey.
+// This will be processed into an InnerCreateAsymmetricKeyOptions.
 export interface CreateAsymmetricKeyOptions {
-  key: string | ArrayBuffer | ArrayBufferView | JsonWebKey;
+  key: string | ArrayBuffer | ArrayBufferView | JsonWebKey | null | undefined;
   format?: AsymmetricKeyFormat;
   type?: PublicKeyEncoding | PrivateKeyEncoding;
-  passphrase?: string | Uint8Array;
+  passphrase?: string | Uint8Array | Buffer;
   encoding?: string;
 }
 
+// The processed key options. The key property will be one of either
+// an ArrayBuffer, an ArrayBufferView, a JWK, or a CryptoKey. The
+// format and type options will be validated to known good values,
+// and the passphrase will either be undefined or an ArrayBufferView.
 export interface InnerCreateAsymmetricKeyOptions {
-  key?: ArrayBuffer | ArrayBufferView | JsonWebKey | CryptoKey;
-  format?: AsymmetricKeyFormat;
-  type?: PublicKeyEncoding | PrivateKeyEncoding;
-  passphrase?: Uint8Array;
+  // CryptoKey is only used when importing a public key derived from
+  // an existing private key.
+  key: ArrayBuffer | ArrayBufferView | JsonWebKey | CryptoKey;
+  format: AsymmetricKeyFormat;
+  type: PublicKeyEncoding | PrivateKeyEncoding | undefined;
+  passphrase: Buffer | ArrayBuffer | ArrayBufferView | undefined;
 }
 
 export interface GenerateKeyOptions {
@@ -283,7 +453,9 @@ export interface GenerateKeyOptions {
 export interface GenerateKeyPairOptions {
   modulusLength?: number;
   publicExponent?: number | bigint;
+  hash?: string;
   hashAlgorithm?: string;
+  mgf1Hash?: string;
   mgf1HashAlgorithm?: string;
   saltLength?: number;
   divisorLength?: number;
@@ -291,6 +463,7 @@ export interface GenerateKeyPairOptions {
   prime?: Uint8Array;
   primeLength?: number;
   generator?: number;
+  group?: string;
   groupName?: string;
   paramEncoding?: ParamEncoding;
   publicKeyEncoding?: PublicKeyExportOptions;
@@ -299,21 +472,36 @@ export interface GenerateKeyPairOptions {
 
 // DiffieHellman
 export class DiffieHellmanHandle {
-  public constructor(
+  constructor(
     sizeOrKey: number | ArrayBuffer | ArrayBufferView,
     generator: number | ArrayBuffer | ArrayBufferView
   );
-  public setPublicKey(data: ArrayBuffer | ArrayBufferView | Buffer): void;
-  public setPrivateKey(data: ArrayBuffer | ArrayBufferView | Buffer): void;
-  public getPublicKey(): ArrayBuffer;
-  public getPrivateKey(): ArrayBuffer;
-  public getGenerator(): ArrayBuffer;
-  public getPrime(): ArrayBuffer;
+  setPublicKey(data: ArrayBuffer | ArrayBufferView | Buffer): void;
+  setPrivateKey(data: ArrayBuffer | ArrayBufferView | Buffer): void;
+  getPublicKey(): ArrayBuffer;
+  getPrivateKey(): ArrayBuffer;
+  getGenerator(): ArrayBuffer;
+  getPrime(): ArrayBuffer;
 
-  public computeSecret(key: ArrayBuffer | ArrayBufferView): ArrayBuffer;
-  public generateKeys(): ArrayBuffer;
+  computeSecret(key: ArrayBuffer | ArrayBufferView): ArrayBuffer;
+  generateKeys(): ArrayBuffer;
 
-  public getVerifyError(): number;
+  getVerifyError(): number;
+}
+
+export type ECDHFormat = 'compressed' | 'uncompressed' | 'hybrid';
+export class ECDHHandle {
+  constructor(curveName: string);
+  computeSecret(otherPublicKey: ArrayBufferView): ArrayBuffer;
+  generateKeys(): ArrayBuffer;
+  getPrivateKey(): ArrayBuffer;
+  getPublicKey(format: ECDHFormat): ArrayBuffer;
+  setPrivateKey(key: ArrayBufferView): void;
+  static convertKey(
+    key: ArrayBufferView,
+    curveName: string,
+    format: ECDHFormat
+  ): ArrayBuffer;
 }
 
 export function DiffieHellmanGroupHandle(name: string): DiffieHellmanHandle;

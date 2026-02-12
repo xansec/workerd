@@ -23,7 +23,13 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-import { strictEqual, throws, ok as assert, match } from 'node:assert';
+import {
+  strictEqual,
+  throws,
+  ok as assert,
+  match,
+  deepStrictEqual,
+} from 'node:assert';
 import {
   domainToASCII,
   domainToUnicode,
@@ -307,7 +313,7 @@ export const testPathToFileURL = {
         }
       );
 
-      // UNC paths on posix are considered a single path that has backslashes:
+      // UNC paths on Posix are considered a single path that has backslashes:
       const fileURL = pathToFileURL('\\\\nas\\share\\path.txt').href;
       match(fileURL, /file:\/\/.+%5C%5Cnas%5Cshare%5Cpath\.txt$/);
     }
@@ -476,5 +482,36 @@ export const testPathToFileURL = {
         });
       }
     }
+  },
+};
+
+// Regression test for: https://github.com/cloudflare/workerd/issues/5144
+export const testUrlPattern = {
+  async test(ctrl, env) {
+    const url = 'https://example.com/??';
+    const pattern = new URLPattern({ hostname: '*' });
+    const obj = new URL(url);
+    deepStrictEqual(pattern.exec(obj), {
+      inputs: [
+        {
+          protocol: 'https:',
+          username: '',
+          password: '',
+          hostname: 'example.com',
+          port: '',
+          pathname: '/',
+          search: '??',
+          hash: '',
+        },
+      ],
+      protocol: { input: 'https', groups: { 0: 'https' } },
+      username: { input: '', groups: { 0: '' } },
+      password: { input: '', groups: { 0: '' } },
+      hostname: { input: 'example.com', groups: { 0: 'example.com' } },
+      port: { input: '', groups: { 0: '' } },
+      pathname: { input: '/', groups: { 0: '/' } },
+      search: { input: '', groups: { 0: '' } },
+      hash: { input: '', groups: { 0: '' } },
+    });
   },
 };

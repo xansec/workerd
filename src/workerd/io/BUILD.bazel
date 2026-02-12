@@ -1,19 +1,8 @@
-load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
-load("//:build/capnp_embed.bzl", "capnp_embed")
 load("//:build/kj_test.bzl", "kj_test")
 load("//:build/wd_capnp_library.bzl", "wd_capnp_library")
+load("//:build/wd_cc_embed.bzl", "wd_cc_embed")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
-
-# Flag to enable WebGPU support via the Dawn library
-bool_flag(
-    name = "enable_experimental_webgpu",
-    build_setting_default = False,
-)
-
-config_setting(
-    name = "set_enable_experimental_webgpu",
-    flag_values = {"enable_experimental_webgpu": "True"},
-)
+load("//:build/wd_test.bzl", "wd_test")
 
 # TODO(cleanup): Split up into smaller targets, although this target is already relatively small and
 # not encumbered with many dependencies.
@@ -37,17 +26,6 @@ wd_cc_library(
 )
 
 wd_cc_library(
-    name = "trace-stream",
-    srcs = ["trace-stream.c++"],
-    hdrs = ["trace-stream.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":io",
-        "//src/workerd/util:completion-membrane",
-    ],
-)
-
-wd_cc_library(
     name = "io",
     # HACK: Currently, the `io` and `api` packages are interdependent. We fold all the sources
     #   from `api` into `io`. In principle, it should be possible to pull them apart so `api`
@@ -56,39 +34,51 @@ wd_cc_library(
     # TODO(cleanup): Fix this.
     srcs = [
         "compatibility-date.c++",
+        "external-pusher.c++",
         "features.c++",
-        "frankenvalue.c++",
         "hibernation-manager.c++",
+        "io-channels.c++",
         "io-context.c++",
         "io-own.c++",
         "io-util.c++",
+        "trace-stream.c++",
+        "tracer.c++",
         "worker.c++",
-    ] + ["//src/workerd/api:srcs"] + select({
-        ":set_enable_experimental_webgpu": ["//src/workerd/api/gpu:srcs"],
-        "//conditions:default": [],
-    }),
+        "worker-fs.c++",
+    ] + ["//src/workerd/api:srcs"],
     hdrs = [
         "compatibility-date.h",
-        "features.h",
-        "frankenvalue.h",
+        "external-pusher.h",
         "hibernation-manager.h",
         "io-channels.h",
         "io-context.h",
         "io-own.h",
         "io-util.h",
-        "promise-wrapper.h",
+        "trace-stream.h",
+        "tracer.h",
         "worker.h",
-    ] + ["//src/workerd/api:hdrs"] + select({
-        ":set_enable_experimental_webgpu": ["//src/workerd/api/gpu:hdrs"],
-        "//conditions:default": [],
-    }),
-    defines = select({
-        ":set_enable_experimental_webgpu": ["WORKERD_EXPERIMENTAL_ENABLE_WEBGPU"],
-        "//conditions:default": [],
+        "worker-fs.h",
+    ] + ["//src/workerd/api:hdrs"],
+    # global CPU-specific options are inconvenient to specify with bazel – just set the options we
+    # need for CRC32C in this target for now.
+    copts = select({
+        "@platforms//cpu:aarch64": [
+            "-mcrc",
+        ],
+        "@platforms//cpu:x86_64": [
+            "-msse4.2",
+        ],
     }),
     implementation_deps = [
+        "//src/workerd/api:crypto-crc-impl",
+        "//src/workerd/api:data-url",
+        "//src/workerd/api/node:exceptions",
+        "//src/workerd/util:completion-membrane",
+        "//src/workerd/util:entropy",
         "//src/workerd/util:perfetto",
         "//src/workerd/util:string-buffer",
+        "//src/workerd/util:strings",
+        "//src/workerd/util:uuid",
         "@capnp-cpp//src/kj/compat:kj-brotli",
         "@capnp-cpp//src/kj/compat:kj-gzip",
         "@nbytes",
@@ -100,35 +90,105 @@ wd_cc_library(
         ":actor-id",
         ":actor-storage_capnp",
         ":cdp_capnp",
-        ":frankenvalue_capnp",
+        ":container_capnp",
+        ":features",
+        ":frankenvalue",
         ":io-gate",
         ":io-helpers",
         ":limit-enforcer",
         ":observer",
-        ":supported-compatibility-date_capnp",
+        ":supported-compatibility-date",
         ":trace",
         ":worker-interface",
-        "//src/cloudflare",
-        "//src/node",
+        ":worker-source",
+        "//src/rust/cxx-integration",
         "//src/workerd/api:analytics-engine_capnp",
-        "//src/workerd/api:data-url",
         "//src/workerd/api:deferred-proxy",
         "//src/workerd/api:encoding",
+        "//src/workerd/api:fuzzilli",
+        "//src/workerd/api:hibernation-event-params",
         "//src/workerd/api:url",
         "//src/workerd/jsg",
-        "//src/workerd/util:autogate",
-        "//src/workerd/util:completion-membrane",
+        "//src/workerd/jsg:inspector",
+        "//src/workerd/jsg:script",
+        "//src/workerd/util:checked-queue",
+        "//src/workerd/util:exception",
+        "//src/workerd/util:header-validation",
+        "//src/workerd/util:immediate-crash",
+        "//src/workerd/util:ring-buffer",
+        "//src/workerd/util:small-set",
         "//src/workerd/util:sqlite",
-        "//src/workerd/util:thread-scopes",
-        "//src/workerd/util:uuid",
+        "//src/workerd/util:state-machine",
+        "//src/workerd/util:strong-bool",
         "@capnp-cpp//src/capnp:capnp-rpc",
         "@capnp-cpp//src/capnp/compat:http-over-capnp",
         "@capnp-cpp//src/kj:kj-async",
+        "@ncrypto",
         "@ssl",
-    ] + select({
-        ":set_enable_experimental_webgpu": ["@dawn"],
-        "//conditions:default": [],
-    }),
+    ],
+)
+
+# Headers only target to avoid having circular dependencies.
+wd_cc_library(
+    name = "features",
+    hdrs = ["features.h"],
+    implementation_deps = [
+        "//src/workerd/jsg",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":compatibility-date_capnp",
+    ],
+)
+
+wd_cc_library(
+    name = "worker-modules",
+    srcs = ["worker-modules.c++"],
+    hdrs = ["worker-modules.h"],
+    implementation_deps = [
+        "//src/pyodide:pyodide_static",
+        "//src/workerd/api:pyodide",
+        "//src/workerd/api/node",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":io",
+        "//src/pyodide:python-entrypoint",
+        "//src/workerd/api:commonjs",
+        "//src/workerd/api:rtti",
+        "//src/workerd/jsg",
+        "//src/workerd/util:strong-bool",
+    ],
+)
+
+wd_cc_library(
+    name = "bundle-fs",
+    srcs = ["bundle-fs.c++"],
+    hdrs = ["bundle-fs.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":io",
+    ],
+)
+
+wd_cc_library(
+    name = "promise-wrapper",
+    hdrs = ["promise-wrapper.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":io",
+        "//src/workerd/jsg",
+    ],
+)
+
+wd_cc_library(
+    name = "worker-source",
+    hdrs = ["worker-source.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/rust/cxx-integration",
+        "@capnp-cpp//src/capnp",
+    ],
 )
 
 # TODO(cleanup): Split this up further.
@@ -144,14 +204,13 @@ wd_cc_library(
         "actor-sqlite.h",
         "actor-storage.h",
     ],
-    implementation_deps = [
-        "@sqlite3",
-    ],
     visibility = ["//visibility:public"],
     deps = [
         ":actor-storage_capnp",
         ":io-gate",
+        ":trace",
         "//src/workerd/jsg:exception",
+        "//src/workerd/util:autogate",
         "//src/workerd/util:duration-exceeded-logger",
         "//src/workerd/util:sqlite",
         "@capnp-cpp//src/capnp:capnp-rpc",
@@ -160,10 +219,23 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "frankenvalue",
+    srcs = ["frankenvalue.c++"],
+    hdrs = ["frankenvalue.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":frankenvalue_capnp",
+        "//src/workerd/jsg",
+        "@capnp-cpp//src/capnp:capnpc",
+    ],
+)
+
+wd_cc_library(
     name = "trace",
     srcs = ["trace.c++"],
     hdrs = ["trace.h"],
     implementation_deps = [
+        "//src/workerd/util:entropy",
         "//src/workerd/util:thread-scopes",
     ],
     visibility = ["//visibility:public"],
@@ -171,11 +243,9 @@ wd_cc_library(
         ":trace_capnp",
         ":worker-interface_capnp",
         "//src/workerd/jsg:memory-tracker",
-        "//src/workerd/util",
         "//src/workerd/util:own-util",
         "@capnp-cpp//src/capnp:capnp-rpc",
         "@capnp-cpp//src/capnp:capnpc",
-        "@capnp-cpp//src/kj:kj-async",
         "@capnp-cpp//src/kj/compat:kj-http",
         "@ssl",
     ],
@@ -185,11 +255,13 @@ wd_cc_library(
     name = "observer",
     srcs = ["observer.c++"],
     hdrs = ["observer.h"],
+    implementation_deps = [
+        ":worker-interface",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":features_capnp",
         ":trace",
-        ":worker-interface",
         "//src/workerd/jsg:observer",
         "//src/workerd/util:sqlite",
     ],
@@ -201,6 +273,7 @@ wd_cc_library(
     hdrs = ["io-gate.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":trace",
         "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj:kj-async",
     ],
@@ -211,7 +284,7 @@ wd_cc_library(
     hdrs = ["limit-enforcer.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":observer",
+        ":outcome_capnp",
         "//src/workerd/jsg",
     ],
 )
@@ -220,10 +293,13 @@ wd_cc_library(
     name = "worker-entrypoint",
     srcs = ["worker-entrypoint.c++"],
     hdrs = ["worker-entrypoint.h"],
+    implementation_deps = [
+        "//src/workerd/util:perfetto",
+        "//src/workerd/util:strings",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":io",
-        "//src/workerd/util:perfetto",
     ],
 )
 
@@ -234,7 +310,9 @@ wd_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":frankenvalue_capnp",
+        ":trace",
         ":worker-interface_capnp",
+        "//src/workerd/util",
         "@capnp-cpp//src/capnp:capnp-rpc",
         "@capnp-cpp//src/capnp:capnpc",
         "@capnp-cpp//src/capnp/compat:http-over-capnp",
@@ -257,23 +335,29 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
-capnp_embed(
-    name = "trimmed-supported-compatibility-date",
-    src = ":trimmed-supported-compatibility-date-gen",
+# Newest compatibility date that can safely be set using code compiled from this repo. Trying to
+# run a Worker with a newer compatibility date than this will fail.
+#
+# This should be updated to the current date on a regular basis. The reason this exists is so that
+# if you build an old version of the code and try to run a new Worker with it, you get an
+# appropriate error, rather than have the code run with the wrong compatibility mode.
+#
+# Note that the production Cloudflare Workers upload API always accepts any date up to the current
+# date regardless of this constant, on the assumption that Cloudflare is always running the latest
+# version of the code. This constant is more to protect users who are self-hosting the runtime and
+# could be running an older version.
+wd_cc_embed(
+    name = "supported-compatibility-date",
+    src = ":trimmed-supported-compatibility-date.txt",
+    base_name = "supported-compatibility-date",
 )
 
 wd_capnp_library(src = "cdp.capnp")
 
 wd_capnp_library(
-    src = "supported-compatibility-date.capnp",
-    deps = [
-        ":trimmed-supported-compatibility-date",
-    ],
-)
-
-wd_capnp_library(
     src = "worker-interface.capnp",
     deps = [
+        ":frankenvalue_capnp",
         ":outcome_capnp",
         ":script-version_capnp",
         ":trace_capnp",
@@ -294,6 +378,13 @@ wd_capnp_library(src = "compatibility-date.capnp")
 wd_capnp_library(src = "features.capnp")
 
 wd_capnp_library(src = "frankenvalue.capnp")
+
+wd_capnp_library(
+    src = "container.capnp",
+    deps = [
+        "@capnp-cpp//src/capnp/compat:byte-stream_capnp",
+    ],
+)
 
 kj_test(
     src = "io-gate-test.c++",
@@ -319,12 +410,18 @@ kj_test(
         ":io-gate",
         "//src/workerd/util:test",
         "//src/workerd/util:test-util",
+        "@sqlite3",
     ],
 )
 
 kj_test(
     src = "promise-wrapper-test.c++",
-    deps = [":io"],
+    # Omitting coverage because it takes a really long time executing it.
+    tags = ["no-coverage"],
+    deps = [
+        ":io",
+        ":promise-wrapper",
+    ],
 )
 
 kj_test(
@@ -339,6 +436,8 @@ kj_test(
     src = "observer-test.c++",
     deps = [
         ":observer",
+        "//src/workerd/io:worker-interface",
+        "//src/workerd/util:strings",
         "@capnp-cpp//src/capnp:capnpc",
     ],
 )
@@ -354,6 +453,28 @@ kj_test(
 kj_test(
     src = "frankenvalue-test.c++",
     deps = [
+        ":frankenvalue",
+    ],
+)
+
+kj_test(
+    src = "worker-fs-test.c++",
+    deps = [
         ":io",
+    ],
+)
+
+wd_test(
+    src = "io-context-test.wd-test",
+    args = ["--experimental"],
+    data = ["io-context-test.js"],
+)
+
+kj_test(
+    src = "bundle-fs-test.c++",
+    deps = [
+        ":bundle-fs",
+        ":io",
+        "//src/workerd/tests:test-fixture",
     ],
 )

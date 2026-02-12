@@ -1,3 +1,6 @@
+// NOTE: This file is a somewhat duplicate of src/rust/api/dns.rs, and will be removed once
+// autogate is unnecessary.
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -164,6 +167,7 @@ pub fn parse_naptr_record(record: &str) -> Result<ffi::NaptrRecord, DnsParserErr
 }
 
 /// Replacement values needs to be parsed accordingly.
+///
 /// It has a similar characteristic to CAA and NAPTR records whereas
 /// first character contains the length of the input, and the second character
 /// is the starting index of the substring. We need to continue parsing until there

@@ -9,8 +9,9 @@
 
 #include <workerd/io/io-context.h>
 #include <workerd/io/observer.h>
+#include <workerd/util/ring-buffer.h>
 
-#include <list>
+#include <kj/refcount.h>
 
 namespace workerd::api {
 
@@ -61,6 +62,9 @@ class ReadableStreamInternalController: public ReadableStreamController {
   kj::Maybe<jsg::Promise<ReadResult>> read(
       jsg::Lock& js, kj::Maybe<ByobOptions> byobOptions) override;
 
+  kj::Maybe<jsg::Promise<DrainingReadResult>> drainingRead(
+      jsg::Lock& js, size_t maxRead = kj::maxValue) override;
+
   jsg::Promise<void> pipeTo(
       jsg::Lock& js, WritableStreamController& destination, PipeToOptions options) override;
 
@@ -92,7 +96,7 @@ class ReadableStreamInternalController: public ReadableStreamController {
   void releaseReader(Reader& reader, kj::Maybe<jsg::Lock&> maybeJs) override;
   // See the comment for releaseReader in common.h for details on the use of maybeJs
 
-  kj::Maybe<PipeController&> tryPipeLock(jsg::Ref<WritableStream> destination) override;
+  kj::Maybe<PipeController&> tryPipeLock() override;
 
   void visitForGc(jsg::GcVisitor& visitor) override;
 
@@ -123,9 +127,7 @@ class ReadableStreamInternalController: public ReadableStreamController {
 
   class PipeLocked: public PipeController {
    public:
-    PipeLocked(ReadableStreamInternalController& inner, jsg::Ref<WritableStream> ref)
-        : inner(inner),
-          ref(kj::mv(ref)) {}
+    PipeLocked(ReadableStreamInternalController& inner): inner(inner) {}
 
     bool isClosed() override;
 
@@ -143,17 +145,8 @@ class ReadableStreamInternalController: public ReadableStreamController {
 
     jsg::Promise<ReadResult> read(jsg::Lock& js) override;
 
-    void visitForGc(jsg::GcVisitor& visitor) {
-      visitor.visit(ref);
-    }
-
-    kj::StringPtr jsgGetMemoryName() const;
-    size_t jsgGetMemorySelfSize() const;
-    void jsgGetMemoryInfo(jsg::MemoryTracker& info) const;
-
    private:
     ReadableStreamInternalController& inner;
-    jsg::Ref<WritableStream> ref;
   };
 
   kj::Maybe<ReadableStream&> owner;
@@ -287,8 +280,6 @@ class WritableStreamInternalController: public WritableStreamController {
   kj::Maybe<kj::Own<PendingAbort>> maybePendingAbort;
 
   uint64_t currentWriteBufferSize = 0;
-  bool warnAboutExcessiveBackpressure = true;
-  size_t excessiveBackpressureWarningCount = 0;
 
   // The highWaterMark is the total amount of data currently buffered in
   // the controller waiting to be flushed out to the underlying WritableStreamSink.
@@ -305,8 +296,7 @@ class WritableStreamInternalController: public WritableStreamController {
   // because the socket is currently being closed.
   bool isPendingClosure = false;
 
-  void increaseCurrentWriteBufferSize(jsg::Lock& js, uint64_t amount);
-  void decreaseCurrentWriteBufferSize(jsg::Lock& js, uint64_t amount);
+  void adjustWriteBufferSize(jsg::Lock& js, int64_t amount);
   void updateBackpressure(jsg::Lock& js, bool backpressure);
 
   struct Write {
@@ -335,121 +325,129 @@ class WritableStreamInternalController: public WritableStreamController {
     }
   };
   struct Pipe {
-    WritableStreamInternalController& parent;
-    ReadableStreamController::PipeController& source;
-    kj::Maybe<jsg::Promise<void>::Resolver> promise;
-    bool preventAbort;
-    bool preventClose;
-    bool preventCancel;
-    kj::Maybe<jsg::Ref<AbortSignal>> maybeSignal;
+    // PipeState is ref-counted so that it can be safely captured by lambdas in pipeLoop().
+    // When drain() destroys the Pipe, the state survives as long as pending callbacks need it.
+    // The `aborted` flag is set when the Pipe is destroyed.
+    struct State: public kj::Refcounted {
+      WritableStreamInternalController& parent;
+      ReadableStreamController::PipeController& source;
+      kj::Maybe<jsg::Promise<void>::Resolver> promise;
+      kj::Maybe<jsg::Ref<AbortSignal>> maybeSignal;
 
-    bool checkSignal(jsg::Lock& js);
-    jsg::Promise<void> pipeLoop(jsg::Lock& js);
-    jsg::Promise<void> write(v8::Local<v8::Value> value);
+      bool preventAbort;
+      bool preventClose;
+      bool preventCancel;
+
+      // True when the Pipe is being destroyed
+      bool aborted = false;
+
+      State(WritableStreamInternalController& parent,
+          ReadableStreamController::PipeController& source,
+          kj::Maybe<jsg::Promise<void>::Resolver> promise,
+          bool preventAbort,
+          bool preventClose,
+          bool preventCancel,
+          kj::Maybe<jsg::Ref<AbortSignal>> maybeSignal)
+          : parent(parent),
+            source(source),
+            promise(kj::mv(promise)),
+            maybeSignal(kj::mv(maybeSignal)),
+            preventAbort(preventAbort),
+            preventClose(preventClose),
+            preventCancel(preventCancel) {}
+
+      bool checkSignal(jsg::Lock& js);
+      jsg::Promise<void> pipeLoop(jsg::Lock& js);
+      jsg::Promise<void> write(v8::Local<v8::Value> value);
+
+      JSG_MEMORY_INFO(State) {
+        tracker.trackField("resolver", promise);
+        tracker.trackField("signal", maybeSignal);
+      }
+    };
+
+    kj::Own<State> state;
+
+    Pipe(WritableStreamInternalController& parent,
+        ReadableStreamController::PipeController& source,
+        kj::Maybe<jsg::Promise<void>::Resolver> promise,
+        bool preventAbort,
+        bool preventClose,
+        bool preventCancel,
+        kj::Maybe<jsg::Ref<AbortSignal>> maybeSignal)
+        : state(kj::refcounted<State>(parent,
+              source,
+              kj::mv(promise),
+              preventAbort,
+              preventClose,
+              preventCancel,
+              kj::mv(maybeSignal))) {}
+
+    ~Pipe() noexcept(false) {
+      state->aborted = true;
+    }
+
+    WritableStreamInternalController& parent() {
+      return state->parent;
+    }
+    ReadableStreamController::PipeController& source() {
+      return state->source;
+    }
+    kj::Maybe<jsg::Promise<void>::Resolver>& promise() {
+      return state->promise;
+    }
+    bool preventAbort() const {
+      return state->preventAbort;
+    }
+    bool preventClose() const {
+      return state->preventClose;
+    }
+    bool preventCancel() const {
+      return state->preventCancel;
+    }
+    kj::Maybe<jsg::Ref<AbortSignal>>& maybeSignal() {
+      return state->maybeSignal;
+    }
+
+    bool checkSignal(jsg::Lock& js) {
+      return state->checkSignal(js);
+    }
+    jsg::Promise<void> pipeLoop(jsg::Lock& js) {
+      return state->pipeLoop(js);
+    }
+    jsg::Promise<void> write(v8::Local<v8::Value> value) {
+      return state->write(value);
+    }
 
     JSG_MEMORY_INFO(Pipe) {
-      tracker.trackField("resolver", promise);
-      tracker.trackField("signal", maybeSignal);
+      tracker.trackField("state", state);
     }
   };
   struct WriteEvent {
     kj::Maybe<IoOwn<kj::Promise<void>>> outputLock;  // must wait for this before actually writing
-    kj::OneOf<Write, Pipe, Close, Flush> event;
+    kj::OneOf<kj::Own<Write>, kj::Own<Pipe>, kj::Own<Close>, kj::Own<Flush>> event;
 
     JSG_MEMORY_INFO(WriteEvent) {
       if (outputLock != kj::none) {
         tracker.trackFieldWithSize("outputLock", sizeof(IoOwn<kj::Promise<void>>));
       }
       KJ_SWITCH_ONEOF(event) {
-        KJ_CASE_ONEOF(w, Write) {
+        KJ_CASE_ONEOF(w, kj::Own<Write>) {
           tracker.trackField("inner", w);
         }
-        KJ_CASE_ONEOF(p, Pipe) {
+        KJ_CASE_ONEOF(p, kj::Own<Pipe>) {
           tracker.trackField("inner", p);
         }
-        KJ_CASE_ONEOF(c, Close) {
+        KJ_CASE_ONEOF(c, kj::Own<Close>) {
           tracker.trackField("inner", c);
         }
-        KJ_CASE_ONEOF(f, Flush) {
+        KJ_CASE_ONEOF(f, kj::Own<Flush>) {
           tracker.trackField("inner", f);
         }
       }
     }
   };
 
-  // We use std::list to keep memory overhead low when there are many streams with no or few pending
-  // events.
-  std::list<WriteEvent> queue;
+  RingBuffer<WriteEvent, 8> queue;
 };
-
-// An implementation of ReadableStreamSource and WritableStreamSink which communicates read and
-// write requests via a OneOf.
-//
-// This class is also used as the implementation of FixedLengthStream, in which case `limit` is
-// non-nullptr.
-class IdentityTransformStreamImpl: public kj::Refcounted,
-                                   public ReadableStreamSource,
-                                   public WritableStreamSink {
-  // TODO(soon): Reimplement this in terms of kj::OneWayPipe, so we can optimize pumpTo().
-
- public:
-  explicit IdentityTransformStreamImpl(kj::Maybe<uint64_t> limit = kj::none): limit(limit) {}
-
-  ~IdentityTransformStreamImpl() noexcept(false) {
-    // Due to the different natures of JS and C++ disposal, there is no point in enforcing the limit
-    // for a FixedLengthStream here.
-    //
-    // 1. Creating but not using a `new FixedLengthStream(n)` should not be an error, and ought not
-    //    to logspam us.
-    // 2. Chances are high that by the time this object gets destroyed, it's too late to tell the
-    //    user about the failure.
-  }
-
-  // ReadableStreamSource implementation -------------------------------------------------
-
-  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override;
-
-  kj::Promise<size_t> tryReadInternal(void* buffer, size_t maxBytes);
-
-  kj::Promise<DeferredProxy<void>> pumpTo(WritableStreamSink& output, bool end) override;
-
-  kj::Maybe<uint64_t> tryGetLength(StreamEncoding encoding) override;
-
-  void cancel(kj::Exception reason) override;
-
-  // WritableStreamSink implementation ---------------------------------------------------
-
-  kj::Promise<void> write(kj::ArrayPtr<const byte> buffer) override;
-
-  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override;
-
-  kj::Promise<void> end() override;
-
-  void abort(kj::Exception reason) override;
-
- private:
-  kj::Promise<size_t> readHelper(kj::ArrayPtr<kj::byte> bytes);
-
-  kj::Promise<void> writeHelper(kj::ArrayPtr<const kj::byte> bytes);
-
-  kj::Maybe<uint64_t> limit;
-
-  struct ReadRequest {
-    kj::ArrayPtr<kj::byte> bytes;
-    // WARNING: `bytes` may be invalid if fulfiller->isWaiting() returns false! (This indicates the
-    //   read was canceled.)
-
-    kj::Own<kj::PromiseFulfiller<size_t>> fulfiller;
-  };
-
-  struct WriteRequest {
-    kj::ArrayPtr<const kj::byte> bytes;
-    kj::Own<kj::PromiseFulfiller<void>> fulfiller;
-  };
-
-  struct Idle {};
-
-  kj::OneOf<Idle, ReadRequest, WriteRequest, kj::Exception, StreamStates::Closed> state = Idle();
-};
-
 }  // namespace workerd::api

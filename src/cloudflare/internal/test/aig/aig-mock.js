@@ -20,6 +20,15 @@ export default {
         );
       }
 
+      if (request.url.endsWith('url/openai')) {
+        return Response.json({
+          result: {
+            url: 'https://gateway.ai.cloudflare.com/v1/account-tag-abc/my-gateway/openai',
+          },
+          success: true,
+        });
+      }
+
       if (request.url.endsWith('logs/500')) {
         return Response.json(
           {
@@ -104,7 +113,11 @@ export default {
     if (request.method === 'POST') {
       const body = await request.json();
 
-      return Response.json({ success: true, result: body });
+      return Response.json({
+        success: true,
+        result: body,
+        headers: Object.fromEntries(request.headers.entries()),
+      });
     }
 
     return Response.json({ success: false }, { status: 500 });

@@ -2,7 +2,6 @@
 
 #include "impl.h"
 #include "keys.h"
-#include "simdutf.h"
 #include "util.h"
 
 #include <openssl/bn.h>
@@ -44,26 +43,6 @@ jsg::BufferSource bioToArray(jsg::Lock& js, BIO* bio) {
   buf.asArrayPtr().copyFrom(aptr.asBytes());
   return jsg::BufferSource(js, kj::mv(buf));
 }
-
-kj::Maybe<jsg::BufferSource> simdutfBase64UrlDecode(jsg::Lock& js, kj::StringPtr input) {
-  auto size = simdutf::maximal_binary_length_from_base64(input.begin(), input.size());
-  ;
-  auto buf = kj::heapArray<kj::byte>(size);
-  auto result = simdutf::base64_to_binary(
-      input.begin(), input.size(), buf.asChars().begin(), simdutf::base64_url);
-  if (result.error != simdutf::SUCCESS) return kj::none;
-  KJ_ASSERT(result.count <= size);
-
-  auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, result.count);
-  auto src = kj::arrayPtr(buf.begin(), result.count);
-  backing.asArrayPtr().copyFrom(src);
-  return jsg::BufferSource(js, kj::mv(backing));
-}
-
-jsg::BufferSource simdutfBase64UrlDecodeChecked(
-    jsg::Lock& js, kj::StringPtr input, kj::StringPtr error) {
-  return JSG_REQUIRE_NONNULL(simdutfBase64UrlDecode(js, input), Error, error);
-}
 }  // namespace
 
 kj::Maybe<Rsa> Rsa::tryGetRsa(const EVP_PKEY* key) {
@@ -90,12 +69,12 @@ jsg::BufferSource Rsa::getPublicExponent(jsg::Lock& js) {
   return KJ_REQUIRE_NONNULL(bignumToArray(js, *e));
 }
 
-CryptoKey::AsymmetricKeyDetails Rsa::getAsymmetricKeyDetail() const {
+CryptoKey::AsymmetricKeyDetails Rsa::getAsymmetricKeyDetail(jsg::Lock& js) const {
   CryptoKey::AsymmetricKeyDetails details;
 
   details.modulusLength = BN_num_bits(n);
   details.publicExponent =
-      JSG_REQUIRE_NONNULL(bignumToArrayPadded(*e), Error, "Failed to extract public exponent");
+      JSG_REQUIRE_NONNULL(bignumToArrayPadded(js, *e), Error, "Failed to extract public exponent");
 
   // TODO(soon): Does BoringSSL not support retrieving RSA_PSS params?
   // if (type == EVP_PKEY_RSA_PSS) {
@@ -165,15 +144,14 @@ jsg::BufferSource Rsa::sign(jsg::Lock& js, const kj::ArrayPtr<const kj::byte> da
         "modulus, consider using a larger key size.");
   }
 
-  auto signature = kj::heapArray<kj::byte>(size);
+  KJ_STACK_ARRAY(kj::byte, signature, size, 256, 256);
   size_t signatureSize = 0;
   OSSLCALL(RSA_decrypt(rsa, &signatureSize, signature.begin(), signature.size(), data.begin(),
       data.size(), RSA_NO_PADDING));
   KJ_ASSERT(signatureSize <= signature.size());
 
   auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, signatureSize);
-  auto src = kj::arrayPtr(signature.begin(), signatureSize);
-  backing.asArrayPtr().copyFrom(src);
+  backing.asArrayPtr().copyFrom(signature.first(signatureSize));
   return jsg::BufferSource(js, kj::mv(backing));
 }
 
@@ -203,7 +181,7 @@ jsg::BufferSource Rsa::cipher(jsg::Lock& js,
 
     JSG_REQUIRE(labelCopy != nullptr, DOMOperationError,
         "Failed to allocate space for RSA-OAEP label copy", tryDescribeOpensslErrors());
-    std::copy(l.begin(), l.end(), labelCopy);
+    kj::arrayPtr(labelCopy, l.size()).copyFrom(l.asArrayPtr());
 
     // EVP_PKEY_CTX_set0_rsa_oaep_label below takes ownership of the buffer passed in (must have
     // been OPENSSL_malloc-allocated).
@@ -463,7 +441,7 @@ void Rsa::validateRsaParams(
   // Now check the public exponent for allow-listed values.
   // First see if we can convert the public exponent to an unsigned number. Unfortunately OpenSSL
   // doesn't have convenient APIs to do this (since these are bignums) so we have to do it by hand.
-  // Since the problematic BIGNUMs are within the range of an unsigned int (& technicall an
+  // Since the problematic BIGNUMs are within the range of an unsigned int (& technically an
   // unsigned short) we can treat an out-of-range issue as valid input.
   KJ_IF_SOME(v, fromBignum<unsigned>(publicExponent)) {
     if (!isImport) {
@@ -527,8 +505,8 @@ class RsaBase: public AsymmetricKeyCryptoKeyImpl {
         DOMInvalidAccessError, "Cannot export \"", getAlgorithmName(), "\" in \"raw\" format.");
   }
 
-  CryptoKey::AsymmetricKeyDetails getAsymmetricKeyDetail() const override {
-    return KJ_ASSERT_NONNULL(Rsa::tryGetRsa(getEvpPkey())).getAsymmetricKeyDetail();
+  CryptoKey::AsymmetricKeyDetails getAsymmetricKeyDetail(jsg::Lock& js) const override {
+    return KJ_ASSERT_NONNULL(Rsa::tryGetRsa(getEvpPkey())).getAsymmetricKeyDetail(js);
   }
 
   virtual kj::String jwkHashAlgorithmName() const = 0;
@@ -733,23 +711,23 @@ CryptoKeyPair generateRsaPair(jsg::Lock& js,
     .usages = usages & CryptoKeyUsageSet::privateKeyMask(),
   };
 
-  static constexpr auto createPair = [](kj::Own<CryptoKey::Impl> publicKey,
+  static constexpr auto createPair = [](jsg::Lock& js, kj::Own<CryptoKey::Impl> publicKey,
                                          kj::Own<CryptoKey::Impl> privateKey) {
-    return CryptoKeyPair{.publicKey = jsg::alloc<CryptoKey>(kj::mv(publicKey)),
-      .privateKey = jsg::alloc<CryptoKey>(kj::mv(privateKey))};
+    return CryptoKeyPair{.publicKey = js.alloc<CryptoKey>(kj::mv(publicKey)),
+      .privateKey = js.alloc<CryptoKey>(kj::mv(privateKey))};
   };
 
   if (normalizedName == "RSASSA-PKCS1-v1_5") {
-    return createPair(
+    return createPair(js,
         kj::heap<RsassaPkcs1V15Key>(kj::mv(publicKeyData), kj::mv(keyAlgorithm), true),
         kj::heap<RsassaPkcs1V15Key>(
             kj::mv(privateKeyData), kj::mv(privateKeyAlgorithm), privateKeyExtractable));
   } else if (normalizedName == "RSA-PSS") {
-    return createPair(kj::heap<RsaPssKey>(kj::mv(publicKeyData), kj::mv(keyAlgorithm), true),
+    return createPair(js, kj::heap<RsaPssKey>(kj::mv(publicKeyData), kj::mv(keyAlgorithm), true),
         kj::heap<RsaPssKey>(
             kj::mv(privateKeyData), kj::mv(privateKeyAlgorithm), privateKeyExtractable));
   } else if (normalizedName == "RSA-OAEP") {
-    return createPair(kj::heap<RsaOaepKey>(kj::mv(publicKeyData), kj::mv(keyAlgorithm), true),
+    return createPair(js, kj::heap<RsaOaepKey>(kj::mv(publicKeyData), kj::mv(keyAlgorithm), true),
         kj::heap<RsaOaepKey>(
             kj::mv(privateKeyData), kj::mv(privateKeyAlgorithm), privateKeyExtractable));
   }
@@ -847,8 +825,8 @@ kj::OneOf<jsg::Ref<CryptoKey>, CryptoKeyPair> CryptoKey::Impl::generateRsa(jsg::
   auto usages = CryptoKeyUsageSet::validate(
       normalizedName, CryptoKeyUsageSet::Context::generate, keyUsages, validUsages);
 
-  Rsa::validateRsaParams(js, modulusLength, publicExponent.asPtr());
-  // boringssl silently uses (modulusLength & ~127) for the key size, i.e. it rounds down to the
+  Rsa::validateRsaParams(js, modulusLength, publicExponent.asArrayPtr());
+  // BoringSSL silently uses (modulusLength & ~127) for the key size, i.e. it rounds down to the
   // closest multiple of 128 bits. This can easily cause confusion when non-standard key sizes are
   // requested.
   // The `modulusLength` field of the resulting CryptoKey will be incorrect when the compat flag
@@ -857,11 +835,11 @@ kj::OneOf<jsg::Ref<CryptoKey>, CryptoKeyPair> CryptoKey::Impl::generateRsa(jsg::
   JSG_REQUIRE(!(FeatureFlags::get(js).getStrictCrypto() && (modulusLength & 127)),
       DOMOperationError, "Can't generate key: RSA key size is required to be a multiple of 128");
 
-  auto bnExponent = JSG_REQUIRE_NONNULL(
-      toBignum(publicExponent), InternalDOMOperationError, "Error setting up RSA keygen.");
+  auto bnExponent = JSG_REQUIRE_NONNULL(toBignum(publicExponent.asArrayPtr()),
+      InternalDOMOperationError, "Error setting up RSA keygen.");
 
   auto rsaPrivateKey = OSSL_NEW(RSA);
-  OSSLCALL(RSA_generate_key_ex(rsaPrivateKey, modulusLength, bnExponent.get(), 0));
+  OSSLCALL(RSA_generate_key_ex(rsaPrivateKey, modulusLength, bnExponent.get(), nullptr));
   auto privateEvpPKey = OSSL_NEW(EVP_PKEY);
   OSSLCALL(EVP_PKEY_set1_RSA(privateEvpPKey.get(), rsaPrivateKey.get()));
   kj::Own<RSA> rsaPublicKey = OSSLCALL_OWN(RSA, RSAPublicKey_dup(rsaPrivateKey.get()),
@@ -908,47 +886,43 @@ kj::Own<CryptoKey::Impl> CryptoKey::Impl::importRsa(jsg::Lock& js,
     KJ_IF_SOME(alg, keyDataJwk.alg) {
       // If this JWK specifies an algorithm, make sure it jives with the hash we were passed via
       // importKey().
-      static const std::map<kj::StringPtr, const EVP_MD*> rsaShaAlgorithms{
+      static const std::map<kj::StringPtr, const EVP_MD*> knownRsaAlgorithms{
         {"RS1", EVP_sha1()},
         {"RS256", EVP_sha256()},
         {"RS384", EVP_sha384()},
         {"RS512", EVP_sha512()},
-      };
-      static const std::map<kj::StringPtr, const EVP_MD*> rsaPssAlgorithms{
         {"PS1", EVP_sha1()},
         {"PS256", EVP_sha256()},
         {"PS384", EVP_sha384()},
         {"PS512", EVP_sha512()},
-      };
-      static const std::map<kj::StringPtr, const EVP_MD*> rsaOaepAlgorithms{
         {"RSA-OAEP", EVP_sha1()},
         {"RSA-OAEP-256", EVP_sha256()},
         {"RSA-OAEP-384", EVP_sha384()},
         {"RSA-OAEP-512", EVP_sha512()},
       };
-      const auto& validAlgorithms = [&] {
-        if (algorithm.name == "RSASSA-PKCS1-v1_5") {
-          return rsaShaAlgorithms;
-        } else if (algorithm.name == "RSA-PSS") {
-          return rsaPssAlgorithms;
-        } else if (algorithm.name == "RSA-OAEP") {
-          return rsaOaepAlgorithms;
+      const auto tryFindAlgorithm = [&](kj::StringPtr alg) -> kj::Maybe<const EVP_MD*> {
+        if (algorithm.name == "RSASSA-PKCS1-v1_5" || algorithm.name == "RSA-PSS" ||
+            algorithm.name == "RSA-OAEP") {
+          auto ret = knownRsaAlgorithms.find(alg);
+          if (ret != knownRsaAlgorithms.end()) {
+            return ret->second;
+          }
+          return kj::none;
         } else {
           JSG_FAIL_REQUIRE(
               DOMNotSupportedError, "Unrecognized RSA variant \"", algorithm.name, "\".");
         }
-      }();
-      auto jwkHash = validAlgorithms.find(alg);
-      JSG_REQUIRE(jwkHash != rsaPssAlgorithms.end(), DOMNotSupportedError,
+      };
+      auto jwkHash = JSG_REQUIRE_NONNULL(tryFindAlgorithm(alg), DOMNotSupportedError,
           "Unrecognized or unimplemented algorithm \"", alg,
           "\" listed in JSON Web Key Algorithm "
           "parameter.");
 
-      JSG_REQUIRE(jwkHash->second == hashEvpMd, DOMDataError,
+      JSG_REQUIRE(jwkHash == hashEvpMd, DOMDataError,
           "JSON Web Key Algorithm parameter \"alg\" (\"", alg,
           "\") does not match requested hash "
           "algorithm \"",
-          jwkHash->first, "\".");
+          alg, "\".");
     }
 
     return rsaJwkReader(kj::mv(keyDataJwk));
@@ -1029,7 +1003,7 @@ kj::Own<CryptoKey::Impl> CryptoKey::Impl::importRsaRaw(jsg::Lock& js,
       "Input was not an RSA key", tryDescribeOpensslErrors());
 
   size_t modulusLength = rsa.getModulusBits();
-  auto publicExponent = KJ_REQUIRE_NONNULL(bignumToArray(*rsa.getE()));
+  auto publicExponent = KJ_REQUIRE_NONNULL(bignumToArray(js, *rsa.getE()));
 
   // Validate modulus and exponent, reject imported RSA keys that may be unsafe.
   Rsa::validateRsaParams(js, modulusLength, publicExponent, true);
@@ -1041,12 +1015,19 @@ kj::Own<CryptoKey::Impl> CryptoKey::Impl::importRsaRaw(jsg::Lock& js,
   return kj::heap<RsaRawKey>(kj::mv(importedKey), kj::mv(keyAlgorithm), extractable);
 }
 
-kj::Own<CryptoKey::Impl> fromRsaKey(kj::Own<EVP_PKEY> key) {
+kj::Own<CryptoKey::Impl> fromRsaKey(jsg::Lock& js, kj::Own<EVP_PKEY> key) {
+  auto rsa =
+      JSG_REQUIRE_NONNULL(Rsa::tryGetRsa(key.get()), DOMDataError, "Input was not an RSA key");
+
   return kj::heap<RsassaPkcs1V15Key>(AsymmetricKeyData{.evpPkey = kj::mv(key),
                                        .keyType = KeyType::PUBLIC,
                                        .usages = CryptoKeyUsageSet::decrypt() |
                                            CryptoKeyUsageSet::sign() | CryptoKeyUsageSet::verify()},
-      CryptoKey::RsaKeyAlgorithm{.name = "RSA"_kj}, true);
+      CryptoKey::RsaKeyAlgorithm{
+        .name = "RSA"_kj,
+        .publicExponent = KJ_REQUIRE_NONNULL(bignumToArray(js, *rsa.getE())),
+      },
+      true);
 }
 
 }  // namespace workerd::api

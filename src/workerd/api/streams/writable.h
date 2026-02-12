@@ -23,7 +23,7 @@ class WritableStreamDefaultWriter: public jsg::Object, public WritableStreamCont
 
   jsg::MemoizedIdentity<jsg::Promise<void>>& getClosed();
   jsg::MemoizedIdentity<jsg::Promise<void>>& getReady();
-  kj::Maybe<int> getDesiredSize(jsg::Lock& js);
+  kj::Maybe<int> getDesiredSize();
 
   jsg::Promise<void> abort(jsg::Lock& js, jsg::Optional<v8::Local<v8::Value>> reason);
 
@@ -39,7 +39,7 @@ class WritableStreamDefaultWriter: public jsg::Object, public WritableStreamCont
   //   complete on this side if we don't care that they're actually read?
   jsg::Promise<void> close(jsg::Lock& js);
 
-  jsg::Promise<void> write(jsg::Lock& js, v8::Local<v8::Value> chunk);
+  jsg::Promise<void> write(jsg::Lock& js, jsg::Optional<v8::Local<v8::Value>> chunk);
   void releaseLock(jsg::Lock& js);
 
   JSG_RESOURCE_TYPE(WritableStreamDefaultWriter, CompatibilityFlags::Reader flags) {
@@ -64,7 +64,8 @@ class WritableStreamDefaultWriter: public jsg::Object, public WritableStreamCont
 
   // Internal API
 
-  void attach(WritableStreamController& controller,
+  void attach(jsg::Lock& js,
+      WritableStreamController& controller,
       jsg::Promise<void> closedPromise,
       jsg::Promise<void> readyPromise) override;
 
@@ -72,16 +73,18 @@ class WritableStreamDefaultWriter: public jsg::Object, public WritableStreamCont
 
   void lockToStream(jsg::Lock& js, WritableStream& stream);
 
-  void replaceReadyPromise(jsg::Promise<void> readyPromise) override;
+  void replaceReadyPromise(jsg::Lock& js, jsg::Promise<void> readyPromise) override;
 
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
+
+  kj::Maybe<jsg::Promise<void>> isReady(jsg::Lock& js);
 
  private:
   struct Initial {};
   // While a Writer is attached to a WritableStream, it holds a strong reference to the
-  // WritableStream to prevent it from being GC'd so long as the Writer is available.
-  // Once the writer is closed, released, or GC'd the reference to the WritableStream
-  // is cleared and the WritableStream can be GC'd if there are no other references to
+  // WritableStream to prevent it from being GC'ed so long as the Writer is available.
+  // Once the writer is closed, released, or GC'ed the reference to the WritableStream
+  // is cleared and the WritableStream can be GC'ed if there are no other references to
   // it being held anywhere. If the writer is still attached to the WritableStream when
   // it is destroyed, the WritableStream's reference to the writer is cleared but the
   // WritableStream remains in the "writer locked" state, per the spec.
@@ -93,6 +96,7 @@ class WritableStreamDefaultWriter: public jsg::Object, public WritableStreamCont
 
   kj::Maybe<jsg::MemoizedIdentity<jsg::Promise<void>>> closedPromise;
   kj::Maybe<jsg::MemoizedIdentity<jsg::Promise<void>>> readyPromise;
+  kj::Maybe<jsg::Promise<void>> readyPromisePending;
 
   void visitForGc(jsg::GcVisitor& visitor);
 };

@@ -3,15 +3,15 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "impl.h"
+#include "kdf.h"
 
-#include <workerd/api/crypto/kdf.h>
-
-#include <openssl/evp.h>
-#include <openssl/mem.h>
+#include <ncrypto.h>
 
 namespace workerd::api {
 namespace {
 
+// The underlying implementation of PBKDF2 for WebCrypto.
+// The CryptoKey::Impl here is used only for web crypto uses.
 class Pbkdf2Key final: public CryptoKey::Impl {
  public:
   explicit Pbkdf2Key(kj::Array<kj::byte> keyData,
@@ -41,16 +41,17 @@ class Pbkdf2Key final: public CryptoKey::Impl {
         JSG_REQUIRE_NONNULL(algorithm.hash, TypeError, "Missing field \"hash\" in \"algorithm\"."));
     auto hashType = lookupDigestAlgorithm(hashName).second;
     kj::ArrayPtr<kj::byte> salt =
-        JSG_REQUIRE_NONNULL(algorithm.salt, TypeError, "Missing field \"salt\" in \"algorithm\".");
+        JSG_REQUIRE_NONNULL(algorithm.salt, TypeError, "Missing field \"salt\" in \"algorithm\".")
+            .asArrayPtr();
     int iterations = JSG_REQUIRE_NONNULL(
         algorithm.iterations, TypeError, "Missing field \"iterations\" in \"algorithm\".");
 
     uint32_t length = JSG_REQUIRE_NONNULL(
         maybeLength, DOMOperationError, "PBKDF2 cannot derive a key with null length.");
 
-    JSG_REQUIRE(length != 0 && (length & 0b111) == 0, DOMOperationError,
-        "PBKDF2 requires a derived key length that is a non-zero multiple of eight (requested ",
-        length, ").");
+    JSG_REQUIRE(length % 8 == 0, DOMOperationError,
+        "PBKDF2 requires a derived key length that is a multiple of eight (requested ", length,
+        ").");
 
     JSG_REQUIRE(iterations > 0, DOMOperationError,
         "PBKDF2 requires a positive iteration count (requested ", iterations, ").");
@@ -69,7 +70,7 @@ class Pbkdf2Key final: public CryptoKey::Impl {
 
   // TODO(bug): Possibly by mistake, PBKDF2 was historically not on the allow list of
   //   algorithms in exportKey(). Later, the allow list was removed, instead assuming that any
-  //   alogorithm which implemented this method must be allowed. To maintain exactly the
+  //   algorithm which implemented this method must be allowed. To maintain exactly the
   //   preexisting behavior, then, this implementation had to be commented out. If disallowing this
   //   was a mistake, we can un-comment this method, but we would need to make sure to add tests
   //   when we do.
@@ -98,7 +99,6 @@ class Pbkdf2Key final: public CryptoKey::Impl {
   ZeroOnFree keyData;
   CryptoKey::KeyAlgorithm keyAlgorithm;
 };
-
 }  // namespace
 
 kj::Maybe<jsg::BufferSource> pbkdf2(jsg::Lock& js,
@@ -107,12 +107,14 @@ kj::Maybe<jsg::BufferSource> pbkdf2(jsg::Lock& js,
     const EVP_MD* digest,
     kj::ArrayPtr<const kj::byte> password,
     kj::ArrayPtr<const kj::byte> salt) {
-  auto buf = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, length);
-  if (PKCS5_PBKDF2_HMAC(password.asChars().begin(), password.size(), salt.begin(), salt.size(),
-          iterations, digest, length, buf.asArrayPtr().begin()) != 1) {
-    return kj::none;
+  ncrypto::ClearErrorOnReturn clearErrorOnReturn;
+  auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, length);
+  auto buf = ToNcryptoBuffer(backing.asArrayPtr());
+  if (ncrypto::pbkdf2Into(digest, ToNcryptoBuffer(password.asChars()), ToNcryptoBuffer(salt),
+          iterations, length, &buf)) {
+    return jsg::BufferSource(js, kj::mv(backing));
   }
-  return jsg::BufferSource(js, kj::mv(buf));
+  return kj::none;
 }
 
 kj::Own<CryptoKey::Impl> CryptoKey::Impl::importPbkdf2(jsg::Lock& js,

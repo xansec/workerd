@@ -3,20 +3,28 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "server.h"
+#include "workerd-api.h"
 
+#include <workerd/api/unsafe.h>
 #include <workerd/io/compatibility-date.capnp.h>
-#include <workerd/io/supported-compatibility-date.capnp.h>
+#include <workerd/io/compatibility-date.h>
+#include <workerd/io/supported-compatibility-date.embed.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/rust/cxx-integration/lib.rs.h>
+#include <workerd/server/cpp-capnp-schema.embed.h>
+#include <workerd/server/json-logger.h>
 #include <workerd/server/v8-platform-impl.h>
-#include <workerd/server/workerd-meta.capnp.h>
+#include <workerd/server/workerd-capnp-schema.embed.h>
 #include <workerd/server/workerd.capnp.h>
 #include <workerd/util/autogate.h>
+#include <workerd/util/entropy.h>
 
+#include <errno.h>
 #include <fcntl.h>
-#include <openssl/rand.h>
-#include <pyodide/generated/pyodide_extra.capnp.h>
+#ifdef __linux__
+#include <sys/mman.h>
 #include <sys/stat.h>
+#endif
 
 #include <capnp/dynamic.h>
 #include <capnp/message.h>
@@ -27,10 +35,6 @@
 #include <kj/filesystem.h>
 #include <kj/main.h>
 #include <kj/map.h>
-
-#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
-#include <workerd/api/gpu/gpu.h>
-#endif
 
 #if _WIN32
 #include <windows.h>
@@ -71,6 +75,32 @@
 
 #include <workerd/util/use-perfetto-categories.h>
 
+// since kj installs their global signal handlers
+// and exits with 1 Fuzzilli doesn't realize that an application crashed due to the signo.
+// Therefore, we install a handler before and just raise the signo
+#ifdef WORKERD_FUZZILLI
+
+void signalHandler(int signo, siginfo_t* info, void* context) noexcept {
+  // inform reprl - remove debug output for clean testing
+  struct sigaction sa = {};
+  sa.sa_handler = SIG_DFL;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(signo, &sa, nullptr);
+  raise(signo);
+}
+
+void initSignalHandlers() {
+  struct sigaction action {};
+  action.sa_flags = SA_SIGINFO;
+  action.sa_sigaction = &signalHandler;
+
+  for (auto signo: {SIGBUS, SIGFPE, SIGABRT, SIGILL, SIGTRAP, SIGSEGV}) {
+    KJ_SYSCALL(sigaction(signo, &action, nullptr));
+  }
+}
+#endif
+
 namespace workerd::server {
 namespace {
 
@@ -81,10 +111,26 @@ static kj::StringPtr getVersionString() {
 
 // =======================================================================================
 
+// For ASan's leak sanitizer, suppress warnings about leaks with stacks that include "unknown
+// modules". This suppression is adopted from the GN build and applies to addresses that LSan can't
+// symbolize or even map to a binary – perhaps JIT or snapshot-generated code in V8's case?
+// TODO(someday): Suppression is needed to get several python tests to pass under LSan. Investigate
+// if this is an actual leak (perhaps a bug in V8 itself since it is suppressed there?) at a later
+// time.
+#if __has_feature(address_sanitizer)
+extern "C" __attribute__((no_sanitize("address"))) __attribute__((visibility("default")))
+__attribute__((used)) const char*
+__lsan_default_suppressions() {
+  return "leak:<unknown module>\n";
+}
+#endif
+
+// =======================================================================================
+
 class EntropySourceImpl: public kj::EntropySource {
  public:
   void generate(kj::ArrayPtr<kj::byte> buffer) override {
-    KJ_ASSERT(RAND_bytes(buffer.begin(), buffer.size()) == 1);
+    getEntropy(buffer);
   }
 };
 
@@ -634,14 +680,15 @@ class NetworkWithLoopback final: public kj::Network {
 
 class CliMain final: public SchemaFileImpl::ErrorReporter {
  public:
-  CliMain(kj::ProcessContext& context, char** argv)
+  CliMain(StructuredLoggingProcessContext& context, char** argv)
       : context(context),
         argv(argv),
         server(kj::heap<Server>(*fs,
             io.provider->getTimer(),
+            kj::systemPreciseMonotonicClock(),
             network,
             entropySource,
-            Worker::ConsoleMode::STDOUT,
+            Worker::LoggingOptions(Worker::ConsoleMode::STDOUT),
             [&](kj::String error) {
               if (watcher == kj::none) {
                 // TODO(someday): Don't just fail on the first error, keep going in order to report
@@ -663,11 +710,10 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       KJ_ASSERT(size > sizeof(COMPILED_MAGIC_SUFFIX) + sizeof(uint64_t));
       kj::byte magic[sizeof(COMPILED_MAGIC_SUFFIX)]{};
       exe.read(size - sizeof(COMPILED_MAGIC_SUFFIX), magic);
-      if (kj::arrayPtr(magic) == kj::arrayPtr(COMPILED_MAGIC_SUFFIX).asBytes()) {
+      if (kj::arrayPtr(magic) == kj::asBytes(COMPILED_MAGIC_SUFFIX)) {
         // Oh! It appears we are running a compiled binary, it has a config appended to the end.
         uint64_t configSize;
-        exe.read(size - sizeof(COMPILED_MAGIC_SUFFIX) - sizeof(uint64_t),
-            kj::arrayPtr(&configSize, 1).asBytes());
+        exe.read(size - sizeof(COMPILED_MAGIC_SUFFIX) - sizeof(uint64_t), kj::asBytes(configSize));
         KJ_ASSERT(size - sizeof(COMPILED_MAGIC_SUFFIX) - sizeof(uint64_t) >
             configSize * sizeof(capnp::word));
         size_t offset = size - sizeof(COMPILED_MAGIC_SUFFIX) - sizeof(uint64_t) -
@@ -699,9 +745,15 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
           .addSubCommand("serve", KJ_BIND_METHOD(*this, getServe), "run the server")
           .addSubCommand(
               "compile", KJ_BIND_METHOD(*this, getCompile), "create a self-contained binary")
+#ifdef WORKERD_FUZZILLI
+          .addSubCommand("fuzzilli", KJ_BIND_METHOD(*this, getFuzz), "run reprl for fuzzing")
+#endif
           .addSubCommand("test", KJ_BIND_METHOD(*this, getTest), "run unit tests")
           .addSubCommand("pyodide-lock", KJ_BIND_METHOD(*this, getPyodideLock),
               "outputs the package lock file used by Pyodide")
+          .addSubCommand("make-pyodide-baseline-snapshot",
+              KJ_BIND_METHOD(*this, getMakePyodideBaselineSnapshot),
+              "Make a Pyodide baseline memory snapshot")
           .build();
       // TODO(someday):
       // "validate": Loads the config and parses all the code to report errors, but then exits
@@ -748,7 +800,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
             "<addr> instead of the address specified in the config file.")
         .addOptionWithArg({'i', "inspector-addr"}, CLI_METHOD(enableInspector), "<addr>",
             "Enable the inspector protocol to connect to the address <addr>.")
-#if defined(WORKERD_USE_PERFETTO)
+#ifdef WORKERD_USE_PERFETTO
         // TODO(later): In the future, we might want to enable providing a perfetto
         // TraceConfig structure here rather than just the categories.
         .addOptionWithArg({"p", "perfetto-trace"}, CLI_METHOD(enablePerfetto),
@@ -775,10 +827,15 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       server->setPythonCreateSnapshot();
       return true;
     }, "Save a dedicated snapshot to the disk cache")
-        .addOption({"python-save-baseline-snapshot"}, [this]() {
+        .addOption({"python-save-baseline-snapshot"},
+            [this]() {
       server->setPythonCreateBaselineSnapshot();
       return true;
-    }, "Save a baseline snapshot to the disk cache");
+    }, "Save a baseline snapshot to the disk cache")
+        .addOptionWithArg({"python-load-snapshot"}, CLI_METHOD(setPythonLoadSnapshot), "<path>",
+            "Load a snapshot from the python snapshot directory.")
+        .addOptionWithArg({"python-snapshot-dir"}, CLI_METHOD(setPythonSnapshotDirectory), "<path>",
+            "Set the snapshot snapshot directory.");
   }
 
   kj::MainFunc addServeOptions(kj::MainBuilder& builder) {
@@ -792,6 +849,10 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         .addOptionWithArg({"control-fd"}, CLI_METHOD(enableControl), "<fd>",
             "Enable sending of control messages on descriptor <fd>. Currently this "
             "only reports the port each socket is listening on when ready.")
+        .addOptionWithArg({"debug-port"}, CLI_METHOD(enableDebugPort), "<addr>",
+            "Listen on the specified address for debug RPC connections. This exposes "
+            "a privileged interface that allows access to all services in the process. "
+            "For use by miniflare and local development only.")
         .callAfterParsing(CLI_METHOD(serve))
         .build();
   }
@@ -807,7 +868,22 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         context, getVersionString(), "Outputs the package lock file used by Pyodide.");
     return builder
         .callAfterParsing([]() -> kj::MainBuilder::Validity {
-      printf("%s\n", PYODIDE_LOCK->cStr());
+      static const PythonConfig config{
+        .packageDiskCacheRoot = kj::none,
+        .pyodideDiskCacheRoot = kj::none,
+        .createSnapshot = false,
+        .createBaselineSnapshot = false,
+      };
+
+      capnp::MallocMessageBuilder message;
+      // TODO(EW-8977): Implement option to specify python worker flags.
+      auto features = message.getRoot<CompatibilityFlags>();
+      features.setPythonWorkers(true);
+      auto pythonRelease = KJ_ASSERT_NONNULL(getPythonSnapshotRelease(features));
+
+      auto lock = KJ_ASSERT_NONNULL(api::pyodide::getPyodideLock(pythonRelease));
+
+      printf("%s\n", lock.cStr());
       fflush(stdout);
       return true;
     }).build();
@@ -855,7 +931,34 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     },
             "Disable INFO-level logging for this test. Otherwise, INFO logging is enabled by "
             "default for tests in order to show uncaught exceptions, but it can be noisey.")
+        .addOption({"predictable"},
+            [this]() {
+      predictable = true;
+      return true;
+    },
+            "Enable predictable mode. This makes workerd behave more deterministically by using "
+            "pre-set values instead of random data or timestamps to facilitate testing.")
+        .addOption({"all-autogates"},
+            [this]() {
+      allAutogates = true;
+      return true;
+    },
+            "Enable all autogates. This is useful for testing code paths that are guarded by "
+            "autogates.")
+        .addOptionWithArg({"compat-date"}, CLI_METHOD(setTestCompatDate), "<date>",
+            "Set the compatibility date for all workers. When specified, workers must NOT "
+            "specify compatibilityDate in the config. Use '0000-00-00' for oldest behavior "
+            "or '9999-12-31' for newest behavior.")
         .expectOptionalArg("<filter>", CLI_METHOD(setTestFilter))
+        .callAfterParsing(CLI_METHOD(test))
+        .build();
+  }
+
+  kj::MainFunc getFuzz() {
+    auto builder = kj::MainBuilder(context, getVersionString(),
+        "Creates a custom signal handler and depending on the config leverages Stdin.reprl() to communicate with fuzzilli.");
+
+    return addServeOrTestOptions(addConfigParsingOptionsNoConstName(builder))
         .callAfterParsing(CLI_METHOD(test))
         .build();
   }
@@ -878,6 +981,18 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
             "The encoded config can be used as input to the \"serve\" command, without the need "
             "for any other files to be present.")
         .callAfterParsing(CLI_METHOD(compile))
+        .build();
+  }
+
+  kj::MainFunc getMakePyodideBaselineSnapshot() {
+    server->allowExperimental();
+    server->setPythonCreateBaselineSnapshot();
+    auto builder =
+        kj::MainBuilder(context, getVersionString(), "Make a Pyodide baseline memory snapshot", "");
+    setPyodideDiskCacheDir(".");
+    return builder.expectArg("<python-version>", CLI_METHOD(parsePythonCompatFlag))
+        .expectArg("<output-directory>", CLI_METHOD(setPackageDiskCacheDir))
+        .callAfterParsing(CLI_METHOD(test))
         .build();
   }
 
@@ -972,7 +1087,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     server->overrideExternal(kj::mv(name), kj::str(value));
   }
 
-#if defined(WORKERD_USE_PERFETTO)
+#ifdef WORKERD_USE_PERFETTO
   void enablePerfetto(kj::StringPtr param) {
     auto [name, value] = parseOverride(param);
     perfettoTraceDestination = kj::str(name);
@@ -990,6 +1105,10 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     server->enableControl(fd);
   }
 
+  void enableDebugPort(kj::StringPtr param) {
+    server->enableDebugPort(kj::str(param));
+  }
+
   void setPackageDiskCacheDir(kj::StringPtr pathStr) {
     kj::Path path = fs->getCurrentPath().eval(pathStr);
     kj::Maybe<kj::Own<const kj::Directory>> dir =
@@ -1003,6 +1122,34 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     kj::Maybe<kj::Own<const kj::Directory>> dir =
         fs->getRoot().tryOpenSubdir(path, kj::WriteMode::MODIFY);
     server->setPyodideDiskCacheRoot(kj::mv(dir));
+  }
+
+  void setPythonLoadSnapshot(kj::StringPtr pathStr) {
+    server->setPythonLoadSnapshot(kj::str(pathStr));
+  }
+  void setPythonSnapshotDirectory(kj::StringPtr pathStr) {
+    kj::Path path = fs->getCurrentPath().eval(pathStr);
+    kj::Maybe<kj::Own<const kj::Directory>> dir =
+        fs->getRoot().tryOpenSubdir(path, kj::WriteMode::MODIFY);
+    server->setPythonSnapshotDirectory(kj::mv(dir));
+  }
+
+  void parsePythonCompatFlag(kj::StringPtr compatFlagStr) {
+    auto builder = kj::heap<capnp::MallocMessageBuilder>();
+    auto configBuilder = builder->initRoot<config::Config>();
+    auto service = configBuilder.initServices(1)[0];
+    service.setName("main");
+    auto worker = service.initWorker();
+    worker.setCompatibilityDate("2023-12-18");
+    auto flags = worker.initCompatibilityFlags(2);
+    flags.set(0, compatFlagStr);
+    flags.set(1, "python_workers");
+    auto mod = worker.initModules(1)[0];
+    mod.setName("main.py");
+    mod.setPythonModule("def test():\n pass");
+    config = configBuilder.asReader();
+    configOwner = kj::mv(builder);
+    util::Autogate::initAutogate(getConfig().getAutogates());
   }
 
   void watch() {
@@ -1044,6 +1191,12 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       // Read file from disk.
       auto path = fs->getCurrentPath().evalNative(pathStr);
       auto file = KJ_UNWRAP_OR(fs->getRoot().tryOpenFile(path), CLI_ERROR("No such file."));
+
+      // Use stat() to check that we have a file vs a directory which will fail to mmap
+      auto metadata = file->stat();
+      if (metadata.type != kj::FsNode::Type::FILE) {
+        CLI_ERROR("Config path is not a file.");
+      }
 
       if (binaryConfig) {
         // Interpret as binary config.
@@ -1141,6 +1294,10 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       default:
         CLI_ERROR("Too many colons.");
     }
+  }
+
+  void setTestCompatDate(kj::StringPtr date) {
+    testCompatDate = kj::str(date);
   }
 
   void compile() {
@@ -1264,10 +1421,17 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 #endif
       TRACE_EVENT("workerd", "serveImpl()");
       auto config = getConfig();
+
+      // Configure structured logging in the process context
+      if (config.hasLogging() ? config.getLogging().getStructuredLogging()
+                              : config.getStructuredLogging()) {
+        context.enableStructuredLogging();
+      }
+
       auto platform = jsg::defaultPlatform(0);
       WorkerdPlatform v8Platform(*platform);
-      jsg::V8System v8System(
-          v8Platform, KJ_MAP(flag, config.getV8Flags()) -> kj::StringPtr { return flag; });
+      jsg::V8System v8System(v8Platform,
+          KJ_MAP(flag, config.getV8Flags()) -> kj::StringPtr { return flag; }, platform.get());
       auto promise = func(v8System, config);
       KJ_IF_SOME(w, watcher) {
         promise = promise.exclusiveJoin(waitForChanges(w).then([this]() {
@@ -1309,6 +1473,16 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       // Always turn on info logging when running tests so that uncaught exceptions are displayed.
       // TODO(beta): This can be removed once we improve our error logging story.
       kj::_::Debug::setLogLevel(kj::LogSeverity::INFO);
+    }
+    if (predictable) {
+      setPredictableModeForTest();
+    }
+    if (allAutogates) {
+      util::Autogate::initAllAutogates();
+    }
+
+    KJ_IF_SOME(compatDate, testCompatDate) {
+      server->setTestCompatibilityDateOverride(kj::str(compatDate));
     }
 
     // Enable loopback sockets in tests only.
@@ -1371,12 +1545,15 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 #endif
 
  private:
-  kj::ProcessContext& context;
+  StructuredLoggingProcessContext& context;
   char** argv;
 
   bool binaryConfig = false;
   bool configOnly = false;
   bool noVerbose = false;
+  bool predictable = false;
+  bool allAutogates = false;
+  kj::Maybe<kj::String> testCompatDate;
   kj::Maybe<FileWatcher> watcher;
 
   kj::Own<kj::Filesystem> fs = kj::newDiskFilesystem();
@@ -1397,7 +1574,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   kj::Maybe<kj::String> testServicePattern;
   kj::Maybe<kj::String> testEntrypointPattern;
 
-#if defined(WORKERD_USE_PERFETTO)
+#ifdef WORKERD_USE_PERFETTO
   kj::Maybe<kj::String> perfettoTraceDestination;
   kj::Maybe<kj::String> perfettoTraceCategories;
 #endif
@@ -1568,15 +1745,16 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 }  // namespace workerd::server
 
 int main(int argc, char* argv[]) {
-  ::kj::TopLevelProcessContext context(argv[0]);
+  workerd::server::StructuredLoggingProcessContext context(argv[0]);
+
 #if !_WIN32
   kj::UnixEventPort::captureSignal(SIGTERM);
 #endif
   workerd::rust::cxx_integration::init();
   workerd::server::CliMain mainObject(context, argv);
 
-#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
-  workerd::api::gpu::initialize();
+#if defined(WORKERD_FUZZILLI) && defined(__linux__)
+  initSignalHandlers();
 #endif
 
   return ::kj::runMainAndExit(context, mainObject.getMain(), argc, argv);

@@ -4,8 +4,10 @@ Dump the AST of a given C++ source file
 Based loosely on https://github.com/bazelbuild/rules_cc/blob/main/examples/my_c_compile/my_c_compile.bzl
 """
 
-load("@bazel_tools//tools/cpp:toolchain_utils.bzl", "find_cpp_toolchain", "use_cpp_toolchain")
 load("@rules_cc//cc:action_names.bzl", "CPP_COMPILE_ACTION_NAME")
+load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
 
 def _cc_ast_dump_impl(ctx):
     cc_toolchain = find_cpp_toolchain(ctx)
@@ -24,10 +26,13 @@ def _cc_ast_dump_impl(ctx):
         feature_configuration = feature_configuration,
         source_file = ctx.file.src.path,
         output_file = None,
-        user_compile_flags = ["-Xclang", "-ast-dump=json", "-fsyntax-only"] + ctx.fragments.cpp.copts + ctx.fragments.cpp.cxxopts,
+        # clang 19 complains about '-c' being unused
+        user_compile_flags = ["-Wno-unused-command-line-argument", "-Xclang", "-ast-dump=json", "-fsyntax-only"] + ctx.fragments.cpp.copts + ctx.fragments.cpp.cxxopts,
         include_directories = cc_info.compilation_context.includes,
         quote_include_directories = cc_info.compilation_context.quote_includes,
-        system_include_directories = cc_info.compilation_context.system_includes,
+        # we need to pass external_includes, but there is no equivalent parameter in
+        # create_compile_variables – pass alongside system_includes.
+        system_include_directories = depset(transitive = [cc_info.compilation_context.system_includes, cc_info.compilation_context.external_includes]),
         framework_include_directories = cc_info.compilation_context.framework_includes,
         preprocessor_defines = cc_info.compilation_context.defines,
     )
@@ -55,8 +60,7 @@ cc_ast_dump = rule(
         "src": attr.label(mandatory = True, allow_single_file = True),
         "out": attr.output(mandatory = True),
         "deps": attr.label_list(providers = [CcInfo]),
-        "_cc_toolchain": attr.label(default = Label("@bazel_tools//tools/cpp:current_cc_toolchain")),
     },
-    toolchains = use_cpp_toolchain(),  # copybara-use-repo-external-label
+    toolchains = use_cc_toolchain(),  # copybara-use-repo-external-label
     fragments = ["cpp"],
 )

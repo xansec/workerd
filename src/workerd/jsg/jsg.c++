@@ -5,18 +5,22 @@
 #include "jsg.h"
 
 #include "setup.h"
+#include "simdutf.h"
 
+#include <workerd/jsg/modules-new.h>
+#include <workerd/jsg/modules.h>
 #include <workerd/jsg/util.h>
 #include <workerd/util/thread-scopes.h>
+
+#ifdef V8_ENABLE_SANDBOX
+#include <sys/mman.h>
+#endif
 
 namespace workerd::jsg {
 
 kj::String stringifyHandle(v8::Local<v8::Value> value) {
-  // This is the only place in the entire codebase where we use v8::Isolate::GetCurrent(). It's
-  // hard to avoid since we want `kj::str(handle)` to work, which doesn't give us a chance to
-  // pass in a `Lock` or whatever.
   // TODO(cleanup): Perhaps we should require you to call `js.toString(handle)`?
-  auto& js = jsg::Lock::from(v8::Isolate::GetCurrent());
+  auto& js = jsg::Lock::current();
   return js.withinHandleScope([&] {
     v8::Local<v8::String> str = workerd::jsg::check(value->ToDetailString(js.v8Context()));
     v8::String::Utf8Value utf8(js.v8Isolate, str);
@@ -91,7 +95,7 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
   KJ_ASSERT(v8::Locker::IsLocked(isolate));
 
   // Verify the handle was not garbage-collected by trying to read it. The intention is for this
-  // to crash if the handle was GC'd before being moved away.
+  // to crash if the handle was GC'ed before being moved away.
   {
     auto& js = jsg::Lock::from(isolate);
     js.withinHandleScope([&] {
@@ -187,10 +191,20 @@ void Lock::setAllowEval(bool allow) {
   IsolateBase::from(v8Isolate).setAllowEval({}, allow);
 }
 
-void Lock::installJspi() {
-  IsolateBase::from(v8Isolate).setJspiEnabled({}, true);
-  v8Isolate->InstallConditionalFeatures(v8Context());
-  IsolateBase::from(v8Isolate).setJspiEnabled({}, false);
+void Lock::setUsingEnhancedErrorSerialization() {
+  IsolateBase::from(v8Isolate).setUsingEnhancedErrorSerialization();
+}
+
+void Lock::setUsingFastJsgStruct() {
+  IsolateBase::from(v8Isolate).setUsingFastJsgStruct();
+}
+
+bool Lock::isUsingFastJsgStruct() const {
+  return IsolateBase::from(v8Isolate).getUsingFastJsgStruct();
+}
+
+bool Lock::isUsingEnhancedErrorSerialization() const {
+  return IsolateBase::from(v8Isolate).getUsingEnhancedErrorSerialization();
 }
 
 void Lock::setCaptureThrowsAsRejections(bool capture) {
@@ -201,6 +215,22 @@ void Lock::setNodeJsCompatEnabled() {
   IsolateBase::from(v8Isolate).setNodeJsCompatEnabled({}, true);
 }
 
+void Lock::setNodeJsProcessV2Enabled() {
+  IsolateBase::from(v8Isolate).setNodeJsProcessV2Enabled({}, true);
+}
+
+void Lock::setRequireReturnsDefaultExportEnabled() {
+  IsolateBase::from(v8Isolate).setRequireReturnsDefaultExportEnabled({}, true);
+}
+
+void Lock::setThrowOnUnrecognizedImportAssertion() {
+  IsolateBase::from(v8Isolate).setThrowOnUnrecognizedImportAssertion();
+}
+
+bool Lock::getThrowOnUnrecognizedImportAssertion() const {
+  return IsolateBase::from(v8Isolate).getThrowOnUnrecognizedImportAssertion();
+}
+
 void Lock::disableTopLevelAwait() {
   IsolateBase::from(v8Isolate).disableTopLevelAwait();
 }
@@ -209,8 +239,8 @@ void Lock::setToStringTag() {
   IsolateBase::from(v8Isolate).enableSetToStringTag();
 }
 
-void Lock::setCommonJsExportDefault(bool exportDefault) {
-  IsolateBase::from(v8Isolate).setCommonJsExportDefault({}, exportDefault);
+void Lock::setImmutablePrototype() {
+  IsolateBase::from(v8Isolate).enableSetImmutablePrototype();
 }
 
 void Lock::setLoggerCallback(kj::Function<Logger>&& logger) {
@@ -258,16 +288,27 @@ bool Lock::v8HasOwn(v8::Local<v8::Object> obj, kj::StringPtr name) {
   return check(obj->HasOwnProperty(v8Context(), v8StrIntern(v8Isolate, name)));
 }
 
-kj::StringPtr Lock::getUuid() const {
-  return IsolateBase::from(v8Isolate).getUuid();
-}
-
 void Lock::runMicrotasks() {
   v8Isolate->PerformMicrotaskCheckpoint();
 }
 
-void Lock::terminateExecution() {
+void Lock::terminateNextExecution() {
   v8Isolate->TerminateExecution();
+}
+
+[[noreturn]] void Lock::terminateExecutionNow() {
+  terminateNextExecution();
+
+  // HACK: This has been observed to reliably make V8 check the termination flag and raise the
+  //   uncatchable termination exception.
+  jsg::check(v8::JSON::Stringify(v8Context(), str()));
+
+  // Shouldn't get here.
+  KJ_FAIL_ASSERT("V8 did not terminate execution when asked.");
+}
+
+bool Lock::pumpMsgLoop() {
+  return IsolateBase::from(v8Isolate).pumpMsgLoop();
 }
 
 Name Lock::newSymbol(kj::StringPtr symbol) {
@@ -282,69 +323,167 @@ Name Lock::newApiSymbol(kj::StringPtr symbol) {
   return Name(*this, v8::Symbol::ForApi(v8Isolate, v8StrIntern(v8Isolate, symbol)));
 }
 
-JsSymbol Lock::symbolDispose() {
-  return JsSymbol(v8::Symbol::GetDispose(v8Isolate));
-}
-JsSymbol Lock::symbolAsyncDispose() {
-  return IsolateBase::from(v8Isolate).getSymbolAsyncDispose();
+kj::Maybe<JsObject> Lock::resolveInternalModule(kj::StringPtr specifier) {
+  auto& isolate = IsolateBase::from(v8Isolate);
+  if (isolate.isUsingNewModuleRegistry()) {
+    return jsg::modules::ModuleRegistry::tryResolveModuleNamespace(
+        *this, specifier, jsg::modules::ResolveContext::Type::BUILTIN);
+  }
+
+  // Use the original module registry implementation
+  auto registry = ModuleRegistry::from(*this);
+  KJ_ASSERT(registry != nullptr);
+  auto module = registry->resolveInternalImport(*this, specifier);
+  return jsg::JsObject(module.getHandle(*this).As<v8::Object>());
 }
 
-void ExternalMemoryAdjustment::maybeDeferAdjustment(v8::Isolate* isolate, size_t amount) {
-  if (isolate == nullptr) return;
-  if (v8::Locker::IsLocked(isolate)) {
-    isolate->AdjustAmountOfExternalAllocatedMemory(static_cast<int64_t>(-amount));
+kj::Maybe<JsObject> Lock::resolveModule(kj::StringPtr specifier, RequireEsm requireEsm) {
+  auto& isolate = IsolateBase::from(v8Isolate);
+  if (isolate.isUsingNewModuleRegistry()) {
+    return jsg::modules::ModuleRegistry::tryResolveModuleNamespace(
+        *this, specifier, jsg::modules::ResolveContext::Type::BUNDLE);
+  }
+
+  auto moduleRegistry = jsg::ModuleRegistry::from(*this);
+  if (moduleRegistry == nullptr) return kj::none;
+  auto spec = kj::Path::parse(specifier);
+  auto& info = JSG_REQUIRE_NONNULL(
+      moduleRegistry->resolve(*this, spec), Error, kj::str("No such module: ", specifier));
+  JSG_REQUIRE(!requireEsm || info.maybeSynthetic == kj::none, TypeError,
+      "Main module must be an ES module.");
+  auto module = info.module.getHandle(*this);
+  jsg::instantiateModule(*this, module);
+  return JsObject(module->GetModuleNamespace().As<v8::Object>());
+}
+
+void ExternalMemoryTarget::maybeDeferAdjustment(ssize_t amount) const {
+  // Carefully check whether `isolate` is locked by the current thread. Note that there's a
+  // possibility that the isolate is being torn down in a different thread, which means we cannot
+  // safely call `v8::Locekr::IsLocked()` on it.
+  if (amount == 0) return;
+  v8::Isolate* current = v8::Isolate::TryGetCurrent();
+  v8::Isolate* target = isolate.load(std::memory_order_relaxed);  // could be null!
+
+  if (current != nullptr && current == target) {
+    // The isolate is currently locked by this thread. Note that it's impossible that `isolate` is
+    // concurrently being torn down because only the thread that holds the isolate lock could be
+    // making such a change, and that's us, and we're not.
+    KJ_ASSERT(v8::Locker::IsLocked(target));
+
+    // We use AdjustAmountOfExternalAllocatedMemoryImpl() instead of ExternalMemoryAccounter
+    // because we explicitly want external memory to be allowed to live beyond the isolate
+    // in some cases. The Impl variant bypasses the destructor check that
+    // ExternalMemoryAccounter enforces (requiring adjustment to return to zero).
+    // See patches/v8/0031-Expose-AdjustAmountOfExternalAllocatedMemoryImpl.patch
+    target->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
   } else {
-    // Otherwise, if we don't have the isolate locked, defer the adjustment to the next
-    // time that we do.
-    auto& jsgIsolate = *reinterpret_cast<IsolateBase*>(isolate->GetData(SET_DATA_ISOLATE_BASE));
-    jsgIsolate.deferExternalMemoryDecrement(static_cast<int64_t>(amount));
+    // We don't hold the isolate lock. Instead, record the adjustment to be applied the next time
+    // the isolate lock is acquired.
+    pendingExternalMemoryUpdate.fetch_add(amount, std::memory_order_relaxed);
   }
 }
 
-ExternalMemoryAdjustment::ExternalMemoryAdjustment(v8::Isolate* isolate, size_t amount)
-    : amount(amount),
-      isolate(isolate) {
-  KJ_DASSERT(isolate != nullptr);
-  isolate->AdjustAmountOfExternalAllocatedMemory(amount);
+void ExternalMemoryTarget::adjustNow(Lock& js, ssize_t amount) const {
+#ifdef KJ_DEBUG
+  v8::Isolate* target = isolate.load(std::memory_order_relaxed);
+  if (target != nullptr) {
+    KJ_ASSERT(target == js.v8Isolate);
+  }
+#endif
+  if (amount == 0) return;
+  js.v8Isolate->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
 }
 
+void ExternalMemoryTarget::detach() const {
+  isolate.store(nullptr, std::memory_order_relaxed);
+}
+
+ExternalMemoryAdjustment ExternalMemoryTarget::getAdjustment(size_t amount) const {
+  return ExternalMemoryAdjustment(this->addRefToThis(), amount);
+}
+
+void ExternalMemoryTarget::applyDeferredMemoryUpdate() const {
+  int64_t amount = pendingExternalMemoryUpdate.exchange(0, std::memory_order_relaxed);
+  if (amount != 0) {
+    isolate.load(std::memory_order_relaxed)->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+  }
+}
+
+bool ExternalMemoryTarget::isIsolateAliveForTest() const {
+  return isolate.load(std::memory_order_relaxed) != nullptr;
+}
+
+int64_t ExternalMemoryTarget::getPendingMemoryUpdateForTest() const {
+  return pendingExternalMemoryUpdate.load(std::memory_order_relaxed);
+}
+
+ExternalMemoryAdjustment Lock::getExternalMemoryAdjustment(int64_t amount) {
+  auto adjustment = IsolateBase::from(v8Isolate).getExternalMemoryAdjustment(0);
+  adjustment.adjustNow(*this, amount);
+  return kj::mv(adjustment);
+}
+
+kj::Arc<const ExternalMemoryTarget> Lock::getExternalMemoryTarget() {
+  return IsolateBase::from(v8Isolate).getExternalMemoryTarget();
+}
+
+void ExternalMemoryAdjustment::maybeDeferAdjustment(ssize_t amount) {
+  KJ_ASSERT(amount >= -static_cast<ssize_t>(this->amount),
+      "Memory usage may not be decreased below zero");
+  if (amount == 0) return;
+  this->amount += amount;
+  externalMemory->maybeDeferAdjustment(amount);
+}
+
+ExternalMemoryAdjustment::ExternalMemoryAdjustment(
+    kj::Arc<const ExternalMemoryTarget> externalMemory, size_t amount)
+    : externalMemory(kj::mv(externalMemory)) {
+  if (amount == 0) return;
+  maybeDeferAdjustment(amount);
+}
 ExternalMemoryAdjustment::ExternalMemoryAdjustment(ExternalMemoryAdjustment&& other)
-    : amount(other.amount),
-      isolate(other.isolate) {
+    : externalMemory(kj::mv(other.externalMemory)),
+      amount(other.amount) {
   other.amount = 0;
-  other.isolate = nullptr;
 }
 
 ExternalMemoryAdjustment& ExternalMemoryAdjustment::operator=(ExternalMemoryAdjustment&& other) {
   // If we currently have an amount, adjust it back to zero.
   // In the case we don't have the isolate lock here, the adjustment
   // will be deferred until the next time we do.
-  if (amount > 0) maybeDeferAdjustment(isolate, amount);
+
+  if (amount > 0) maybeDeferAdjustment(-amount);
+  externalMemory = kj::mv(other.externalMemory);
   amount = other.amount;
-  isolate = other.isolate;
   other.amount = 0;
-  other.isolate = nullptr;
   return *this;
 }
 
 ExternalMemoryAdjustment::~ExternalMemoryAdjustment() noexcept(false) {
   if (amount != 0) {
-    maybeDeferAdjustment(isolate, amount);
+    maybeDeferAdjustment(-amount);
   }
 }
 
-void ExternalMemoryAdjustment::adjust(Lock& js, ssize_t amount) {
-  amount = kj::max(amount, -static_cast<ssize_t>(this->amount));
+void ExternalMemoryAdjustment::adjust(ssize_t amount) {
+  if (amount == 0) return;
+  maybeDeferAdjustment(amount);
+}
+
+void ExternalMemoryAdjustment::adjustNow(Lock& js, ssize_t amount) {
+  KJ_ASSERT(amount >= -static_cast<ssize_t>(this->amount),
+      "Memory usage may not be decreased below zero");
+
   this->amount += amount;
-  isolate->AdjustAmountOfExternalAllocatedMemory(amount);
+  externalMemory->adjustNow(js, amount);
 }
 
-void ExternalMemoryAdjustment::set(Lock& js, size_t amount) {
-  adjust(js, amount - this->amount);
+void ExternalMemoryAdjustment::set(size_t amount) {
+  adjust(amount - this->amount);
 }
 
-ExternalMemoryAdjustment Lock::getExternalMemoryAdjustment(int64_t amount) {
-  return ExternalMemoryAdjustment(v8Isolate, amount);
+void ExternalMemoryAdjustment::setNow(Lock& js, size_t amount) {
+  adjustNow(js, amount - this->amount);
 }
 
 Name::Name(kj::String string): hash(kj::hashCode(string)), inner(kj::mv(string)) {}
@@ -403,5 +542,73 @@ kj::String Name::toString(jsg::Lock& js) {
 bool isInGcDestructor() {
   return HeapTracer::isInCppgcDestructor();
 }
+
+bool USVString::isValidUtf8() const {
+  return simdutf::validate_utf8(cStr(), size());
+}
+
+std::unique_ptr<v8::BackingStore> Lock::allocBackingStore(size_t size, AllocOption init_mode) {
+  auto v8_mode = (init_mode == AllocOption::ZERO_INITIALIZED)
+      ? v8::BackingStoreInitializationMode::kZeroInitialized
+      : v8::BackingStoreInitializationMode::kUninitialized;
+  auto store = v8::ArrayBuffer::NewBackingStore(
+      v8Isolate, size, v8_mode, v8::BackingStoreOnFailureMode::kReturnNull);
+  JSG_REQUIRE(store != nullptr, RangeError, "Failed to allocate ArrayBuffer backing store");
+  return kj::mv(store);
+}
+
+const capnp::SchemaLoader& ContextGlobal::getSchemaLoader() {
+  return KJ_ASSERT_NONNULL(schemaLoader);
+}
+
+void ContextGlobal::setSchemaLoader(const capnp::SchemaLoader& schemaLoader) {
+  this->schemaLoader = schemaLoader;
+}
+
+#ifdef V8_ENABLE_SANDBOX
+// These are disabled by default in workerd. We do not build workerd with
+// the V8_ENABLED_SANDBOX flag. If we do decide to enable it, we will need
+// additional setup to ensure that these are handled correctly on all platforms.
+// For now, keeping it simple. This bit will only be used in the internal
+// project.
+static constexpr int kPkeyNoRestrictions = 0;
+MemoryProtectionKeyScope::MemoryProtectionKeyScope(Lock& js)
+    : pkey(js.v8Isolate->GetMemoryProtectionKey()) {}
+
+MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey): key(pkey), saved(pkey_get(key)) {
+  pkey_set(pkey, kPkeyNoRestrictions);
+}
+MemoryProtectionKeyScope::PkeyScope::~PkeyScope() {
+  pkey_set(key, saved);
+}
+#endif
+
+namespace _ {
+
+JsgCatchScope::JsgCatchScope(Lock& js): js(js) {
+  tryCatchHolder.emplace(js.v8Isolate);
+}
+
+void JsgCatchScope::catchException(ExceptionToJsOptions options) {
+  // Be sure to release our TryCatch on the way out.
+  KJ_DEFER(tryCatchHolder = kj::none);
+
+  auto& tryCatch = KJ_ASSERT_NONNULL(tryCatchHolder).tryCatch;
+
+  // Same logic as that found in `jsg::Lock::tryCatch()`.
+  try {
+    throw;
+  } catch (JsExceptionThrown&) {
+    if (!tryCatch.CanContinue() || !tryCatch.HasCaught() || tryCatch.Exception().IsEmpty()) {
+      tryCatch.ReThrow();
+      throw;
+    }
+    caughtException.emplace(js.v8Isolate, tryCatch.Exception());
+  } catch (kj::Exception& e) {
+    caughtException.emplace(js.exceptionToJs(kj::mv(e), options));
+  }
+}
+
+}  // namespace _
 
 }  // namespace workerd::jsg

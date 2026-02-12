@@ -26,7 +26,7 @@ export function collateStandardComments(
   assert(combinedLibFile !== undefined);
 
   const result: CommentsData = {};
-  const recordComments = (node: ts.Node, name: string, memberName?: string) => {
+  const recordComments = (node: ts.Node, name: string, memberName?: string): void => {
     const ranges = ts.getLeadingCommentRanges(
       combinedLibContents,
       node.getFullStart()

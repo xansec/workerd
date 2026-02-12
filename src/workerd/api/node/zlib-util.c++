@@ -39,11 +39,11 @@ class GrowableBuffer final {
   // A copy of kj::Vector with some additional methods for use as a growable buffer with a maximum
   // size
  public:
-  inline explicit GrowableBuffer(size_t _chunkSize, size_t _maxCapacity) {
-    auto maxChunkSize = kj::min(_chunkSize, _maxCapacity);
+  inline explicit GrowableBuffer(size_t _chunkSize, size_t _maxCapacity)
+      : maxCapacity(_maxCapacity) {
+    auto maxChunkSize = kj::min(_chunkSize, maxCapacity);
     builder = kj::heapArrayBuilder<kj::byte>(maxChunkSize);
     chunkSize = maxChunkSize;
-    maxCapacity = _maxCapacity;
   }
 
   size_t size() const {
@@ -443,8 +443,8 @@ void ZlibContext::setOutputBuffer(kj::ArrayPtr<kj::byte> output) {
 
 template <typename CompressionContext>
 jsg::Ref<ZlibUtil::CompressionStream<CompressionContext>> ZlibUtil::CompressionStream<
-    CompressionContext>::constructor(ZlibModeValue mode) {
-  return jsg::alloc<CompressionStream>(static_cast<ZlibMode>(mode));
+    CompressionContext>::constructor(jsg::Lock& js, ZlibModeValue mode) {
+  return js.alloc<CompressionStream>(static_cast<ZlibMode>(mode), js.getExternalMemoryTarget());
 }
 
 template <typename CompressionContext>
@@ -483,8 +483,8 @@ void ZlibUtil::CompressionStream<CompressionContext>::writeStream(
   if constexpr (!async) {
     context()->work();
     if (checkError(js)) {
-      updateWriteResult();
       writing = false;
+      updateWriteResult();
     }
     return;
   }
@@ -540,6 +540,7 @@ template <typename CompressionContext>
 void ZlibUtil::CompressionStream<CompressionContext>::updateWriteResult() {
   KJ_IF_SOME(wr, writeResult) {
     auto ptr = wr.template asArrayPtr<uint32_t>();
+    JSG_REQUIRE(ptr.size() >= 2, Error, "Invalid write result buffer"_kj);
     context()->getAfterWriteResult(&ptr[1], &ptr[0]);
   }
 }
@@ -549,11 +550,11 @@ template <bool async>
 void ZlibUtil::CompressionStream<CompressionContext>::write(jsg::Lock& js,
     int flush,
     jsg::Optional<kj::Array<kj::byte>> input,
-    int inputOffset,
-    int inputLength,
+    uint32_t inputOffset,
+    uint32_t inputLength,
     kj::Array<kj::byte> output,
-    int outputOffset,
-    int outputLength) {
+    uint32_t outputOffset,
+    uint32_t outputLength) {
   if (flush != Z_NO_FLUSH && flush != Z_PARTIAL_FLUSH && flush != Z_SYNC_FLUSH &&
       flush != Z_FULL_FLUSH && flush != Z_FINISH && flush != Z_BLOCK) {
     JSG_FAIL_REQUIRE(Error, "Invalid flush value");
@@ -567,10 +568,14 @@ void ZlibUtil::CompressionStream<CompressionContext>::write(jsg::Lock& js,
 
   auto input_ensured = input.map([](auto& val) { return val.asPtr(); }).orDefault({});
 
+  // Check for integer overflow...
+  JSG_REQUIRE(inputOffset + inputLength >= inputOffset, Error, "Input access it not within bounds");
+  JSG_REQUIRE(
+      outputOffset + outputLength >= outputOffset, Error, "Input access it not within bounds");
   JSG_REQUIRE(IsWithinBounds(inputOffset, inputLength, input_ensured.size()), Error,
       "Input access is not within bounds"_kj);
   JSG_REQUIRE(IsWithinBounds(outputOffset, outputLength, output.size()), Error,
-      "Input access is not within bounds"_kj);
+      "Output access is not within bounds"_kj);
 
   writeStream<async>(js, flush, input_ensured.slice(inputOffset, inputOffset + inputLength),
       output.slice(outputOffset, outputOffset + outputLength));
@@ -583,8 +588,9 @@ void ZlibUtil::CompressionStream<CompressionContext>::reset(jsg::Lock& js) {
   }
 }
 
-jsg::Ref<ZlibUtil::ZlibStream> ZlibUtil::ZlibStream::constructor(ZlibModeValue mode) {
-  return jsg::alloc<ZlibStream>(static_cast<ZlibMode>(mode));
+jsg::Ref<ZlibUtil::ZlibStream> ZlibUtil::ZlibStream::constructor(
+    jsg::Lock& js, ZlibModeValue mode) {
+  return js.alloc<ZlibStream>(static_cast<ZlibMode>(mode), js.getExternalMemoryTarget());
 }
 
 void ZlibUtil::ZlibStream::initialize(int windowBits,
@@ -742,7 +748,7 @@ kj::Maybe<CompressionError> BrotliDecoderContext::getError() const {
   }
 
   if (flush == BROTLI_OPERATION_FINISH && lastResult == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) {
-    // Match zlib behaviour, as brotli doesn't have its own code for this.
+    // Match zlib behavior, as brotli doesn't have its own code for this.
     return CompressionError("Unexpected end of file", "Z_BUF_ERROR", Z_BUF_ERROR);
   }
 
@@ -751,8 +757,9 @@ kj::Maybe<CompressionError> BrotliDecoderContext::getError() const {
 
 template <typename CompressionContext>
 jsg::Ref<ZlibUtil::BrotliCompressionStream<CompressionContext>> ZlibUtil::BrotliCompressionStream<
-    CompressionContext>::constructor(ZlibModeValue mode) {
-  return jsg::alloc<BrotliCompressionStream>(static_cast<ZlibMode>(mode));
+    CompressionContext>::constructor(jsg::Lock& js, ZlibModeValue mode) {
+  return js.alloc<BrotliCompressionStream>(
+      static_cast<ZlibMode>(mode), js.getExternalMemoryTarget());
 }
 
 template <typename CompressionContext>
@@ -805,10 +812,10 @@ static kj::Array<kj::byte> syncProcessBuffer(Context& ctx, GrowableBuffer& resul
 }  // namespace
 
 kj::Array<kj::byte> ZlibUtil::zlibSync(
-    ZlibUtil::InputSource data, ZlibContext::Options opts, ZlibModeValue mode) {
+    jsg::Lock& js, ZlibUtil::InputSource data, ZlibContext::Options opts, ZlibModeValue mode) {
   // Any use of zlib APIs constitutes an implicit dependency on Allocator which must
   // remain alive until the zlib stream is destroyed
-  CompressionAllocator allocator;
+  CompressionAllocator allocator(js.getExternalMemoryTarget());
   ZlibContext ctx(static_cast<ZlibMode>(mode));
   allocator.configure(ctx.getStream());
 
@@ -819,7 +826,9 @@ kj::Array<kj::byte> ZlibUtil::zlibSync(
   JSG_REQUIRE(Z_MIN_CHUNK <= chunkSize && chunkSize <= Z_MAX_CHUNK, RangeError,
       kj::str("The value of \"options.chunkSize\" is out of range. It must be >= ", Z_MIN_CHUNK,
           " and <= ", Z_MAX_CHUNK, ". Received ", chunkSize));
-  JSG_REQUIRE(maxOutputLength <= Z_MAX_CHUNK, RangeError, "Invalid maxOutputLength"_kj);
+  JSG_REQUIRE(maxOutputLength >= 1 && maxOutputLength <= Z_MAX_CHUNK, RangeError,
+      kj::str("The value of \"options.maxOutputLength\" is out of range. It must be >= 1 and <= ",
+          Z_MAX_CHUNK, ". Received ", maxOutputLength));
   GrowableBuffer result(ZLIB_PERFORMANT_CHUNK_SIZE, maxOutputLength);
 
   ctx.initialize(opts.level.orDefault(Z_DEFAULT_LEVEL),
@@ -848,7 +857,7 @@ void ZlibUtil::zlibWithCallback(jsg::Lock& js,
     CompressCallback cb) {
   // Capture only relevant errors so they can be passed to the callback
   auto res = js.tryCatch([&]() {
-    return CompressCallbackArg(zlibSync(kj::mv(data), kj::mv(options), mode));
+    return CompressCallbackArg(zlibSync(js, kj::mv(data), kj::mv(options), mode));
   }, [&](jsg::Value&& exception) {
     return CompressCallbackArg(jsg::JsValue(exception.getHandle(js)));
   });
@@ -858,10 +867,11 @@ void ZlibUtil::zlibWithCallback(jsg::Lock& js,
 }
 
 template <typename Context>
-kj::Array<kj::byte> ZlibUtil::brotliSync(InputSource data, BrotliContext::Options opts) {
+kj::Array<kj::byte> ZlibUtil::brotliSync(
+    jsg::Lock& js, InputSource data, BrotliContext::Options opts) {
   // Any use of brotli APIs constitutes an implicit dependency on Allocator which must
   // remain alive until the brotli state is destroyed
-  CompressionAllocator allocator;
+  CompressionAllocator allocator(js.getExternalMemoryTarget());
   Context ctx(Context::Mode);
 
   auto chunkSize = opts.chunkSize.orDefault(ZLIB_PERFORMANT_CHUNK_SIZE);
@@ -871,7 +881,9 @@ kj::Array<kj::byte> ZlibUtil::brotliSync(InputSource data, BrotliContext::Option
   JSG_REQUIRE(Z_MIN_CHUNK <= chunkSize && chunkSize <= Z_MAX_CHUNK, RangeError,
       kj::str("The value of \"options.chunkSize\" is out of range. It must be >= ", Z_MIN_CHUNK,
           " and <= ", Z_MAX_CHUNK, ". Received ", chunkSize));
-  JSG_REQUIRE(maxOutputLength <= Z_MAX_CHUNK, Error, "Invalid maxOutputLength"_kj);
+  JSG_REQUIRE(maxOutputLength >= 1 && maxOutputLength <= Z_MAX_CHUNK, RangeError,
+      kj::str("The value of \"options.maxOutputLength\" is out of range. It must be >= 1 and <= ",
+          Z_MAX_CHUNK, ". Received ", maxOutputLength));
   GrowableBuffer result(ZLIB_PERFORMANT_CHUNK_SIZE, maxOutputLength);
 
   KJ_IF_SOME(err,
@@ -913,7 +925,7 @@ void ZlibUtil::brotliWithCallback(
     jsg::Lock& js, InputSource data, BrotliContext::Options options, CompressCallback cb) {
   // Capture only relevant errors so they can be passed to the callback
   auto res = js.tryCatch([&]() {
-    return CompressCallbackArg(brotliSync<Context>(kj::mv(data), kj::mv(options)));
+    return CompressCallbackArg(brotliSync<Context>(js, kj::mv(data), kj::mv(options)));
   }, [&](jsg::Value&& exception) {
     return CompressCallbackArg(jsg::JsValue(exception.getHandle(js)));
   });
@@ -924,33 +936,25 @@ void ZlibUtil::brotliWithCallback(
 
 #ifndef CREATE_TEMPLATE
 #define CREATE_TEMPLATE(T)                                                                         \
-  template void ZlibUtil::CompressionStream<T>::reset(jsg::Lock& js);                              \
+  template class ZlibUtil::CompressionStream<T>;                                                   \
   template void ZlibUtil::CompressionStream<T>::write<false>(jsg::Lock & js, int flush,            \
-      jsg::Optional<kj::Array<kj::byte>> input, int inputOffset, int inputLength,                  \
-      kj::Array<kj::byte> output, int outputOffset, int outputLength);                             \
+      jsg::Optional<kj::Array<kj::byte>> input, uint32_t inputOffset, uint32_t inputLength,        \
+      kj::Array<kj::byte> output, uint32_t outputOffset, uint32_t outputLength);                   \
   template void ZlibUtil::CompressionStream<T>::write<true>(jsg::Lock & js, int flush,             \
-      jsg::Optional<kj::Array<kj::byte>> input, int inputOffset, int inputLength,                  \
-      kj::Array<kj::byte> output, int outputOffset, int outputLength);                             \
-  template jsg::Ref<ZlibUtil::CompressionStream<T>> ZlibUtil::CompressionStream<T>::constructor(   \
-      ZlibModeValue mode);
+      jsg::Optional<kj::Array<kj::byte>> input, uint32_t inputOffset, uint32_t inputLength,        \
+      kj::Array<kj::byte> output, uint32_t outputOffset, uint32_t outputLength);
 
 CREATE_TEMPLATE(ZlibContext)
 CREATE_TEMPLATE(BrotliEncoderContext)
 CREATE_TEMPLATE(BrotliDecoderContext)
 
-template jsg::Ref<ZlibUtil::BrotliCompressionStream<BrotliEncoderContext>> ZlibUtil::
-    BrotliCompressionStream<BrotliEncoderContext>::constructor(ZlibModeValue mode);
-template jsg::Ref<ZlibUtil::BrotliCompressionStream<BrotliDecoderContext>> ZlibUtil::
-    BrotliCompressionStream<BrotliDecoderContext>::constructor(ZlibModeValue mode);
-template bool ZlibUtil::BrotliCompressionStream<BrotliEncoderContext>::initialize(
-    jsg::Lock&, jsg::BufferSource, jsg::BufferSource, jsg::Function<void()>);
-template bool ZlibUtil::BrotliCompressionStream<BrotliDecoderContext>::initialize(
-    jsg::Lock&, jsg::BufferSource, jsg::BufferSource, jsg::Function<void()>);
+template class ZlibUtil::BrotliCompressionStream<BrotliEncoderContext>;
+template class ZlibUtil::BrotliCompressionStream<BrotliDecoderContext>;
 
 template kj::Array<kj::byte> ZlibUtil::brotliSync<BrotliEncoderContext>(
-    InputSource data, BrotliContext::Options opts);
+    jsg::Lock& js, InputSource data, BrotliContext::Options opts);
 template kj::Array<kj::byte> ZlibUtil::brotliSync<BrotliDecoderContext>(
-    InputSource data, BrotliContext::Options opts);
+    jsg::Lock& js, InputSource data, BrotliContext::Options opts);
 template void ZlibUtil::brotliWithCallback<BrotliEncoderContext>(
     jsg::Lock& js, InputSource data, BrotliContext::Options options, CompressCallback cb);
 template void ZlibUtil::brotliWithCallback<BrotliDecoderContext>(

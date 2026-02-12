@@ -9,10 +9,9 @@ import { ERR_INVALID_URI } from 'node-internal:internal_errors';
 type EncodeFunction = (value: string) => string;
 type DecodeFunction = (value: string) => string;
 
-export const hexTable = new Array(256) as string[];
-for (let i = 0; i < 256; ++i) {
-  hexTable[i] = '%' + ((i < 16 ? '0' : '') + i.toString(16)).toUpperCase();
-}
+export const hexTable = Array.from({ length: 256 }, (_, i) => {
+  return '%' + ((i < 16 ? '0' : '') + i.toString(16)).toUpperCase();
+});
 
 // prettier-ignore
 const isHexTable = new Int8Array([
@@ -102,6 +101,8 @@ export function encodeStr(
   return out;
 }
 /* eslint-enable */
+
+/* eslint-disable @typescript-eslint/no-unnecessary-type-conversion */
 
 // prettier-ignore
 const unhexTable = new Int8Array([
@@ -209,8 +210,9 @@ const noEscape = new Int8Array([
 export function escape(input: unknown): string {
   let str: string;
   if (typeof input !== 'string') {
+    // eslint-disable-next-line @typescript-eslint/no-base-to-string
     if (typeof input === 'object') str = String(input);
-    // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
+    // eslint-disable-next-line @typescript-eslint/restrict-plus-operands,@typescript-eslint/no-base-to-string
     else str = input + '';
   } else {
     str = input;
@@ -227,6 +229,7 @@ function stringifyPrimitive(v: unknown): string {
   if (typeof v === 'string') return v;
   // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
   if (typeof v === 'number' && Number.isFinite(v)) return '' + v;
+  // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
   if (typeof v === 'bigint') return '' + v;
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   return '';
@@ -240,6 +243,7 @@ function encodeStringified(v: unknown, encode: EncodeFunction): string {
     // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
     return Math.abs(v) < 1e21 ? '' + v : encode('' + v);
   }
+  // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
   if (typeof v === 'bigint') return '' + v;
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   return '';

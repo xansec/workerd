@@ -4,6 +4,8 @@
 
 #include "urlpattern.h"
 
+#include <workerd/util/own-util.h>
+
 #include <kj/vector.h>
 
 namespace workerd::api {
@@ -11,16 +13,17 @@ namespace workerd::api {
 namespace {
 jsg::JsRef<jsg::JsRegExp> compileRegex(
     jsg::Lock& js, const jsg::UrlPattern::Component& component, bool ignoreCase) {
-  return js.tryCatch([&] {
+  JSG_TRY(js) {
     jsg::Lock::RegExpFlags flags = jsg::Lock::RegExpFlags::kUNICODE;
     if (ignoreCase) {
       flags = static_cast<jsg::Lock::RegExpFlags>(
           flags | static_cast<int>(jsg::Lock::RegExpFlags::kIGNORE_CASE));
     }
     return jsg::JsRef<jsg::JsRegExp>(js, js.regexp(component.getRegex(), flags));
-  }, [&](auto reason) -> jsg::JsRef<jsg::JsRegExp> {
+  }
+  JSG_CATCH(_) {
     JSG_FAIL_REQUIRE(TypeError, "Invalid regular expression syntax.");
-  });
+  }
 }
 
 jsg::Ref<URLPattern> create(jsg::Lock& js, jsg::UrlPattern pattern) {
@@ -36,7 +39,7 @@ jsg::Ref<URLPattern> create(jsg::Lock& js, jsg::UrlPattern pattern) {
 #undef V
 
 #define V(_, var) , kj::mv(var)
-  return jsg::alloc<URLPattern>(kj::mv(pattern) URL_PATTERN_COMPONENTS(V));
+  return js.alloc<URLPattern>(kj::mv(pattern) URL_PATTERN_COMPONENTS(V));
 #undef V
 }
 
@@ -123,29 +126,48 @@ kj::StringPtr URLPattern::getHash() {
 
 URLPattern::URLPatternInit::operator jsg::UrlPattern::Init() {
   return {
-    .protocol = this->protocol.map([](kj::String& str) { return kj::str(str); }),
-    .username = this->username.map([](kj::String& str) { return kj::str(str); }),
-    .password = this->password.map([](kj::String& str) { return kj::str(str); }),
-    .hostname = this->hostname.map([](kj::String& str) { return kj::str(str); }),
-    .port = this->port.map([](kj::String& str) { return kj::str(str); }),
-    .pathname = this->pathname.map([](kj::String& str) { return kj::str(str); }),
-    .search = this->search.map([](kj::String& str) { return kj::str(str); }),
-    .hash = this->hash.map([](kj::String& str) { return kj::str(str); }),
-    .baseUrl = this->baseURL.map([](kj::String& str) { return kj::str(str); }),
+    .protocol = mapCopyString(this->protocol),
+    .username = mapCopyString(this->username),
+    .password = mapCopyString(this->password),
+    .hostname = mapCopyString(this->hostname),
+    .port = mapCopyString(this->port),
+    .pathname = mapCopyString(this->pathname),
+    .search = mapCopyString(this->search),
+    .hash = mapCopyString(this->hash),
+    .baseUrl = mapCopyString(this->baseURL),
   };
 }
 
 jsg::Ref<URLPattern> URLPattern::constructor(jsg::Lock& js,
     jsg::Optional<URLPatternInput> input,
-    jsg::Optional<kj::String> baseURL,
+    jsg::Optional<kj::OneOf<kj::String, URLPatternOptions>> baseURL,
     jsg::Optional<URLPatternOptions> patternOptions) {
-  auto options = patternOptions.orDefault({});
+  kj::Maybe<kj::String> base;
+  kj::Maybe<bool> ignoreCase;
+
+  KJ_IF_SOME(b, baseURL) {
+    KJ_SWITCH_ONEOF(b) {
+      KJ_CASE_ONEOF(str, kj::String) {
+        base = kj::str(str);
+      }
+      KJ_CASE_ONEOF(o, URLPatternOptions) {
+        ignoreCase = o.ignoreCase.orDefault(false);
+      }
+    }
+  }
+
+  if (ignoreCase == kj::none) {
+    KJ_IF_SOME(o, patternOptions) {
+      ignoreCase = o.ignoreCase.orDefault(false);
+    }
+  }
+
   KJ_SWITCH_ONEOF(kj::mv(input).orDefault(URLPatternInit{})) {
     KJ_CASE_ONEOF(str, kj::String) {
       KJ_SWITCH_ONEOF(jsg::UrlPattern::tryCompile(str.asPtr(),
                           jsg::UrlPattern::CompileOptions{
-                            .baseUrl = baseURL.map([](kj::String& str) { return str.asPtr(); }),
-                            .ignoreCase = options.ignoreCase.orDefault(false),
+                            .baseUrl = base.map([](kj::String& str) { return str.asPtr(); }),
+                            .ignoreCase = ignoreCase.orDefault(false),
                           })) {
         KJ_CASE_ONEOF(err, kj::String) {
           JSG_FAIL_REQUIRE(TypeError, kj::mv(err));
@@ -158,7 +180,8 @@ jsg::Ref<URLPattern> URLPattern::constructor(jsg::Lock& js,
     KJ_CASE_ONEOF(init, URLPatternInit) {
       KJ_SWITCH_ONEOF(jsg::UrlPattern::tryCompile(init,
                           jsg::UrlPattern::CompileOptions{
-                            .ignoreCase = options.ignoreCase.orDefault(false),
+                            .baseUrl = base.map([](kj::String& str) { return str.asPtr(); }),
+                            .ignoreCase = ignoreCase.orDefault(false),
                           })) {
         KJ_CASE_ONEOF(err, kj::String) {
           JSG_FAIL_REQUIRE(TypeError, kj::mv(err));
@@ -217,15 +240,15 @@ kj::Maybe<URLPattern::URLPatternResult> URLPattern::exec(
       JSG_REQUIRE(
           maybeBase == kj::none, TypeError, "A baseURL is not allowed when input is an object.");
       inputs.add(URLPattern::URLPatternInit{
-        .protocol = i.protocol.map([](kj::String& str) { return kj::str(str); }),
-        .username = i.username.map([](kj::String& str) { return kj::str(str); }),
-        .password = i.password.map([](kj::String& str) { return kj::str(str); }),
-        .hostname = i.hostname.map([](kj::String& str) { return kj::str(str); }),
-        .port = i.port.map([](kj::String& str) { return kj::str(str); }),
-        .pathname = i.pathname.map([](kj::String& str) { return kj::str(str); }),
-        .search = i.search.map([](kj::String& str) { return kj::str(str); }),
-        .hash = i.hash.map([](kj::String& str) { return kj::str(str); }),
-        .baseURL = i.baseURL.map([](kj::String& str) { return kj::str(str); }),
+        .protocol = mapCopyString(i.protocol),
+        .username = mapCopyString(i.username),
+        .password = mapCopyString(i.password),
+        .hostname = mapCopyString(i.hostname),
+        .port = mapCopyString(i.port),
+        .pathname = mapCopyString(i.pathname),
+        .search = mapCopyString(i.search),
+        .hash = mapCopyString(i.hash),
+        .baseURL = mapCopyString(i.baseURL),
       });
 
       jsg::UrlPattern::Init init = {

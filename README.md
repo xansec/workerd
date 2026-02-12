@@ -72,14 +72,14 @@ To build `workerd`, you need:
 * Bazel
   * If you use [Bazelisk](https://github.com/bazelbuild/bazelisk) (recommended), it will automatically download and use the right version of Bazel for building workerd.
 * On Linux:
-  * We use the clang/LLVM toolchain to build workerd and support version 16 and higher. Earlier versions of clang may still work, but are not officially supported.
-  * Clang 16+ (e.g. package `clang-16` on Debian Bookworm). If clang is installed as `clang-<version>` please create a symlink to it in your PATH named `clang`, or use `--action_env=CC=clang-<version>` on `bazel` command lines to specify the compiler name.
+  * We use the clang/LLVM toolchain to build workerd and support version 19 and higher. Earlier versions of clang may still work, but are not officially supported.
+  * Clang 19+ (e.g. package `clang-19` on Debian Bookworm). If clang is installed as `clang-<version>` please create a symlink to it in your PATH named `clang`, or use `--action_env=CC=clang-<version>` on `bazel` command lines to specify the compiler name.
 
-  * libc++ 16+ (e.g. packages `libc++-16-dev` and `libc++abi-16-dev`)
-  * LLD 16+ (e.g. package `lld-16`).
+  * libc++ 19+ (e.g. packages `libc++-19-dev` and `libc++abi-19-dev`)
+  * LLD 19+ (e.g. package `lld-19`).
   * `python3`, `python3-distutils`, and `tcl8.6`
 * On macOS:
-  * Xcode 16 installation (available on macOS 14 and higher). **Full Xcode is required**, the Xcode command line tools alone are **not sufficient** for building.
+  * Xcode 16.3 installation (available on macOS 15 and higher). Building with just the Xcode Command Line Tools is not being tested, but should work too.
   * Homebrew installed `tcl-tk` package (provides Tcl 8.6)
 * On Windows:
   * Install [App Installer](https://learn.microsoft.com/en-us/windows/package-manager/winget/#install-winget)
@@ -96,6 +96,12 @@ You may then build `workerd` at the command-line with:
 bazel build //src/workerd/server:workerd
 ```
 
+You can pass `--config=release` to compile in release mode:
+
+```sh
+bazel build //src/workerd/server:workerd --config=release
+```
+
 You can also build from within Visual Studio Code using the instructions in [docs/vscode.md](docs/vscode.md).
 
 The compiled binary will be located at `bazel-bin/src/workerd/server/workerd`.
@@ -103,7 +109,7 @@ The compiled binary will be located at `bazel-bin/src/workerd/server/workerd`.
 If you run a Bazel build before you've installed some dependencies (like clang or libc++), and then you install the dependencies, you must resync locally cached toolchains, or clean Bazel's cache, otherwise you might get strange errors:
 
 ```sh
-bazel sync --configure
+bazel fetch --configure --force
 ```
 
 If that fails, you can try:
@@ -119,6 +125,33 @@ version of workerd:
 
 ```sh
 bazel build --config=thin-lto //src/workerd/server:workerd
+```
+
+### Code Coverage (Linux only)
+
+Code coverage is only supported on Linux. To generate code coverage reports, you need LLVM coverage tools (`llvm-profdata` and `llvm-cov`) installed:
+
+```sh
+sudo apt-get install llvm
+```
+
+If your distribution installs versioned binaries (e.g., `llvm-profdata-19`), create symlinks:
+
+```sh
+sudo ln -sf /usr/bin/llvm-profdata-19 /usr/local/bin/llvm-profdata
+sudo ln -sf /usr/bin/llvm-cov-19 /usr/local/bin/llvm-cov
+```
+
+Then run coverage with:
+
+```sh
+bazel coverage //...
+```
+
+Or use the just command which also generates an HTML report:
+
+```sh
+just coverage
 ```
 
 ### Configuring `workerd`
@@ -186,7 +219,13 @@ Prebuilt binaries are distributed via `npm`. Run `npx workerd ...` to use these.
 
 ### Local Worker development with `wrangler`
 
-You can use [Wrangler](https://developers.cloudflare.com/workers/wrangler/) (v3.0 or greater) to develop Cloudflare Workers locally, using `workerd`. Run:
+You can use [Wrangler](https://developers.cloudflare.com/workers/wrangler/) (v3.0 or greater) to develop Cloudflare Workers locally, using `workerd`. First, run the following command to configure Miniflare to use this build of `workerd`.
+
+```
+export MINIFLARE_WORKERD_PATH="<WORKERD_REPO_DIR>/bazel-bin/src/workerd/server/workerd"
+```
+
+Then, run:
 
 `wrangler dev`
 

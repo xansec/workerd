@@ -8,19 +8,21 @@
 #include <workerd/io/actor-cache.h>  // because we can't forward-declare ActorCache::SharedLru.
 #include <workerd/io/actor-id.h>
 #include <workerd/io/compatibility-date.capnp.h>
+#include <workerd/io/container.capnp.h>
 #include <workerd/io/frankenvalue.h>
 #include <workerd/io/io-channels.h>
-#include <workerd/io/limit-enforcer.h>
-#include <workerd/io/outcome.capnp.h>
+#include <workerd/io/io-timers.h>
+#include <workerd/io/observer.h>
 #include <workerd/io/request-tracker.h>
-#include <workerd/io/worker-interface.capnp.h>
+#include <workerd/io/trace.h>
 #include <workerd/io/worker-interface.h>
+#include <workerd/io/worker-source.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/jsg.h>
-#include <workerd/util/thread-scopes.h>
-#include <workerd/util/uncaught-exception-source.h>
+#include <workerd/jsg/modules-new.h>
+#include <workerd/jsg/modules.h>
+#include <workerd/util/strong-bool.h>
 #include <workerd/util/weak-refs.h>
-#include <workerd/util/xthreadnotifier.h>
 
 #include <kj/compat/http.h>
 #include <kj/mutex.h>
@@ -30,6 +32,9 @@ class Isolate;
 }
 
 namespace workerd {
+
+WD_STRONG_BOOL(StructuredLogging);
+WD_STRONG_BOOL(ProcessStdioPrefixed);
 
 namespace api {
 class DurableObjectState;
@@ -42,7 +47,16 @@ class Socket;
 class WebSocket;
 class WebSocketRequestResponsePair;
 class ExecutionContext;
+namespace pyodide {
+struct ArtifactBundler_State;
+struct EmscriptenRuntime;
+KJ_DECLARE_NON_POLYMORPHIC(ArtifactBundler_State);
+}  // namespace pyodide
 }  // namespace api
+
+class IsolateLimitEnforcer;
+enum class UncaughtExceptionSource;
+class VirtualFileSystem;
 
 class ThreadContext;
 class IoContext;
@@ -50,13 +64,24 @@ class InputGate;
 class OutputGate;
 
 // Type signature of an entrypoint implementation class (Durable Object or stateless service).
-typedef kj::OneOf<jsg::Ref<api::ExecutionContext>, jsg::Ref<api::DurableObjectState>>
-    ExecutionContextOrState;
-typedef jsg::Constructor<api::ExportedHandler(ExecutionContextOrState ctx, jsg::Value env)>
-    EntrypointClass;
+using ExecutionContextOrState =
+    kj::OneOf<jsg::Ref<api::ExecutionContext>, jsg::Ref<api::DurableObjectState>>;
+using EntrypointClass =
+    jsg::Constructor<api::ExportedHandler(ExecutionContextOrState ctx, jsg::Value env)>;
 
 // The type of a top-level export -- either a simple handler or a class.
-typedef kj::OneOf<EntrypointClass, api::ExportedHandler> NamedExport;
+using NamedExport = kj::OneOf<EntrypointClass, api::ExportedHandler>;
+
+struct EntrypointClasses {
+  // Class constructor for WorkerEntrypoint.
+  jsg::JsObject workerEntrypoint;
+
+  // Class constructor for DurableObject (aka api::DurableObjectBase).
+  jsg::JsObject durableObject;
+
+  // Class constructor for WorkflowEntrypoint
+  jsg::JsObject workflowEntrypoint;
+};
 
 // An instance of a Worker.
 //
@@ -77,33 +102,73 @@ class Worker: public kj::AtomicRefcounted {
   class ValidationErrorReporter {
    public:
     virtual void addError(kj::String error) = 0;
-    virtual void addHandler(kj::Maybe<kj::StringPtr> exportName, kj::StringPtr type) = 0;
 
-    // Called when an export is encountered that defines no handlers, thus isn't useful for
-    // anything.
-    virtual void addEmptyExport(kj::Maybe<kj::StringPtr> exportName) {}
+    // Report that the Worker implements a stateless entrypoint (e.g. WorkerEntrypoint or plain
+    // object export) with the given export name and methods.
+    virtual void addEntrypoint(
+        kj::Maybe<kj::StringPtr> exportName, kj::Array<kj::String> methods) = 0;
+
+    // Report that the Worker exports a Durable Object class with the given name.
+    virtual void addActorClass(kj::StringPtr exportName) = 0;
+
+    // Report that the Worker exports a Workflow class with the given name.
+    virtual void addWorkflowClass(kj::StringPtr exportName, kj::Array<kj::String> methods) = 0;
   };
 
   class LockType;
 
   enum class ConsoleMode {
-    // Only send `console.log`s to the inspector. Default, production behaviour.
+    // Only send `console.log`s to the inspector. Default, production behavior.
     INSPECTOR_ONLY,
-    // Send `console.log`s to the inspector and stdout/err. Behaviour running `workerd` locally.
+    // Send `console.log`s to the inspector and stdout/err. Behavior running `workerd` locally.
     STDOUT,
+  };
+
+  struct LoggingOptions {
+    ConsoleMode consoleMode = Worker::ConsoleMode::INSPECTOR_ONLY;
+    StructuredLogging structuredLogging = StructuredLogging::NO;
+    ProcessStdioPrefixed processStdioPrefixed = ProcessStdioPrefixed::YES;
+    kj::ConstString stdoutPrefix = "stdout:"_kjc;
+    kj::ConstString stderrPrefix = "stderr:"_kjc;
+
+    LoggingOptions() = default;
+    LoggingOptions(LoggingOptions&&) = default;
+    LoggingOptions& operator=(LoggingOptions&&) = default;
+
+    explicit LoggingOptions(ConsoleMode mode): consoleMode(mode) {}
+
+    LoggingOptions(const LoggingOptions& other)
+        : consoleMode(other.consoleMode),
+          structuredLogging(other.structuredLogging),
+          processStdioPrefixed(other.processStdioPrefixed),
+          stdoutPrefix(other.stdoutPrefix.clone()),
+          stderrPrefix(other.stderrPrefix.clone()) {}
+
+    LoggingOptions& operator=(const LoggingOptions& other) {
+      consoleMode = other.consoleMode;
+      structuredLogging = other.structuredLogging;
+      processStdioPrefixed = other.processStdioPrefixed;
+      stdoutPrefix = other.stdoutPrefix.clone();
+      stderrPrefix = other.stderrPrefix.clone();
+      return *this;
+    }
   };
 
   explicit Worker(kj::Own<const Script> script,
       kj::Own<WorkerObserver> metrics,
-      kj::FunctionParam<void(jsg::Lock& lock, const Api& api, v8::Local<v8::Object> target)>
-          compileBindings,
+      kj::FunctionParam<void(jsg::Lock& lock,
+          const Api& api,
+          v8::Local<v8::Object> target,
+          v8::Local<v8::Object> ctxExports)> compileBindings,
       IsolateObserver::StartType startType,
-      TraceParentContext spans,
+      SpanParent parentSpan,
       LockType lockType,
       kj::Maybe<ValidationErrorReporter&> errorReporter = kj::none,
       kj::Maybe<kj::Duration&> startupTime = kj::none);
   // `compileBindings()` is a callback that constructs all of the bindings and adds them as
-  // properties to `target`.
+  // properties to `target`. It also compiles the `ctx.exports` object and writes it to
+  // `ctxExports`. Note that it is permissible for this callback to save a handle to `ctxExports`
+  // and fill it in later if needed, as long as it is filled in before any requests are started.
 
   ~Worker() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(Worker);
@@ -150,12 +215,12 @@ class Worker: public kj::AtomicRefcounted {
   // This is useful for allowing generic client libraries to connect to private local services using
   // just a provided address (rather than requiring them to support being passed a binding to call
   // binding.connect() on).
-  typedef kj::Function<jsg::Ref<api::Socket>(jsg::Lock&)> ConnectFn;
+  using ConnectFn = kj::Function<jsg::Ref<api::Socket>(jsg::Lock&)>;
   void setConnectOverride(kj::String networkAddress, ConnectFn connectFn);
   kj::Maybe<ConnectFn&> getConnectOverride(kj::StringPtr networkAddress);
 
   static void setupContext(
-      jsg::Lock& lock, v8::Local<v8::Context> context, Worker::ConsoleMode consoleMode);
+      jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions);
 
  private:
   kj::Own<const Script> script;
@@ -171,15 +236,25 @@ class Worker: public kj::AtomicRefcounted {
 
   kj::HashMap<kj::String, ConnectFn> connectOverrides;
 
+  struct ActorClassInfo {
+    EntrypointClass cls;
+    bool missingSuperclass;
+  };
+
   class InspectorClient;
   class AsyncWaiter;
   friend constexpr bool _kj_internal_isPolymorphic(AsyncWaiter*);
 
   static void handleLog(jsg::Lock& js,
-      ConsoleMode mode,
+      const LoggingOptions& loggingOptions,
       LogLevel level,
       const v8::Global<v8::Function>& original,
       const v8::FunctionCallbackInfo<v8::Value>& info);
+
+  void processEntrypointClass(jsg::Lock& js,
+      EntrypointClass cls,
+      EntrypointClasses entrypointClasses,
+      kj::String handlerName);
 };
 
 // A compiled script within an Isolate, but which hasn't been instantiated into a particular
@@ -198,55 +273,64 @@ class Worker::Script: public kj::AtomicRefcounted {
   inline bool isModular() const {
     return modular;
   }
+  inline bool isPython() const {
+    return python;
+  }
+  inline kj::Maybe<kj::Arc<DynamicEnvBuilder>> getDynamicEnvBuilder() const {
+    return mapAddRef(dynamicEnvBuilder);
+  }
+
+  void installVirtualFileSystemOnContext(v8::Local<v8::Context> context) const;
+
+  const capnp::SchemaLoader& getSchemaLoader() const;
 
   struct CompiledGlobal {
     jsg::V8Ref<v8::String> name;
     jsg::V8Ref<v8::Value> value;
   };
 
-  struct ScriptSource {
-    // Content of the script (JavaScript). Pointer is valid only until the Script constructor
-    // returns.
-    kj::StringPtr mainScript;
-
-    // Name of the script, used as the script origin for stack traces. Pointer is valid only until
-    // the Script constructor returns.
-    kj::StringPtr mainScriptName;
-
-    // Callback which will compile the script-level globals, returning a list of them.
-    kj::Function<kj::Array<CompiledGlobal>(
-        jsg::Lock& lock, const Api& api, const jsg::CompilationObserver& observer)>
-        compileGlobals;
-  };
-  struct ModulesSource {
-    // Path to the main module, which can be looked up in the module registry. Pointer is valid
-    // only until the Script constructor returns.
-    kj::StringPtr mainModule;
-
-    // Callback which will construct the module registry and load all the modules into it.
-    kj::Function<void(jsg::Lock& lock, const Api& api)> compileModules;
-    bool isPython;
-  };
-  bool isPython;
-  using Source = kj::OneOf<ScriptSource, ModulesSource>;
+  // Historically these types were declared here, but then they were moved to `WorkerSource`. We
+  // maintain aliases here for backwards compatibility.
+  // TODO(cleanup): Update all the references, then remove these.
+  using EsModule = WorkerSource::EsModule;
+  using CommonJsModule = WorkerSource::CommonJsModule;
+  using TextModule = WorkerSource::TextModule;
+  using DataModule = WorkerSource::DataModule;
+  using WasmModule = WorkerSource::WasmModule;
+  using JsonModule = WorkerSource::JsonModule;
+  using PythonModule = WorkerSource::PythonModule;
+  using PythonRequirement = WorkerSource::PythonRequirement;
+  using CapnpModule = WorkerSource::CapnpModule;
+  using ModuleContent = WorkerSource::ModuleContent;
+  using Module = WorkerSource::Module;
+  using ScriptSource = WorkerSource::ScriptSource;
+  using ModulesSource = WorkerSource::ModulesSource;
+  using Source = WorkerSource;
 
  private:
   kj::Own<const Isolate> isolate;
   kj::String id;
   bool modular;
+  bool python;
 
   struct Impl;
   kj::Own<Impl> impl;
+
+  kj::Maybe<kj::Arc<DynamicEnvBuilder>> dynamicEnvBuilder;
 
   friend class Worker;
 
  public:  // pretend this is private (needs to be public because allocated through template)
   explicit Script(kj::Own<const Isolate> isolate,
       kj::StringPtr id,
-      Source source,
+      const Source& source,
       IsolateObserver::StartType startType,
       bool logNewScript,
-      kj::Maybe<ValidationErrorReporter&> errorReporter);
+      kj::Maybe<ValidationErrorReporter&> errorReporter,
+      kj::Maybe<kj::Own<api::pyodide::ArtifactBundler_State>> artifacts,
+      SpanParent parentSpan,
+      kj::Own<workerd::VirtualFileSystem> vfs,
+      kj::Maybe<kj::Arc<workerd::jsg::modules::ModuleRegistry>> maybeNewModuleRegistry);
 };
 
 // Multiple zones may share the same script. We would like to compile each script only once,
@@ -283,13 +367,23 @@ class Worker::Isolate: public kj::AtomicRefcounted {
       kj::StringPtr id,
       kj::Own<IsolateLimitEnforcer> limitEnforcer,
       InspectorPolicy inspectorPolicy,
-      ConsoleMode consoleMode = ConsoleMode::INSPECTOR_ONLY);
+      LoggingOptions loggingOptions = {});
 
   ~Isolate() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(Isolate);
 
   // Get the current Worker::Isolate from the current jsg::Lock
   static const Isolate& from(jsg::Lock& js);
+
+  // This callback gets executed when the CPU limiter is nearly out of time. It has to be signal
+  // safe since we call it in a signal handler.
+  //
+  // We give a reference to the callback to the limit enforcer, so it has to outlive the limit
+  // enforcer. The Isolate outlives the limit enforcer. If this function is called a second time, we
+  // throw to avoid invalidating references.
+  void setCpuLimitNearlyExceededCallback(kj::Function<void(void)> cb) const;
+  // Returns a reference to cpuLimitNearlyExceededCallback. Can't outlive the Isolate.
+  kj::Maybe<kj::Function<void(void)>> getCpuLimitNearlyExceededCallback() const;
 
   inline IsolateObserver& getMetrics() {
     return *metrics;
@@ -304,11 +398,19 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   }
 
   // Parses the given code to create a new script object and returns it.
+  //
+  // Note that the `source` is fully consumed before this method returns, so the underlying buffers
+  // it points into can be freed immediately after the call.
   kj::Own<const Worker::Script> newScript(kj::StringPtr id,
-      Script::Source source,
+      const Script::Source& source,
       IsolateObserver::StartType startType,
+      SpanParent parentSpan,
+      kj::Own<workerd::VirtualFileSystem> vfs,
       bool logNewScript = false,
-      kj::Maybe<ValidationErrorReporter&> errorReporter = kj::none) const;
+      kj::Maybe<ValidationErrorReporter&> errorReporter = kj::none,
+      kj::Maybe<kj::Own<api::pyodide::ArtifactBundler_State>> artifacts = kj::none,
+      kj::Maybe<kj::Arc<workerd::jsg::modules::ModuleRegistry>> maybeNewModuleRegistry =
+          kj::none) const;
 
   inline IsolateLimitEnforcer& getLimitEnforcer() {
     return *limitEnforcer;
@@ -342,7 +444,7 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   // running on the _calling thread_, which will most likely only be inspector console commands, and
   // is not typically desired.
   //
-  // For the above reason , this overload is curently only suitable for use by the internal Workers
+  // For the above reason , this overload is currently only suitable for use by the internal Workers
   // Runtime codebase, which patches V8 to profile whichever thread currently holds the `v8::Locker`
   // for this Isolate.
   kj::Promise<void> attachInspector(kj::Timer& timer,
@@ -391,6 +493,15 @@ class Worker::Isolate: public kj::AtomicRefcounted {
 
   bool isInspectorEnabled() const;
 
+  // Get the process stdio prefixed setting from logging options
+  inline kj::StringPtr getStdoutPrefix() const {
+    return loggingOptions.stdoutPrefix;
+  }
+
+  inline kj::StringPtr getStderrPrefix() const {
+    return loggingOptions.stderrPrefix;
+  }
+
   // Represents a weak reference back to the isolate that code within the isolate can use as an
   // indirect pointer when they want to be able to race destruction safely. A caller wishing to
   // use a weak reference to the isolate should acquire a strong reference to weakIsolateRef.
@@ -404,6 +515,9 @@ class Worker::Isolate: public kj::AtomicRefcounted {
 
   kj::Own<const WeakIsolateRef> getWeakRef() const;
 
+  // Get a UUID for this isolate.
+  kj::StringPtr getUuid() const;
+
  private:
   kj::Promise<AsyncLock> takeAsyncLockImpl(
       kj::Maybe<kj::Own<IsolateObserver::LockTiming>> lockTiming) const;
@@ -415,8 +529,9 @@ class Worker::Isolate: public kj::AtomicRefcounted {
 
   kj::String id;
   kj::Own<IsolateLimitEnforcer> limitEnforcer;
+  kj::MutexGuarded<kj::Maybe<kj::Function<void(void)>>> cpuLimitNearlyExceededCallback;
   kj::Own<Api> api;
-  ConsoleMode consoleMode;
+  LoggingOptions loggingOptions;
 
   // If non-null, a serialized JSON object with a single "flags" property, which is a list of
   // compatibility enable-flags that are relevant to FL.
@@ -480,6 +595,9 @@ class Worker::Api {
   // TODO(cleanup): This is a hack thrown in quickly because IoContext::current() doesn't work in
   //   the global scope (when no request is running). We need a better design here.
 
+  // Like `current()`, but returns `kj::none` if there is no current Api instance.
+  static kj::Maybe<const Api&> tryCurrent();
+
   // Take a lock on the isolate.
   virtual kj::Own<jsg::Lock> lock(jsg::V8StackScope& stackScope) const = 0;
   // TODO(cleanup): Change all locking to a synchronous callback style rather than RAII style, so
@@ -490,23 +608,32 @@ class Worker::Api {
   // Api.
   virtual CompatibilityFlags::Reader getFeatureFlags() const = 0;
 
+  struct NewContextOptions {
+    // If the worker is using the new module registry system, this is the registry to
+    // install on the newly created context. If null, the old system is assumed.
+    kj::Maybe<const workerd::jsg::modules::ModuleRegistry&> newModuleRegistry;
+    kj::Maybe<const capnp::SchemaLoader&> schemaLoader;
+  };
+
   // Create the context (global scope) object.
-  virtual jsg::JsContext<api::ServiceWorkerGlobalScope> newContext(jsg::Lock& lock) const = 0;
+  virtual jsg::JsContext<api::ServiceWorkerGlobalScope> newContext(
+      jsg::Lock& lock, NewContextOptions options = {}) const = 0;
+
+  virtual void compileModules(jsg::Lock& lock,
+      const Script::ModulesSource& source,
+      const Worker::Isolate& isolate,
+      kj::Maybe<kj::Own<api::pyodide::ArtifactBundler_State>> artifacts,
+      SpanParent parentSpan) const = 0;
+
+  virtual kj::Array<Worker::Script::CompiledGlobal> compileServiceWorkerGlobals(jsg::Lock& lock,
+      const Script::ScriptSource& source,
+      const Worker::Isolate& isolate) const = 0;
 
   // Given a module's export namespace, return all the top-level exports.
   virtual jsg::Dict<NamedExport> unwrapExports(
       jsg::Lock& lock, v8::Local<v8::Value> moduleNamespace) const = 0;
 
-  struct EntrypointClasses {
-    // Class constructor for WorkerEntrypoint.
-    jsg::JsObject workerEntrypoint;
-
-    // Class constructor for DurableObject (aka api::DurableObjectBase).
-    jsg::JsObject durableObject;
-
-    // Class constructor for WorkflowEntrypoint
-    jsg::JsObject workflowEntrypoint;
-  };
+  virtual NamedExport unwrapExport(jsg::Lock& lock, v8::Local<v8::Value> exportVal) const = 0;
 
   // Get the constructors for classes from which entrypoint classes may inherit.
   //
@@ -638,6 +765,9 @@ class Worker::Lock {
   // Get the C++ object representing the global scope.
   api::ServiceWorkerGlobalScope& getGlobalScope();
 
+  // Get the timeout ID generator from this worker's ServiceWorkerGlobalScope.
+  TimeoutId::Generator& getTimeoutIdGenerator();
+
   // Get the opaque storage key to use for recording trace information in async contexts.
   jsg::AsyncContextFrame::StorageKey& getTraceAsyncContextKey();
 
@@ -717,6 +847,7 @@ class Worker::Actor final: public kj::Refcounted {
   //   to customize the JS API but only the underlying ActorCacheInterface?
 
   using Id = kj::OneOf<kj::Own<ActorIdFactory::ActorId>, kj::String>;
+  static bool idsEqual(const Id& a, const Id& b);
 
   // Class that allows sending requests to this actor, recreating it as needed. It is safe to hold
   // onto this for longer than a Worker::Actor is alive.
@@ -741,11 +872,34 @@ class Worker::Actor final: public kj::Refcounted {
     virtual void hibernateWebSockets(Worker::Lock& lock) = 0;
     virtual void setWebSocketAutoResponse(
         kj::Maybe<kj::StringPtr> request, kj::Maybe<kj::StringPtr> response) = 0;
-    virtual kj::Maybe<jsg::Ref<api::WebSocketRequestResponsePair>> getWebSocketAutoResponse() = 0;
+    virtual kj::Maybe<jsg::Ref<api::WebSocketRequestResponsePair>> getWebSocketAutoResponse(
+        jsg::Lock& js) = 0;
     virtual void setTimerChannel(TimerChannel& timerChannel) = 0;
     virtual kj::Own<HibernationManager> addRef() = 0;
     virtual void setEventTimeout(kj::Maybe<uint32_t> timeoutMs) = 0;
     virtual kj::Maybe<uint32_t> getEventTimeout() = 0;
+  };
+
+  class FacetManager {
+   public:
+    // Information needed to start a facet.
+    struct StartInfo {
+      // The actor class, from a DurableObjectClass binding.
+      //
+      // WARNING: The object passed here MUST be directly from IoChannelFactory::getActorClass(),
+      //   as the FacetManager implementation is allowed to assume it can downcast to whatever
+      //   type the IoChannelFactory produces.
+      kj::Own<IoChannelFactory::ActorClassChannel> actorClass;
+
+      // ctx.id for the child object.
+      Worker::Actor::Id id;
+    };
+
+    // These methods are C++ equivalents of the JavaScript ctx.facets API.
+    virtual kj::Own<IoChannelFactory::ActorChannel> getFacet(
+        kj::StringPtr name, kj::Function<kj::Promise<StartInfo>()> getStartInfo) = 0;
+    virtual void abortFacet(kj::StringPtr name, kj::Exception reason) = 0;
+    virtual void deleteFacet(kj::StringPtr name) = 0;
   };
 
   // Create a new Actor hosted by this Worker. Note that this Actor object may only be manipulated
@@ -756,13 +910,15 @@ class Worker::Actor final: public kj::Refcounted {
       bool hasTransient,
       MakeActorCacheFunc makeActorCache,
       kj::Maybe<kj::StringPtr> className,
+      Frankenvalue props,
       MakeStorageFunc makeStorage,
-      Worker::Lock& lock,
       kj::Own<Loopback> loopback,
       TimerChannel& timerChannel,
       kj::Own<ActorObserver> metrics,
       kj::Maybe<kj::Own<HibernationManager>> manager,
-      kj::Maybe<uint16_t> hibernationEventType);
+      kj::Maybe<uint16_t> hibernationEventType,
+      kj::Maybe<rpc::Container::Client> container = kj::none,
+      kj::Maybe<FacetManager&> facetManager = kj::none);
 
   ~Actor() noexcept(false);
 
@@ -823,6 +979,12 @@ class Worker::Actor final: public kj::Refcounted {
   //   some more information to the place where `Actor` is created, which might be uglier than it's
   //   worth.
 
+  // Get the `ctx` object for this actor.
+  jsg::JsObject getCtx(jsg::Lock& js);
+
+  // Get the `env` object for this actor.
+  jsg::JsValue getEnv(jsg::Lock& js);
+
   // Get the HibernationManager which should be used for all activity in this Actor. Returns null if
   // setHibernationManager() hasn't been called yet.
   kj::Maybe<HibernationManager&> getHibernationManager();
@@ -865,6 +1027,8 @@ class Worker::Actor final: public kj::Refcounted {
 
   kj::Maybe<api::ExportedHandler&> getHandler();
   friend class Worker;
+
+  kj::Promise<void> ensureConstructedImpl(IoContext&, ActorClassInfo& info);
 };
 
 // =======================================================================================
@@ -882,7 +1046,14 @@ struct SimpleWorkerErrorReporter final: public Worker::ValidationErrorReporter {
   void addError(kj::String error) override {
     errors.add(kj::mv(error));
   }
-  void addHandler(kj::Maybe<kj::StringPtr> exportName, kj::StringPtr type) override {
+  void addEntrypoint(kj::Maybe<kj::StringPtr> exportName, kj::Array<kj::String> methods) override {
+    KJ_UNREACHABLE;
+  }
+  void addActorClass(kj::StringPtr exportName) override {
+    KJ_UNREACHABLE;
+  }
+
+  void addWorkflowClass(kj::StringPtr exportName, kj::Array<kj::String> methods) override {
     KJ_UNREACHABLE;
   }
 

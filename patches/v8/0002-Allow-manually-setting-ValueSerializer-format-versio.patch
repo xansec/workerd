@@ -1,9 +1,10 @@
-From 8aa5173892d869765d77bbe83e3c97ba5be123b3 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: James M Snell <jasnell@gmail.com>
 Date: Wed, 16 Mar 2022 08:59:21 -0700
 Subject: Allow manually setting ValueSerializer format version
 
 Refs: https://bitbucket.cfdata.org/projects/MIRRORS/repos/v8/pull-requests/2/overview
+Signed-off-by: James M Snell <jsnell@cloudflare.com>
 
 diff --git a/include/v8-value-serializer.h b/include/v8-value-serializer.h
 index 40ad805c7970cc9379e69f046205836dbd760373..596be18adeb3a5a81794aaa44b1d347dec6c0c7d 100644
@@ -22,10 +23,10 @@ index 40ad805c7970cc9379e69f046205836dbd760373..596be18adeb3a5a81794aaa44b1d347d
     * Writes out a header, which includes the format version.
     */
 diff --git a/src/api/api.cc b/src/api/api.cc
-index cda724c712dda198f3c0c6b1d94e0a6d70b745fd..b69788395974538231aa3d2094453630d0c4f62a 100644
+index a1c286d2c073eb49b06fd58324f9525ea34fea33..4689a9057392f463d50f56db4b559e719b81dda1 100644
 --- a/src/api/api.cc
 +++ b/src/api/api.cc
-@@ -3487,6 +3487,10 @@ ValueSerializer::ValueSerializer(Isolate* v8_isolate, Delegate* delegate)
+@@ -3460,6 +3460,10 @@ ValueSerializer::ValueSerializer(Isolate* v8_isolate, Delegate* delegate)
  
  ValueSerializer::~ValueSerializer() { delete private_; }
  
@@ -37,10 +38,10 @@ index cda724c712dda198f3c0c6b1d94e0a6d70b745fd..b69788395974538231aa3d2094453630
  
  void ValueSerializer::SetTreatArrayBufferViewsAsHostObjects(bool mode) {
 diff --git a/src/objects/value-serializer.cc b/src/objects/value-serializer.cc
-index b62f2f907806fa3fa6189e15908aaeb218b06b82..187700b273d5d79b79b554d597ca6e605cdb4d26 100644
+index 128331ee3fd500b3861c8e8d866ca40e5a621c02..6294e46b2a1d7b6b9e9fd57706d5cb4d72295f53 100644
 --- a/src/objects/value-serializer.cc
 +++ b/src/objects/value-serializer.cc
-@@ -291,6 +291,7 @@ ValueSerializer::ValueSerializer(Isolate* isolate,
+@@ -297,6 +297,7 @@ ValueSerializer::ValueSerializer(Isolate* isolate,
      : isolate_(isolate),
        delegate_(delegate),
        zone_(isolate->allocator(), ZONE_NAME),
@@ -48,7 +49,7 @@ index b62f2f907806fa3fa6189e15908aaeb218b06b82..187700b273d5d79b79b554d597ca6e60
        id_map_(isolate->heap(), ZoneAllocationPolicy(&zone_)),
        array_buffer_transfer_map_(isolate->heap(),
                                   ZoneAllocationPolicy(&zone_)) {
-@@ -310,9 +311,17 @@ ValueSerializer::~ValueSerializer() {
+@@ -316,9 +317,17 @@ ValueSerializer::~ValueSerializer() {
    }
  }
  
@@ -67,7 +68,7 @@ index b62f2f907806fa3fa6189e15908aaeb218b06b82..187700b273d5d79b79b554d597ca6e60
  }
  
  void ValueSerializer::SetTreatArrayBufferViewsAsHostObjects(bool mode) {
-@@ -1033,10 +1042,12 @@ Maybe<bool> ValueSerializer::WriteJSArrayBufferView(
+@@ -1102,10 +1111,12 @@ Maybe<bool> ValueSerializer::WriteJSArrayBufferView(
    WriteVarint(static_cast<uint8_t>(tag));
    WriteVarint(static_cast<uint32_t>(view->byte_offset()));
    WriteVarint(static_cast<uint32_t>(view->byte_length()));
@@ -83,7 +84,7 @@ index b62f2f907806fa3fa6189e15908aaeb218b06b82..187700b273d5d79b79b554d597ca6e60
  }
  
 diff --git a/src/objects/value-serializer.h b/src/objects/value-serializer.h
-index fd9ff05f3f5455a84b76246b5e9996cf7bcbf8db..cb9f1f3d9750da8914d5bd73c6742d6459c48e06 100644
+index 395f3848f0d0e62c1515a33ab07e7ef46e15d0e6..a463753df6ee29e79768829c7b7d5b3136bd997d 100644
 --- a/src/objects/value-serializer.h
 +++ b/src/objects/value-serializer.h
 @@ -54,6 +54,11 @@ class ValueSerializer {
@@ -98,7 +99,7 @@ index fd9ff05f3f5455a84b76246b5e9996cf7bcbf8db..cb9f1f3d9750da8914d5bd73c6742d64
    /*
     * Writes out a header, which includes the format version.
     */
-@@ -179,6 +184,7 @@ class ValueSerializer {
+@@ -182,6 +187,7 @@ class ValueSerializer {
    bool treat_array_buffer_views_as_host_objects_ = false;
    bool out_of_memory_ = false;
    Zone zone_;

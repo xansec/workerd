@@ -1,0 +1,47 @@
+"Bazel dependencies, see https://registry.bazel.build"
+
+module(name = "workerd")
+
+# sqlite3 is downloaded from sqlite.org (not GitHub), so it remains manual.
+# We have some patches that aren't included in BCR:
+# https://github.com/bazelbuild/bazel-central-registry/tree/main/modules/sqlite3/3.47.0/patches
+bazel_dep(name = "sqlite3")
+archive_override(
+    module_name = "sqlite3",
+    build_file = "//:build/BUILD.sqlite3",
+    patch_args = ["-p1"],
+    patches = [
+        "//:patches/sqlite/0001-row-counts-plain.patch",
+        "//:patches/sqlite/0002-macOS-missing-PATH-fix.patch",
+        "//:patches/sqlite/0003-sqlite-complete-early-exit.patch",
+        "//:patches/sqlite/0004-invalid-wal-on-rollback-fix.patch",
+    ],
+    remote_file_integrity = {
+        "MODULE.bazel": "sha256-TtpmqyHyks3o0WcSJO0XFyKkHfAIF98wq06+urs3oKI=",
+    },
+    remote_file_urls = {
+        "MODULE.bazel": ["https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/refs/heads/main/modules/sqlite3/3.47.0/MODULE.bazel"],
+    },
+    sha256 = "f59c349bedb470203586a6b6d10adb35f2afefa49f91e55a672a36a09a8fedf7",
+    strip_prefix = "sqlite-src-3470000",
+    url = "https://sqlite.org/2024/sqlite-src-3470000.zip",
+)
+
+# Automatically managed dependencies
+include("//build/deps:gen/deps.MODULE.bazel")
+include("//build/deps:gen/build_deps.MODULE.bazel")
+include("//build/deps:gen/shared_deps.MODULE.bazel")
+
+# Must be loaded after automated dependencies
+include("//build/deps:rust.MODULE.bazel")
+include("//build/deps:nodejs.MODULE.bazel")
+include("//build/deps:python.MODULE.bazel")
+include("//build/deps:v8.MODULE.bazel")
+include("//build/deps:oci.MODULE.bazel")
+
+# compatibility proxy is needed when using current rules_cc with Bazel 8
+compat = use_extension("@rules_cc//cc:extensions.bzl", "compatibility_proxy")
+use_repo(compat, "cc_compatibility_proxy")
+
+cc_configure = use_extension("@rules_cc//cc:extensions.bzl", "cc_configure_extension")
+use_repo(cc_configure, "local_config_cc")

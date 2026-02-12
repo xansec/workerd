@@ -4,9 +4,6 @@
 
 #pragma once
 
-#include <workerd/api/analytics-engine-impl.h>
-#include <workerd/api/analytics-engine.capnp.h>
-#include <workerd/api/util.h>
 #include <workerd/io/io-util.h>
 #include <workerd/jsg/jsg.h>
 
@@ -70,6 +67,10 @@ class AnalyticsEngine: public jsg::Object {
   double millisToNanos(double m) {
     return m * 1000000;
   }
+
+  // Called within writeDataPoint after waiting for output locks
+  void writeDataPointNoOutputLock(
+      jsg::Lock& js, jsg::Optional<api::AnalyticsEngine::AnalyticsEngineEvent>&& event);
 
   uint logfwdrChannel;
   kj::String dataset;

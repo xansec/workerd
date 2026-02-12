@@ -141,7 +141,7 @@ type PathObject = {
 };
 
 function _format(sep: string, pathObject: PathObject): string {
-  validateObject(pathObject, 'pathObject', {});
+  validateObject(pathObject, 'pathObject');
   const dir = pathObject.dir || pathObject.root;
   const base =
     pathObject.base ||
@@ -1238,7 +1238,7 @@ const posix = {
    * @returns {string}
    */
   toNamespacedPath(path: string): string {
-    // Non-op on posix systems
+    // No-op on Posix systems
     return path;
   },
 

@@ -4,6 +4,8 @@
 
 #include "analytics-engine.h"
 
+#include <workerd/api/analytics-engine-impl.h>
+#include <workerd/api/analytics-engine.capnp.h>
 #include <workerd/io/io-context.h>
 
 namespace workerd::api {
@@ -13,6 +15,21 @@ void AnalyticsEngine::writeDataPoint(
   auto& context = IoContext::current();
 
   context.getLimitEnforcer().newAnalyticsEngineRequest();
+
+  // Optimization: For non-actors, which never have output locks, avoid the overhead of
+  // awaitIo() and such by not going back to the event loop at all.
+  KJ_IF_SOME(promise, context.waitForOutputLocksIfNecessary()) {
+    context.awaitIo(js, kj::mv(promise), [this, event = kj::mv(event)](jsg::Lock& js) mutable {
+      writeDataPointNoOutputLock(js, kj::mv(event));
+    });
+  } else {
+    writeDataPointNoOutputLock(js, kj::mv(event));
+  }
+}
+
+void AnalyticsEngine::writeDataPointNoOutputLock(
+    jsg::Lock& js, jsg::Optional<api::AnalyticsEngine::AnalyticsEngineEvent>&& event) {
+  auto& context = IoContext::current();
 
   context.writeLogfwdr(logfwdrChannel, [&](capnp::AnyPointer::Builder ptr) {
     api::AnalyticsEngineEvent::Builder aeEvent = ptr.initAs<api::AnalyticsEngineEvent>();

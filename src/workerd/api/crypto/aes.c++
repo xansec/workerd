@@ -216,7 +216,14 @@ class AesGcmKey final: public AesKeyBase {
         JSG_REQUIRE_NONNULL(algorithm.iv, TypeError, "Missing field \"iv\" in \"algorithm\".");
     JSG_REQUIRE(iv.size() != 0, DOMOperationError, "AES-GCM IV must not be empty.");
 
-    auto additionalData = algorithm.additionalData.orDefault(kj::Array<kj::byte>()).asPtr();
+    kj::ArrayPtr<kj::byte> empty = nullptr;
+    auto additionalData = ([&] {
+      KJ_IF_SOME(source, algorithm.additionalData) {
+        return source.asArrayPtr();
+      } else {
+        return empty;
+      }
+    })();
 
     // The magic number below came from here:
     // https://w3c.github.io/webcrypto/Overview.html#aes-gcm-operations
@@ -291,7 +298,13 @@ class AesGcmKey final: public AesKeyBase {
         "the size of the AES-GCM tag length of ",
         tagLength, " bits.");
 
-    auto additionalData = algorithm.additionalData.orDefault(kj::Array<kj::byte>()).asPtr();
+    kj::ArrayPtr<kj::byte> empty = nullptr;
+    auto additionalData = ([&] {
+      KJ_IF_SOME(source, algorithm.additionalData) {
+        return source.asArrayPtr();
+      }
+      return empty;
+    })();
 
     auto cipherCtx = kj::disposeWith<EVP_CIPHER_CTX_free>(EVP_CIPHER_CTX_new());
     KJ_ASSERT(cipherCtx.get() != nullptr);
@@ -408,7 +421,8 @@ class AesCbcKey final: public AesKeyBase {
     int plainSize = 0;
     auto blockSize = EVP_CIPHER_CTX_block_size(cipherCtx.get());
 
-    auto plainText = kj::heapArray<kj::byte>(cipherText.size() + ((blockSize > 1) ? blockSize : 0));
+    KJ_STACK_ARRAY(
+        kj::byte, plainText, cipherText.size() + ((blockSize > 1) ? blockSize : 0), 1024, 4096);
 
     // Perform the actual decryption.
     OSSLCALL(EVP_DecryptUpdate(
@@ -419,7 +433,8 @@ class AesCbcKey final: public AesKeyBase {
         cipherCtx.get(), plainText.begin() + plainSize);
     KJ_ASSERT(plainSize <= plainText.size());
 
-    // TODO(perf): Avoid this copy, see comment in the encrypt implementation functions.
+    // Copy is necessary to support v8:Sandbox where all ArrayBuffers have to be
+    // allocated from within the sandbox.
     auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, plainSize);
     backing.asArrayPtr().copyFrom(plainText.first(plainSize));
     return jsg::BufferSource(js, kj::mv(backing));
@@ -497,7 +512,7 @@ class AesCtrKey final: public AesKeyBase {
         InternalDOMOperationError, "Error doing ", getAlgorithmName(), " encrypt/decrypt",
         internalDescribeOpensslErrors());
 
-    auto currentCounter = getCounter(counter.asPtr(), counterBitLength);
+    auto currentCounter = getCounter(counter.asArrayPtr(), counterBitLength);
 
     // Now figure out how many AES blocks we'll process/how many times to increment the counter.
     auto numOutputBlocks = newBignum();
@@ -531,19 +546,20 @@ class AesCtrKey final: public AesKeyBase {
 
     process(&cipher, data.first(inputSizePart1), counter, result.asArrayPtr());
 
-    // Zero the counter bits of the block. Chromium creates a copy but we own our buffer.
+    // Zero the counter bits of the block in a copy of the input counter.
+    kj::Array<kj::byte> zeroed_counter = kj::heapArray(counter.asArrayPtr());
     {
       KJ_DASSERT(counterBitLength / 8 <= expectedCounterByteSize);
 
       auto remainder = counterBitLength % 8;
       auto idx = expectedCounterByteSize - counterBitLength / 8;
-      counter.slice(idx).first(counterBitLength / 8).fill(0);
+      zeroed_counter.slice(idx).fill(0);
       if (remainder) {
-        counter[idx - 1] &= 0xFF << remainder;
+        zeroed_counter[idx - 1] &= 0xFF << remainder;
       }
     }
 
-    process(&cipher, data.slice(inputSizePart1, data.size()), counter,
+    process(&cipher, data.slice(inputSizePart1, data.size()), zeroed_counter,
         result.asArrayPtr().slice(inputSizePart1, result.size()));
 
     return jsg::BufferSource(js, kj::mv(result));
@@ -570,7 +586,7 @@ class AesCtrKey final: public AesKeyBase {
     // Convert the counter but zero out the topmost bits so that we can convert to bignum from a
     // byte stream. Chromium creates a copy here but that's because they only have a const only view
     // of the data but in our WebCrypto implementation we have a non-const view of the underlying
-    // counter buffer (in fact encrypt/decrypt explicitly gives us ownership of that buffer).
+    // counter buffer.
     auto byteLength = integerCeilDivision(counterBitLength, 8u);
     KJ_DASSERT(byteLength > 0, counterBitLength, remainderBits);
     KJ_DASSERT(byteLength <= expectedCounterByteSize, counterBitLength, counterBlock.size());
@@ -580,9 +596,8 @@ class AesCtrKey final: public AesKeyBase {
     auto previous = counterToProcess[0];
     counterToProcess[0] &= ~(0xFF << remainderBits);
     KJ_DEFER(counterToProcess[0] = previous);
-    // We temporarily modify the counter to construct the BIGNUM & this undoes it. It's a safe
-    // operation because we own the buffer. Technically the restoration isn't even strictly
-    // necessary because this buffer isn't used any more after this.
+    // We temporarily modified the counter to construct the BIGNUM, this undoes it to restore the
+    // input counter.
 
     return JSG_REQUIRE_NONNULL(toBignum(counterToProcess), InternalDOMOperationError,
         "Error doing ", getAlgorithmName(), " encrypt/decrypt", internalDescribeOpensslErrors());
@@ -757,7 +772,7 @@ kj::OneOf<jsg::Ref<CryptoKey>, CryptoKeyPair> CryptoKey::Impl::generateAes(jsg::
     JSG_FAIL_REQUIRE(DOMNotSupportedError, normalizedName, " key generation not supported.");
   }
 
-  return jsg::alloc<CryptoKey>(kj::mv(keyImpl));
+  return js.alloc<CryptoKey>(kj::mv(keyImpl));
 }
 
 kj::Own<CryptoKey::Impl> CryptoKey::Impl::importAes(jsg::Lock& js,
@@ -842,7 +857,7 @@ kj::Own<CryptoKey::Impl> CryptoKey::Impl::importAes(jsg::Lock& js,
     //     > The "use" and "key_ops" JWK members SHOULD NOT be used together;
     //     > however, if both are used, the information they convey MUST be
     //     > consistent
-    //   be interpreted? What constitutes "inconsistentcy"? Is that implicit in enforcing that "enc"
+    //   be interpreted? What constitutes "inconsistency"? Is that implicit in enforcing that "enc"
     //   must be the value for `use'? Or is there something else?
 
     KJ_IF_SOME(e, keyDataJwk.ext) {

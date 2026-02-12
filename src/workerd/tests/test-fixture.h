@@ -26,9 +26,12 @@ struct TestFixture {
     kj::Maybe<kj::StringPtr> mainModuleSource;
     // If set, make a stub of an Actor with the given id.
     kj::Maybe<Worker::Actor::Id> actorId;
+    // If true, use real timers instead of mock timers that never advance.
+    // Requires waitScope to be kj::none (so that the fixture creates its own AsyncIoContext).
+    bool useRealTimers;
   };
 
-  TestFixture(SetupParams&& params = {});
+  TestFixture(SetupParams&& params = {.useRealTimers = false});
 
   struct V8Environment {
     v8::Isolate* isolate;
@@ -78,7 +81,7 @@ struct TestFixture {
 
   // Special void version of runInIoContext that ignores exceptions with given descriptions.
   void runInIoContext(kj::Function<kj::Promise<void>(const Environment&)>&& callback,
-      kj::ArrayPtr<kj::StringPtr> errorsToIgnore);
+      kj::ArrayPtr<const kj::StringPtr> errorsToIgnore);
 
   struct Response {
     uint statusCode;
@@ -105,6 +108,7 @@ struct TestFixture {
   ThreadContext threadContext;
   kj::Own<Worker::ValidationErrorReporter> errorReporter;
   kj::Own<api::MemoryCacheProvider> memoryCacheProvider;
+  v8::IsolateGroup isolateGroup;
   kj::Own<Worker::Api> api;
   kj::Own<Worker::Isolate> workerIsolate;
   kj::Own<Worker::Script> workerScript;

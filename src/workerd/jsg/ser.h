@@ -6,6 +6,8 @@
 
 #include <workerd/jsg/jsg.h>
 
+#include <v8-value-serializer.h>
+
 #include <kj/vector.h>
 
 namespace workerd::jsg {
@@ -195,12 +197,13 @@ class Serializer final: v8::ValueSerializer::Delegate {
 
   kj::Maybe<ExternalHandler&> externalHandler;
 
-  kj::Vector<JsValue> sharedArrayBuffers;
-  kj::Vector<JsValue> arrayBuffers;
+  kj::Vector<jsg::JsRef<JsValue>> sharedArrayBuffers;
+  kj::Vector<jsg::JsRef<JsValue>> arrayBuffers;
   kj::Vector<std::shared_ptr<v8::BackingStore>> sharedBackingStores;
   kj::Vector<std::shared_ptr<v8::BackingStore>> backingStores;
   bool released = false;
   bool treatClassInstancesAsPlainObjects;
+  bool treatErrorsAsHostObjects = false;
 
   // Initialized to point at the prototype of `Object` if and only if
   // `treatClassInstancesAsPlainObjects` is false (in which case we will need to check against this
@@ -227,6 +230,14 @@ class Deserializer final: v8::ValueDeserializer::Delegate {
   struct Options {
     kj::Maybe<uint32_t> version;
     bool readHeader = true;
+
+    // When the enahnced error serialization feature is enabled, and we are deserializing
+    // a serialized error, this option controls whether to include the serialized stack
+    // property in the deserialized error. If false, the stack property is not restored
+    // and will instead be set to the captured stack at the time of deserialization.
+    // This flag has no effect if the enhanced error serialization feature is disabled,
+    // or the values being deserialized are not errors (or do not contain any error objects).
+    bool preserveStackInErrors = true;
 
     // ExternalHandler, if any. Typically this would be allocated on the stack just before the
     // Deserializer.
@@ -285,6 +296,7 @@ class Deserializer final: v8::ValueDeserializer::Delegate {
   size_t totalInputSize;
   v8::ValueDeserializer deser;
   kj::Maybe<kj::ArrayPtr<std::shared_ptr<v8::BackingStore>>> sharedBackingStores;
+  bool preserveStackInErrors = true;
 };
 
 // Intended for use with v8::ValueSerializer data released into a kj::Array.

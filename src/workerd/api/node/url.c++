@@ -5,6 +5,12 @@
 
 #include "ada.h"
 
+#include <workerd/rust/net/lib.rs.h>
+
+#include <kj-rs/kj-rs.h>
+
+using namespace kj_rs;
+
 namespace workerd::api::node {
 
 namespace {
@@ -77,6 +83,12 @@ jsg::JsString UrlUtil::format(
 
   auto href = out->get_href();
   return js.str(kj::StringPtr(href.data(), href.size()));
+}
+
+// We return empty string if the input is not a valid IP address.
+jsg::JsString UrlUtil::canonicalizeIp(jsg::Lock& js, kj::String input) {
+  auto out = rust::net::canonicalize_ip({input.begin(), input.size()});
+  return js.str(kj::StringPtr(out.c_str(), out.size()));
 }
 
 }  // namespace workerd::api::node

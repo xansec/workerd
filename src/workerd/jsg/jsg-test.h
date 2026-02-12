@@ -5,8 +5,10 @@
 #pragma once
 // Common JSG testing infrastructure
 
-#include "jsg.h"
-#include "setup.h"
+#include <workerd/jsg/jsg.h>
+#include <workerd/jsg/resource.h>
+#include <workerd/jsg/setup.h>
+#include <workerd/jsg/type-wrapper.h>
 
 #include <kj/test.h>
 
@@ -28,11 +30,14 @@ class Evaluator {
   //   in cases that the isolate includes types that require configuration, but currently the
   //   type is always default-constructed. What if you want to specify a test config?
  public:
-  explicit Evaluator(V8System& v8System): v8System(v8System) {}
+  explicit Evaluator(V8System& v8System, ConfigurationType config = {})
+      : v8System(v8System),
+        config(config) {}
 
   IsolateType& getIsolate() {
     // Slightly more efficient to only instantiate each isolate type once (17s vs. 20s):
-    static IsolateType isolate(v8System, ConfigurationType(), kj::heap<IsolateObserver>());
+    static IsolateType isolate(
+        v8System, v8::IsolateGroup::GetDefault(), config, kj::heap<IsolateObserver>());
     return isolate;
   }
 
@@ -144,7 +149,7 @@ class Evaluator {
         v8::TryCatch tryCatch(js.v8Isolate);
 
         try {
-          func(js);
+          func(lock);
         } catch (JsExceptionThrown&) {
           if (tryCatch.HasTerminated()) {
             KJ_FAIL_ASSERT("TerminateExecution() was called");
@@ -159,6 +164,7 @@ class Evaluator {
 
  private:
   V8System& v8System;
+  ConfigurationType config;
 };
 
 struct NumberBox: public Object {
@@ -167,8 +173,8 @@ struct NumberBox: public Object {
   explicit NumberBox(double value): value(value) {}
   NumberBox() = default;
 
-  static Ref<NumberBox> constructor(double value) {
-    return jsg::alloc<NumberBox>(value);
+  static Ref<NumberBox> constructor(jsg::Lock& js, double value) {
+    return js.alloc<NumberBox>(value);
   }
 
   void increment() {
@@ -187,8 +193,8 @@ struct NumberBox: public Object {
   double addBox(NumberBox& other) {
     return value + other.value;
   }
-  Ref<NumberBox> addReturnBox(double other) {
-    return jsg::alloc<NumberBox>(value + other);
+  Ref<NumberBox> addReturnBox(jsg::Lock& js, double other) {
+    return js.alloc<NumberBox>(value + other);
   }
   double addMultiple(NumberBox& a, double b, NumberBox& c) {
     return value + a.value + b + c.value;
@@ -201,21 +207,19 @@ struct NumberBox: public Object {
     value = newValue;
   }
 
-  Ref<NumberBox> getBoxed() {
-    return jsg::alloc<NumberBox>(value);
+  Ref<NumberBox> getBoxed(jsg::Lock& js) {
+    return js.alloc<NumberBox>(value);
   }
   void setBoxed(NumberBox& newValue) {
     value = newValue.value;
   }
 
   v8::Local<v8::Value> getBoxedFromTypeHandler(
-      jsg::Lock& js, v8::Isolate*, const TypeHandler<Ref<NumberBox>>& numberBoxTypeHandler) {
-    // This function takes an Isolate just to prove it can take multiple value-less parameters.
-    return numberBoxTypeHandler.wrap(js, alloc<NumberBox>(value));
+      jsg::Lock& js, const TypeHandler<Ref<NumberBox>>& numberBoxTypeHandler) {
+    return numberBoxTypeHandler.wrap(js, js.alloc<NumberBox>(value));
   }
 
   JSG_RESOURCE_TYPE(NumberBox) {
-
     JSG_METHOD(increment);
     JSG_METHOD(incrementBy);
     JSG_METHOD(incrementByBox);
@@ -240,8 +244,8 @@ class BoxBox: public Object {
 
   Ref<NumberBox> inner;
 
-  static Ref<BoxBox> constructor(NumberBox& inner, double add) {
-    return jsg::alloc<BoxBox>(jsg::alloc<NumberBox>(inner.value + add));
+  static Ref<BoxBox> constructor(jsg::Lock& js, NumberBox& inner, double add) {
+    return js.alloc<BoxBox>(js.alloc<NumberBox>(inner.value + add));
   }
 
   Ref<NumberBox> getInner() {
@@ -259,8 +263,8 @@ class BoxBox: public Object {
 };
 
 struct ExtendedNumberBox: public NumberBox {
-  static Ref<ExtendedNumberBox> constructor(double value, kj::String text) {
-    auto result = jsg::alloc<ExtendedNumberBox>();
+  static Ref<ExtendedNumberBox> constructor(jsg::Lock& js, double value, kj::String text) {
+    auto result = js.alloc<ExtendedNumberBox>();
     result->value = value;
     result->text = kj::mv(text);
     return result;

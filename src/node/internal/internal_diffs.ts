@@ -1,7 +1,7 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 // This module is browser compatible.
 
-/* todo: the following is adopted code, enabling linting one day */
+/* TODO: the following is adopted code, enabling linting one day */
 /* eslint-disable */
 
 interface FarthestPoint {
@@ -9,14 +9,14 @@ interface FarthestPoint {
   id: number;
 }
 
-export enum DiffType {
-  removed = 'removed',
-  common = 'common',
-  added = 'added',
-}
+export const DiffType = {
+  removed: 'removed',
+  common: 'common',
+  added: 'added',
+};
 
 export interface DiffResult<T> {
-  type: DiffType;
+  type: (typeof DiffType)[keyof typeof DiffType];
   value: T;
   details?: Array<DiffResult<T>>;
 }
@@ -107,7 +107,7 @@ export function diff<T>(A: T[], B: T[]): Array<DiffResult<T>> {
     current: FarthestPoint,
     swapped: boolean
   ): Array<{
-    type: DiffType;
+    type: (typeof DiffType)[keyof typeof DiffType];
     value: T;
   }> {
     const M = A.length;
@@ -391,7 +391,9 @@ export function diffstr(A: string, B: string) {
  * Prefixes `+` or `-` in diff output
  * @param diffType Difference type, either added or removed
  */
-function createSign(diffType: DiffType): string {
+function createSign(
+  diffType: (typeof DiffType)[keyof typeof DiffType]
+): string {
   switch (diffType) {
     case DiffType.added:
       return '+   ';

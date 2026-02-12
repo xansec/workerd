@@ -53,29 +53,29 @@ struct OptionalContext: public ContextGlobalObject {
     JSG_STRUCT(optString, optDouble);
   };
 
-  double takeOptional(Optional<Ref<NumberBox>> num) {
-    return kj::mv(num).orDefault(jsg::alloc<NumberBox>(321))->value;
+  double takeOptional(jsg::Lock& js, Optional<Ref<NumberBox>> num) {
+    return kj::mv(num).orDefault(js.alloc<NumberBox>(321))->value;
   }
-  double takeMaybe(kj::Maybe<Ref<NumberBox>> num) {
-    return kj::mv(num).orDefault(jsg::alloc<NumberBox>(321))->value;
+  double takeMaybe(jsg::Lock& js, kj::Maybe<Ref<NumberBox>> num) {
+    return kj::mv(num).orDefault(js.alloc<NumberBox>(321))->value;
   }
-  double takeLenientOptional(LenientOptional<Ref<NumberBox>> num) {
-    return kj::mv(num).orDefault(jsg::alloc<NumberBox>(321))->value;
+  double takeLenientOptional(jsg::Lock& js, LenientOptional<Ref<NumberBox>> num) {
+    return kj::mv(num).orDefault(js.alloc<NumberBox>(321))->value;
   }
   kj::String takeOptionalMaybe(Optional<kj::Maybe<kj::String>> arg) {
     return kj::mv(arg).orDefault(kj::str("(absent)")).orDefault(kj::str("(null)"));
   }
-  Optional<Ref<NumberBox>> returnOptional(double value) {
+  Optional<Ref<NumberBox>> returnOptional(jsg::Lock& js, double value) {
     if (value == 321)
       return kj::none;
     else
-      return jsg::alloc<NumberBox>(value);
+      return js.alloc<NumberBox>(value);
   }
-  kj::Maybe<Ref<NumberBox>> returnMaybe(double value) {
+  kj::Maybe<Ref<NumberBox>> returnMaybe(jsg::Lock& js, double value) {
     if (value == 321)
       return kj::none;
     else
-      return jsg::alloc<NumberBox>(value);
+      return js.alloc<NumberBox>(value);
   }
 
   kj::String readTestOptionalFields(TestOptionalFields s) {
@@ -115,6 +115,7 @@ JSG_DECLARE_ISOLATE_TYPE(OptionalIsolate,
 
 KJ_TEST("optionals and maybes") {
   Evaluator<OptionalContext, OptionalIsolate> e(v8System);
+  e.getIsolate().setUsingFastJsgStruct();
   e.expectEval("takeOptional(new NumberBox(123))", "number", "123");
   e.expectEval("takeOptional()", "number", "321");
   e.expectEval("takeOptional(undefined)", "number", "321");
@@ -161,14 +162,14 @@ KJ_TEST("optionals and maybes") {
 
   e.expectEval(
       "var object = makeTestOptionalFields(undefined, undefined, null);\n" ENUMERATE_OBJECT,
-      "string", "nullable: null");
+      "string", "optional: undefined, lenient: undefined, nullable: null");
   e.expectEval("var object = makeTestOptionalFields('foo', 'bar', null);\n" ENUMERATE_OBJECT,
       "string", "optional: foo, lenient: bar, nullable: null");
   e.expectEval("var object = makeTestOptionalFields('foo', 'bar', 'baz');\n" ENUMERATE_OBJECT,
       "string", "optional: foo, lenient: bar, nullable: baz");
   e.expectEval(
       "var object = makeTestOptionalFields(undefined, undefined, 'bar');\n" ENUMERATE_OBJECT,
-      "string", "nullable: bar");
+      "string", "optional: undefined, lenient: undefined, nullable: bar");
 #undef ENUMERATE_OBJECT
 
   e.expectEval("readTestAllOptionalFields({})", "string", "(absent), 321");
@@ -354,11 +355,11 @@ struct DictContext: public ContextGlobalObject {
     return kj::strArray(
         KJ_MAP(f, dict.fields) { return kj::str(f.name, ": ", f.value(js)); }, ", ");
   }
-  Dict<Ref<NumberBox>> returnDict() {
+  Dict<Ref<NumberBox>> returnDict(jsg::Lock& js) {
     auto builder = kj::heapArrayBuilder<Dict<Ref<NumberBox>>::Field>(3);
-    builder.add(Dict<Ref<NumberBox>>::Field{kj::str("foo"), jsg::alloc<NumberBox>(123)});
-    builder.add(Dict<Ref<NumberBox>>::Field{kj::str("bar"), jsg::alloc<NumberBox>(456)});
-    builder.add(Dict<Ref<NumberBox>>::Field{kj::str("baz"), jsg::alloc<NumberBox>(789)});
+    builder.add(Dict<Ref<NumberBox>>::Field{kj::str("foo"), js.alloc<NumberBox>(123)});
+    builder.add(Dict<Ref<NumberBox>>::Field{kj::str("bar"), js.alloc<NumberBox>(456)});
+    builder.add(Dict<Ref<NumberBox>>::Field{kj::str("baz"), js.alloc<NumberBox>(789)});
     return {builder.finish()};
   }
 
@@ -802,24 +803,50 @@ KJ_TEST("kj::Strings") {
 }
 
 // ========================================================================================
-
-struct ByteStringContext: public ContextGlobalObject {
-  ByteString takeByteString(ByteString s) {
+struct USVStringContext: public ContextGlobalObject {
+  jsg::USVString takeUSVString(jsg::USVString s) {
     return kj::mv(s);
   }
-  JSG_RESOURCE_TYPE(ByteStringContext) {
-    JSG_METHOD(takeByteString);
+
+  JSG_RESOURCE_TYPE(USVStringContext) {
+    JSG_METHOD(takeUSVString);
   }
 };
-JSG_DECLARE_ISOLATE_TYPE(ByteStringIsolate, ByteStringContext);
 
-KJ_TEST("ByteStrings") {
-  Evaluator<ByteStringContext, ByteStringIsolate> e(v8System);
-  e.expectEval("takeByteString('foo\\0bar') === 'foo\\0bar'", "boolean", "true");
-  // ﬃ is 0xEF 0xAC 0x83 in UTF-8.
-  e.expectEval("takeByteString('\\xEF\\xAC\\x83') === '\\xEF\\xAC\\x83'", "boolean", "true");
+JSG_DECLARE_ISOLATE_TYPE(USVStringIsolate, USVStringContext);
 
-  // TODO(cleanup): ByteString should become HeaderString somewhere in the api directory.
+KJ_TEST("jsg::USVStrings") {
+  Evaluator<USVStringContext, USVStringIsolate> e(v8System);
+  e.expectEval("takeUSVString('hello world')", "string", "hello world");
+  // From JS to C++: Characters forbidden in UTF-8, like unpaired surrogates, are replaced with the Unicode replacement character
+  // From C++ to JS: The replacement character is valid and is converted from UTF-8 to UTF-16
+  e.expectEval("takeUSVString('\\uD835x')", "string", u8"\uFFFDx");
+  e.expectEval("takeUSVString('\\uD835x\\uDC53')", "string", u8"\uFFFDx\uFFFD");
+}
+
+// ========================================================================================
+struct DOMStringContext: public ContextGlobalObject {
+  jsg::DOMString takeDOMString(jsg::DOMString s) {
+    return kj::mv(s);
+  }
+
+  JSG_RESOURCE_TYPE(DOMStringContext) {
+    JSG_METHOD(takeDOMString);
+  }
+};
+
+JSG_DECLARE_ISOLATE_TYPE(DOMStringIsolate, DOMStringContext);
+
+KJ_TEST("jsg::DOMStrings") {
+  Evaluator<DOMStringContext, DOMStringIsolate> e(v8System);
+  e.expectEval("takeDOMString('hello world')", "string", "hello world");
+  // From JS to C++: Characters forbidden in UTF-8, like unpaired surrogates, are encoded anyway making this a WTF-8 encoded value.
+  // From C++ to JS: Each invalid byte in the encoding of the unpaired surrogate is replaced with the Unicode replacement character.
+  // WTF, that's 3 replacement characters for each unpaired surrogate.
+  // TODO(someday): Fix the conversion back into a V8 string such that we get back the WTF-16 value we had originally (an unpaired surrogate)
+  e.expectEval("[...takeDOMString('\\uD835x')]", "object", u8"\uFFFD,\uFFFD,\uFFFD,x");
+  e.expectEval("[...takeDOMString('\\uD835x\\uDC53')]", "object",
+      u8"\uFFFD,\uFFFD,\uFFFD,x,\uFFFD,\uFFFD,\uFFFD");
 }
 
 // ========================================================================================
@@ -904,6 +931,37 @@ KJ_TEST("Array Values") {
   e.expectEval("m = Array(65); m[64] = 1; takeArray(m)[64]", "number", "1");
 
   e.expectEval("takeArguments(123, 456, 789, 321).join(', ')", "string", "456, 789, 321");
+}
+
+// ========================================================================================
+
+struct SetContext: public ContextGlobalObject {
+  kj::HashSet<kj::String> takeSet(kj::HashSet<kj::String> set) {
+    KJ_ASSERT(set.contains("42"_kj));
+    return kj::mv(set);
+  }
+  kj::HashSet<kj::String> returnStrings(int i, int j, int k) {
+    auto result = kj::HashSet<kj::String>();
+    result.insert(kj::str(i));
+    result.insert(kj::str(j));
+    result.insert(kj::str(k));
+    return kj::mv(result);
+  }
+  JSG_RESOURCE_TYPE(SetContext) {
+    JSG_METHOD(takeSet);
+    JSG_METHOD(returnStrings);
+  }
+};
+JSG_DECLARE_ISOLATE_TYPE(SetIsolate, SetContext);
+
+KJ_TEST("Set Values") {
+  Evaluator<SetContext, SetIsolate> e(v8System);
+  e.expectEval("m = new Set(); m.add('42'); takeSet(m).has('42')", "boolean", "true");
+  e.expectEval(
+      "const toString = () => '42'; takeSet(new Set([{ toString }, { toString }])).has('42')",
+      "throws", "TypeError: Duplicate values in the set after unwrapping.");
+
+  e.expectEval("returnStrings(123, 1024, 456).has('1024')", "boolean", "true");
 }
 
 // ========================================================================================
@@ -1008,6 +1066,10 @@ struct NonCoercibleContext: public ContextGlobalObject {
   JSG_RESOURCE_TYPE(NonCoercibleContext) {
     JSG_METHOD_NAMED(testString, template test<kj::String>);
     JSG_METHOD_NAMED(testStringCoerced, template testCoerced<kj::String>);
+    JSG_METHOD_NAMED(testUSVString, template test<jsg::USVString>);
+    JSG_METHOD_NAMED(testUSVStringCoerced, template testCoerced<jsg::USVString>);
+    JSG_METHOD_NAMED(testDOMString, template test<jsg::DOMString>);
+    JSG_METHOD_NAMED(testDOMStringCoerced, template testCoerced<jsg::DOMString>);
     JSG_METHOD_NAMED(testBoolean, template test<bool>);
     JSG_METHOD_NAMED(testBooleanCoerced, template testCoerced<bool>);
     JSG_METHOD_NAMED(testDouble, template test<double>);
@@ -1035,6 +1097,20 @@ KJ_TEST("NonCoercible Values") {
   e.expectEval("testStringCoerced(null)", "boolean", "true");
   e.expectEval("testStringCoerced({})", "boolean", "true");
   e.expectEval("testStringCoerced(1)", "boolean", "true");
+
+  e.expectEval("testUSVString('hi')", "boolean", "true");
+  e.expectEval("testUSVString(null)", "throws",
+      "TypeError: Failed to execute 'testUSVString' on 'NonCoercibleContext': parameter 1 is "
+      "not of type 'USVString'.");
+  e.expectEval("testUSVStringCoerced('hi')", "boolean", "true");
+  e.expectEval("testUSVStringCoerced(null)", "boolean", "true");
+
+  e.expectEval("testDOMString('hi')", "boolean", "true");
+  e.expectEval("testDOMString(null)", "throws",
+      "TypeError: Failed to execute 'testDOMString' on 'NonCoercibleContext': parameter 1 is "
+      "not of type 'DOMString'.");
+  e.expectEval("testDOMStringCoerced('hi')", "boolean", "true");
+  e.expectEval("testDOMStringCoerced(null)", "boolean", "true");
 
   e.expectEval("testBoolean(true)", "boolean", "true");
   e.expectEval("testBoolean(null)", "throws",
@@ -1100,17 +1176,17 @@ KJ_TEST("MemoizedIdentity Values") {
 // ========================================================================================
 
 struct IdentifiedContext: public ContextGlobalObject {
-  kj::String compare(Identified<kj::Date> a, Identified<kj::Date> b, v8::Isolate* isolate) {
+  kj::String compare(jsg::Lock& js, Identified<kj::Date> a, Identified<kj::Date> b) {
     bool result = a.identity == b.identity;
     KJ_EXPECT(a.identity.hashCode() != 0);
     KJ_EXPECT(b.identity.hashCode() != 0);
     if (result) {
       KJ_EXPECT(a.identity.hashCode() == b.identity.hashCode());
     }
-    KJ_EXPECT(
-        a.identity.hashCode() == kj::hashCode(a.identity.getHandle(isolate)->GetIdentityHash()));
-    KJ_EXPECT(
-        b.identity.hashCode() == kj::hashCode(b.identity.getHandle(isolate)->GetIdentityHash()));
+    KJ_EXPECT(a.identity.hashCode() ==
+        kj::hashCode(a.identity.getHandle(js.v8Isolate)->GetIdentityHash()));
+    KJ_EXPECT(b.identity.hashCode() ==
+        kj::hashCode(b.identity.getHandle(js.v8Isolate)->GetIdentityHash()));
 
     return kj::str(result, ' ', a.unwrapped - b.unwrapped);
   }

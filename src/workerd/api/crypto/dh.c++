@@ -1,27 +1,24 @@
 #include "dh.h"
 
+#include "impl.h"
+
 #include <workerd/io/io-context.h>
 
+#include <ncrypto.h>
 #include <openssl/bn.h>
 #include <openssl/dh.h>
 
 #include <kj/one-of.h>
 #include <kj/string.h>
 
-#if WORKERD_BSSL_NEED_DH_PRIMES
-#include <workerd/api/crypto/dh-primes.h>
-#endif  // WORKERD_BSSL_NEED_DH_PRIMES
-
-#if !_WIN32
-#include <strings.h>
-#endif
-
 namespace workerd::api {
 
 namespace {
 
-// Maximum DH prime size, adapted from boringssl.
-constexpr int OPENSSL_DH_MAX_MODULUS_BITS = 10000;
+// Maximum DH prime size, adapted from BoringSSL. This is already defined in more recent versions.
+#ifndef OPENSSL_DH_MAX_MODULUS_BITS
+#define OPENSSL_DH_MAX_MODULUS_BITS 10000
+#endif
 
 // Returns a function that can be used to create an instance of a standardized
 // Diffie-Hellman group.
@@ -80,13 +77,13 @@ kj::Own<DH> initDh(kj::OneOf<kj::Array<kj::byte>, int>& sizeOrKey,
           // Generating a DH key with a reasonable size can be expensive.
           // We will only allow it if there is an active IoContext so that
           // we can enforce a timeout associate with the limit enforcer.
-          JSG_REQUIRE(IoContext::hasCurrent(), Error,
+          auto& ioContext = JSG_REQUIRE_NONNULL(IoContext::tryCurrent(), Error,
               "DiffieHellman key generation requires an active request");
 
           struct Status {
             IoContext& context;
             kj::Maybe<EventOutcome> status;
-          } status{.context = IoContext::current()};
+          } status{.context = ioContext};
 
           auto dh = OSSL_NEW(DH);
           BN_GENCB cb;
@@ -103,7 +100,7 @@ kj::Own<DH> initDh(kj::OneOf<kj::Array<kj::byte>, int>& sizeOrKey,
             }
             return 1;
           };
-          // Operations on an "egregiously large" prime will throw with recent boringssl.
+          // Operations on an "egregiously large" prime will throw with recent BoringSSL.
           JSG_REQUIRE(size <= OPENSSL_DH_MAX_MODULUS_BITS, RangeError,
               "DiffieHellman init failed: requested prime size too large");
           if (!DH_generate_parameters_ex(dh.get(), size, gen, &cb)) {
@@ -132,7 +129,7 @@ kj::Own<DH> initDh(kj::OneOf<kj::Array<kj::byte>, int>& sizeOrKey,
       }
     }
     KJ_CASE_ONEOF(key, kj::Array<kj::byte>) {
-      // Operations on an "egregiously large" prime will throw with boringssl.
+      // Operations on an "egregiously large" prime will throw with BoringSSL.
       JSG_REQUIRE(key.size() <= OPENSSL_DH_MAX_MODULUS_BITS / CHAR_BIT, RangeError,
           "DiffieHellman init failed: key is too large");
       JSG_REQUIRE(key.size() > 0, Error, "DiffieHellman init failed: invalid key");
@@ -219,24 +216,28 @@ void DiffieHellman::setPublicKey(kj::ArrayPtr<kj::byte> key) {
 
 jsg::BufferSource DiffieHellman::getPublicKey(jsg::Lock& js) {
   const BIGNUM* pub_key = DH_get0_pub_key(dh);
+  JSG_REQUIRE(pub_key != nullptr, Error, "No public key");
   return JSG_REQUIRE_NONNULL(
       bignumToArrayPadded(js, *pub_key), Error, "Error while retrieving DiffieHellman public key");
 }
 
 jsg::BufferSource DiffieHellman::getPrivateKey(jsg::Lock& js) {
   const BIGNUM* priv_key = DH_get0_priv_key(dh);
+  JSG_REQUIRE(priv_key != nullptr, Error, "No private key");
   return JSG_REQUIRE_NONNULL(bignumToArrayPadded(js, *priv_key), Error,
       "Error while retrieving DiffieHellman private key");
 }
 
 jsg::BufferSource DiffieHellman::getGenerator(jsg::Lock& js) {
   const BIGNUM* g = DH_get0_g(dh);
+  JSG_REQUIRE(g != nullptr, Error, "No DiffieHellman generator");
   return JSG_REQUIRE_NONNULL(
       bignumToArrayPadded(js, *g), Error, "Error while retrieving DiffieHellman generator");
 }
 
 jsg::BufferSource DiffieHellman::getPrime(jsg::Lock& js) {
   const BIGNUM* p = DH_get0_p(dh);
+  JSG_REQUIRE(p != nullptr, Error, "No DiffieHellman prime");
   return JSG_REQUIRE_NONNULL(
       bignumToArrayPadded(js, *p), Error, "Error while retrieving DiffieHellman prime");
 }

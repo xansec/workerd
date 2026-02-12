@@ -23,11 +23,6 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-/* todo: the following is adopted code, enabling linting one day */
-/* eslint-disable */
-
-'use strict';
-
 import { default as cryptoImpl } from 'node-internal:crypto';
 
 import {
@@ -77,7 +72,7 @@ function validateParameters(
   password: ArrayLike,
   salt: ArrayLike,
   keylen: number,
-  options: ScryptOptions
+  options?: ScryptOptions
 ): ValidatedScryptOptions {
   // TODO(soon): Add support for KeyObject input.
   password = getArrayBufferOrView(password, 'password');
@@ -139,10 +134,18 @@ function validateParameters(
     if (maxmem === 0) maxmem = defaults.maxmem;
   }
 
-  return { password, salt, keylen, N: N!, r: r!, p: p!, maxmem: maxmem! };
+  return {
+    password,
+    salt,
+    keylen,
+    N: N as number,
+    r: r as number,
+    p: p as number,
+    maxmem: maxmem as number,
+  };
 }
 
-type Callback = (err: Error | null, derivedKey?: ArrayBuffer) => void;
+type Callback = (err: Error | null, derivedKey?: Buffer) => void;
 type OptionsOrCallback = ScryptOptions | Callback;
 
 export function scrypt(
@@ -151,7 +154,7 @@ export function scrypt(
   keylen: number,
   options: OptionsOrCallback,
   callback: OptionsOrCallback = defaults
-) {
+): void {
   if (callback === defaults) {
     callback = options;
     options = defaults;
@@ -174,13 +177,15 @@ export function scrypt(
     try {
       res(cryptoImpl.getScrypt(password, salt, N, r, p, maxmem, keylen));
     } catch (err) {
-      rej(err);
+      rej(err as Error);
     }
   }).then(
     (val: ArrayBuffer) => {
       (callback as Callback)(null, Buffer.from(val));
     },
-    (err) => (callback as Callback)(err)
+    (err: unknown) => {
+      (callback as Callback)(err as Error);
+    }
   );
 }
 
@@ -189,7 +194,7 @@ export function scryptSync(
   salt: ArrayLike,
   keylen: number,
   options: ScryptOptions
-): ArrayBuffer {
+): Buffer {
   let N: number;
   let r: number;
   let p: number;

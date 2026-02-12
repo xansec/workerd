@@ -166,14 +166,14 @@ kj::String kjUrlToString(const kj::Url& url) {
 // =======================================================================================
 // URL
 
-jsg::Ref<URL> URL::constructor(kj::String url, jsg::Optional<kj::String> base) {
+jsg::Ref<URL> URL::constructor(jsg::Lock& js, kj::String url, jsg::Optional<kj::String> base) {
   KJ_IF_SOME(b, base) {
     auto baseUrl =
         JSG_REQUIRE_NONNULL(kj::Url::tryParse(kj::mv(b)), TypeError, "Invalid base URL string.");
-    return jsg::alloc<URL>(JSG_REQUIRE_NONNULL(
+    return js.alloc<URL>(JSG_REQUIRE_NONNULL(
         baseUrl.tryParseRelative(kj::mv(url)), TypeError, "Invalid relative URL string."));
   }
-  return jsg::alloc<URL>(
+  return js.alloc<URL>(
       JSG_REQUIRE_NONNULL(kj::Url::tryParse(kj::mv(url)), TypeError, "Invalid URL string."));
 }
 
@@ -366,7 +366,7 @@ void URL::setPort(kj::String value) {
 }
 
 kj::String URL::getPathname() {
-  if (url->path.size() > 0) {
+  if (!url->path.empty()) {
     auto components =
         KJ_MAP(component, url->path) { return kj::str('/', kj::encodeUriPath(component)); };
     return kj::str(kj::strArray(components, ""), url->hasTrailingSlash ? "/" : "");
@@ -391,7 +391,7 @@ void URL::setPathname(kj::String value) {
     constexpr auto END_PATH_PART = kj::parse::anyOfChars("/");
     auto part = split(text, END_PATH_PART);
     if (part.size() == 2 && part[0] == '.' && part[1] == '.') {
-      if (newPath.size() != 0) {
+      if (!newPath.empty()) {
         newPath.removeLast();
       }
       newHasTrailingSlash = true;
@@ -472,11 +472,11 @@ void URL::setSearch(kj::String value) {
   }
 }
 
-jsg::Ref<URLSearchParams> URL::getSearchParams() {
+jsg::Ref<URLSearchParams> URL::getSearchParams(jsg::Lock& js) {
   KJ_IF_SOME(usp, searchParams) {
     return usp.addRef();
   } else {
-    searchParams.emplace(jsg::alloc<URLSearchParams>(kj::addRef(*url)));
+    searchParams.emplace(js.alloc<URLSearchParams>(kj::addRef(*url)));
     return KJ_ASSERT_NONNULL(searchParams).addRef();
   }
 }
@@ -507,8 +507,8 @@ kj::String URL::toJSON() {
 URLSearchParams::URLSearchParams(kj::Own<URL::RefcountedUrl> url): url(kj::mv(url)) {}
 
 jsg::Ref<URLSearchParams> URLSearchParams::constructor(
-    jsg::Optional<URLSearchParams::Initializer> init) {
-  auto searchParams = jsg::alloc<URLSearchParams>(kj::refcounted<URL::RefcountedUrl>());
+    jsg::Lock& js, jsg::Optional<URLSearchParams::Initializer> init) {
+  auto searchParams = js.alloc<URLSearchParams>(kj::refcounted<URL::RefcountedUrl>());
 
   KJ_IF_SOME(i, init) {
     KJ_SWITCH_ONEOF(i) {
@@ -623,22 +623,25 @@ void URLSearchParams::forEach(jsg::Lock& js,
   // it up. Using the classic for (;;) syntax here allows for that. However, this does
   // mean that it's possible for a user to trigger an infinite loop here if new items
   // are added to the search params unconditionally on each iteration.
+  // Silence clang-tidy warning, using an iterator would not work correctly if callback
+  // increases the size of data.
+  // NOLINTNEXTLINE(modernize-loop-convert)
   for (size_t i = 0; i < this->url->query.size(); i++) {
     auto& [key, value] = this->url->query[i];
     callback(js, value, key, JSG_THIS);
   }
 }
 
-jsg::Ref<URLSearchParams::EntryIterator> URLSearchParams::entries(jsg::Lock&) {
-  return jsg::alloc<EntryIterator>(IteratorState{JSG_THIS});
+jsg::Ref<URLSearchParams::EntryIterator> URLSearchParams::entries(jsg::Lock& js) {
+  return js.alloc<EntryIterator>(IteratorState{JSG_THIS});
 }
 
-jsg::Ref<URLSearchParams::KeyIterator> URLSearchParams::keys(jsg::Lock&) {
-  return jsg::alloc<KeyIterator>(IteratorState{JSG_THIS});
+jsg::Ref<URLSearchParams::KeyIterator> URLSearchParams::keys(jsg::Lock& js) {
+  return js.alloc<KeyIterator>(IteratorState{JSG_THIS});
 }
 
-jsg::Ref<URLSearchParams::ValueIterator> URLSearchParams::values(jsg::Lock&) {
-  return jsg::alloc<ValueIterator>(IteratorState{JSG_THIS});
+jsg::Ref<URLSearchParams::ValueIterator> URLSearchParams::values(jsg::Lock& js) {
+  return js.alloc<ValueIterator>(IteratorState{JSG_THIS});
 }
 
 kj::String URLSearchParams::toString() {

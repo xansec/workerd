@@ -4,6 +4,8 @@
 
 #include "impl.h"
 
+#include "simdutf.h"
+
 #include <workerd/api/util.h>
 #include <workerd/jsg/memory.h>
 
@@ -78,7 +80,7 @@ void throwOpensslError(const char* file, int line, kj::StringPtr code) {
   // Unfortunately BoringSSL's ERR_error_string() and friends produce unfriendly strings that
   // mostly just tell you the error constant name, which isn't what we want to throw at users.
   switch (ERR_GET_LIB(ERR_peek_last_error())) {
-    // The error code defines overlap between the different boringssl libraries (for example, we
+    // The error code defines overlap between the different BoringSSL libraries (for example, we
     // have EC_R_INVALID_ENCODING == RSA_R_CANNOT_RECOVER_MULTI_PRIME_KEY), so we must check the
     // library code.
     case ERR_LIB_EC:
@@ -122,7 +124,7 @@ void throwOpensslError(const char* file, int line, kj::StringPtr code) {
   }
   kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, file, line,
       kj::str("OpenSSL call failed: ", code, "; ",
-          lines.size() == 0 ? "but ERR_get_error() returned 0"_kj : kj::strArray(lines, "; "))));
+          lines.empty() ? "but ERR_get_error() returned 0"_kj : kj::strArray(lines, "; "))));
 }
 
 kj::Vector<kj::OneOf<kj::StringPtr, OpensslUntranslatedError>> consumeAllOpensslErrors() {
@@ -222,10 +224,10 @@ bool CryptoKey::Impl::equals(const jsg::BufferSource& other) const {
   KJ_FAIL_REQUIRE("Unable to compare raw key material for this key");
 }
 
-kj::Own<CryptoKey::Impl> CryptoKey::Impl::from(kj::Own<EVP_PKEY> key) {
+kj::Own<CryptoKey::Impl> CryptoKey::Impl::from(jsg::Lock& js, kj::Own<EVP_PKEY> key) {
   switch (EVP_PKEY_id(key.get())) {
     case EVP_PKEY_RSA:
-      return fromRsaKey(kj::mv(key));
+      return fromRsaKey(js, kj::mv(key));
     case EVP_PKEY_EC:
       return fromEcKey(kj::mv(key));
     case EVP_PKEY_ED25519:
@@ -350,5 +352,33 @@ kj::Maybe<kj::ArrayPtr<const kj::byte>> tryGetAsn1Sequence(kj::ArrayPtr<const kj
   auto start = 2;
   auto end = start + kj::min(data.size() - 2, data[1]);
   return data.slice(start, end);
+}
+
+kj::Maybe<kj::Array<kj::byte>> simdutfBase64UrlDecode(kj::StringPtr input) {
+  auto size = simdutf::maximal_binary_length_from_base64(input.begin(), input.size());
+  auto buf = kj::heapArray<kj::byte>(size);
+  auto result = simdutf::base64_to_binary(
+      input.begin(), input.size(), buf.asChars().begin(), simdutf::base64_url);
+  if (result.error != simdutf::SUCCESS) return kj::none;
+  KJ_ASSERT(result.count <= size);
+  return buf.slice(0, result.count).attach(kj::mv(buf));
+}
+
+kj::Maybe<jsg::BufferSource> simdutfBase64UrlDecode(jsg::Lock& js, kj::StringPtr input) {
+  auto size = simdutf::maximal_binary_length_from_base64(input.begin(), input.size());
+  KJ_STACK_ARRAY(kj::byte, buf, size, 1024, 4096);
+  auto result = simdutf::base64_to_binary(
+      input.begin(), input.size(), buf.asChars().begin(), simdutf::base64_url);
+  if (result.error != simdutf::SUCCESS) return kj::none;
+  KJ_ASSERT(result.count <= size);
+
+  auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, result.count);
+  backing.asArrayPtr().copyFrom(buf.first(result.count));
+  return jsg::BufferSource(js, kj::mv(backing));
+}
+
+jsg::BufferSource simdutfBase64UrlDecodeChecked(
+    jsg::Lock& js, kj::StringPtr input, kj::StringPtr error) {
+  return JSG_REQUIRE_NONNULL(simdutfBase64UrlDecode(js, input), Error, error);
 }
 }  // namespace workerd::api

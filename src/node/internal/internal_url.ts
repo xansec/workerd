@@ -110,9 +110,9 @@ function encodePathChars(
 export function isURL(self?: any): self is URL {
   return Boolean(
     self?.href &&
-      self.protocol &&
-      self.auth === undefined &&
-      self.path === undefined
+    self.protocol &&
+    self.auth === undefined &&
+    self.path === undefined
   );
 }
 /* eslint-enable */
@@ -269,6 +269,7 @@ export function urlToHttpOptions(url: URL): Record<string, unknown> {
   const { hostname, pathname, port, username, password, search } = url;
   const options: Record<string, unknown> = {
     __proto__: null,
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...url, // In case the url object was extended by the user.
     protocol: url.protocol,
     hostname:

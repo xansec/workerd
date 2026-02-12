@@ -6,6 +6,8 @@
 
 #include "impl.h"
 
+#include <workerd/api/crypto/crc-impl.h>
+#include <workerd/api/crypto/endianness.h>
 #include <workerd/api/streams/standard.h>
 #include <workerd/api/util.h>
 #include <workerd/io/io-context.h>
@@ -14,6 +16,7 @@
 
 #include <openssl/digest.h>
 #include <openssl/mem.h>
+#include <zlib.h>
 
 #include <algorithm>
 #include <array>
@@ -303,8 +306,8 @@ bool CryptoKey::operator==(const CryptoKey& other) const {
   return this == &other || (getType() == other.getType() && impl->equals(*other.impl));
 }
 
-CryptoKey::AsymmetricKeyDetails CryptoKey::getAsymmetricKeyDetails() const {
-  return impl->getAsymmetricKeyDetail();
+CryptoKey::AsymmetricKeyDetails CryptoKey::getAsymmetricKeyDetails(jsg::Lock& js) const {
+  return impl->getAsymmetricKeyDetail(js);
 }
 
 bool CryptoKey::verifyX509Public(const X509* cert) const {
@@ -315,6 +318,11 @@ bool CryptoKey::verifyX509Public(const X509* cert) const {
 bool CryptoKey::verifyX509Private(const X509* cert) const {
   if (this->getType() != "private"_kj) return false;
   return impl->verifyX509Private(cert);
+}
+
+void CryptoKey::visitForGc(jsg::GcVisitor& visitor) {
+  if (impl.get() == nullptr) return;
+  impl->visitForGc(visitor);
 }
 
 jsg::Promise<jsg::BufferSource> SubtleCrypto::encrypt(jsg::Lock& js,
@@ -473,7 +481,7 @@ jsg::Promise<jsg::BufferSource> SubtleCrypto::deriveBits(jsg::Lock& js,
   KJ_IF_SOME(maybeLength, lengthParam) {
     KJ_IF_SOME(l, maybeLength) {
       JSG_REQUIRE(l >= 0, TypeError, "deriveBits length must be an unsigned long integer.");
-      length = uint32_t(l);
+      length = static_cast<uint32_t>(l);
     }
   }
 
@@ -618,7 +626,7 @@ jsg::Ref<CryptoKey> SubtleCrypto::importKeySync(jsg::Lock& js,
   //   implementation functions don't necessarily know the name of the algorithm whose key they're
   //   importing (importKeyAesImpl handles AES-CTR, -CBC, and -GCM, for instance), so they should
   //   rely on this value to set the imported CryptoKey's name.
-  auto cryptoKey = jsg::alloc<CryptoKey>(algoImpl.importFunc(
+  auto cryptoKey = js.alloc<CryptoKey>(algoImpl.importFunc(
       js, algoImpl.name, format, kj::mv(keyData), kj::mv(algorithm), extractable, keyUsages));
 
   if (cryptoKey->getUsageSet().size() == 0) {
@@ -644,14 +652,14 @@ jsg::Promise<SubtleCrypto::ExportKeyData> SubtleCrypto::exportKey(
   });
 }
 
-bool SubtleCrypto::timingSafeEqual(kj::Array<kj::byte> a, kj::Array<kj::byte> b) {
+bool SubtleCrypto::timingSafeEqual(jsg::BufferSource a, jsg::BufferSource b) {
   JSG_REQUIRE(a.size() == b.size(), TypeError, "Input buffers must have the same byte length.");
 
   // The implementation here depends entirely on the characteristics of the CRYPTO_memcmp
   // implementation. We do not perform any additional verification that the operation is
   // actually timing safe other than checking the input types and lengths.
 
-  return CRYPTO_memcmp(a.begin(), b.begin(), a.size()) == 0;
+  return CRYPTO_memcmp(a.asArrayPtr().begin(), b.asArrayPtr().begin(), a.size()) == 0;
 }
 
 // =======================================================================================
@@ -676,31 +684,138 @@ kj::String Crypto::randomUUID() {
 // =======================================================================================
 // Crypto Streams implementation
 
+class CRC32DigestContext final: public DigestContext {
+ public:
+  CRC32DigestContext(): value(crc32(0, Z_NULL, 0)) {}
+  ~CRC32DigestContext() noexcept override = default;
+
+  void write(kj::ArrayPtr<kj::byte> buffer) override {
+    value = crc32(value, buffer.begin(), buffer.size());
+  }
+
+  jsg::BufferSource close(jsg::Lock& js) override {
+    auto beValue = htobe32(value);
+    static_assert(sizeof(value) == sizeof(beValue), "CRC32 digest is not 32 bits?");
+    auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, sizeof(beValue));
+    jsg::BufferSource source(js, kj::mv(backing));
+    kj::ArrayPtr<kj::byte> be(reinterpret_cast<kj::byte*>(&beValue), sizeof(beValue));
+    source.asArrayPtr().copyFrom(be);
+    return kj::mv(source);
+  }
+
+ private:
+  uint32_t value;
+};
+
+class CRC32CDigestContext final: public DigestContext {
+ public:
+  CRC32CDigestContext(): value(crc32c(0, nullptr, 0)) {}
+  ~CRC32CDigestContext() noexcept override = default;
+
+  void write(kj::ArrayPtr<kj::byte> buffer) override {
+    value = crc32c(value, buffer.begin(), buffer.size());
+  }
+
+  jsg::BufferSource close(jsg::Lock& js) override {
+    auto beValue = htobe32(value);
+    static_assert(sizeof(value) == sizeof(beValue), "CRC32 digest is not 32 bits?");
+    auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, sizeof(beValue));
+    jsg::BufferSource source(js, kj::mv(backing));
+    kj::ArrayPtr<kj::byte> be(reinterpret_cast<kj::byte*>(&beValue), sizeof(beValue));
+    source.asArrayPtr().copyFrom(be);
+    return kj::mv(source);
+  }
+
+ private:
+  uint32_t value;
+};
+
+class CRC64NVMEDigestContext final: public DigestContext {
+ public:
+  CRC64NVMEDigestContext(): value(crc64nvme(0, nullptr, 0)) {}
+  ~CRC64NVMEDigestContext() noexcept override = default;
+
+  void write(kj::ArrayPtr<kj::byte> buffer) override {
+    value = crc64nvme(value, buffer.begin(), buffer.size());
+  }
+
+  jsg::BufferSource close(jsg::Lock& js) override {
+    auto beValue = htobe64(value);
+    static_assert(sizeof(value) == sizeof(beValue), "CRC64 digest is not 64 bits?");
+    auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, sizeof(beValue));
+    jsg::BufferSource source(js, kj::mv(backing));
+    kj::ArrayPtr<kj::byte> be(reinterpret_cast<kj::byte*>(&beValue), sizeof(beValue));
+    source.asArrayPtr().copyFrom(be);
+    return kj::mv(source);
+  }
+
+ private:
+  uint64_t value;
+};
+
+class OpenSSLDigestContext final: public DigestContext {
+ public:
+  OpenSSLDigestContext(kj::StringPtr algorithm): algorithm(kj::str(algorithm)) {
+    auto checkErrorsOnFinish = webCryptoOperationBegin(__func__, algorithm);
+    auto type = lookupDigestAlgorithm(algorithm).second;
+    auto opensslContext = kj::disposeWith<EVP_MD_CTX_free>(EVP_MD_CTX_new());
+    KJ_ASSERT(opensslContext.get() != nullptr);
+    OSSLCALL(EVP_DigestInit_ex(opensslContext.get(), type, nullptr));
+    context = kj::mv(opensslContext);
+  }
+  ~OpenSSLDigestContext() noexcept override = default;
+
+  void write(kj::ArrayPtr<kj::byte> buffer) override {
+    auto checkErrorsOnFinish = webCryptoOperationBegin(__func__, algorithm);
+    OSSLCALL(EVP_DigestUpdate(context.get(), buffer.begin(), buffer.size()));
+  }
+
+  jsg::BufferSource close(jsg::Lock& js) override {
+    auto checkErrorsOnFinish = webCryptoOperationBegin(__func__, algorithm);
+    uint size = 0;
+    auto backing = jsg::BackingStore::alloc<v8::ArrayBuffer>(js, EVP_MD_CTX_size(context.get()));
+    jsg::BufferSource source(js, kj::mv(backing));
+    OSSLCALL(EVP_DigestFinal_ex(context.get(), source.asArrayPtr().begin(), &size));
+    KJ_ASSERT(size, source.size());
+    return kj::mv(source);
+  }
+
+ private:
+  kj::String algorithm;
+  kj::Own<EVP_MD_CTX> context;
+};
+
 DigestStream::DigestContextPtr DigestStream::initContext(SubtleCrypto::HashAlgorithm& algorithm) {
-  auto checkErrorsOnFinish = webCryptoOperationBegin(__func__, algorithm.name);
-  auto type = lookupDigestAlgorithm(algorithm.name).second;
-  auto context = kj::disposeWith<EVP_MD_CTX_free>(EVP_MD_CTX_new());
-  KJ_ASSERT(context.get() != nullptr);
-  OSSLCALL(EVP_DigestInit_ex(context.get(), type, nullptr));
-  return kj::mv(context);
+  if (algorithm.name == "crc32") {
+    return kj::heap<CRC32DigestContext>();
+  } else if (algorithm.name == "crc32c") {
+    return kj::heap<CRC32CDigestContext>();
+  } else if (algorithm.name == "crc64nvme") {
+    return kj::heap<CRC64NVMEDigestContext>();
+  } else {
+    return kj::heap<OpenSSLDigestContext>(algorithm.name);
+  }
 }
 
 DigestStream::DigestStream(kj::Own<WritableStreamController> controller,
     SubtleCrypto::HashAlgorithm algorithm,
-    jsg::Promise<kj::Array<kj::byte>>::Resolver resolver,
-    jsg::Promise<kj::Array<kj::byte>> promise)
+    jsg::Promise<jsg::BufferSource>::Resolver resolver,
+    jsg::Promise<jsg::BufferSource> promise)
     : WritableStream(kj::mv(controller)),
       promise(kj::mv(promise)),
       state(Ready(kj::mv(algorithm), kj::mv(resolver))) {}
 
 void DigestStream::dispose(jsg::Lock& js) {
-  js.tryCatch([&] {
+  JSG_TRY(js) {
     KJ_IF_SOME(ready, state.tryGet<Ready>()) {
       auto reason = js.typeError("The DigestStream was disposed.");
       ready.resolver.reject(js, reason);
       state.init<StreamStates::Errored>(js.v8Ref<v8::Value>(reason));
     }
-  }, [&](jsg::Value exception) { js.throwException(kj::mv(exception)); });
+  }
+  JSG_CATCH(exception) {
+    js.throwException(kj::mv(exception));
+  }
 }
 
 void DigestStream::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
@@ -726,8 +841,7 @@ kj::Maybe<StreamStates::Errored> DigestStream::write(jsg::Lock& js, kj::ArrayPtr
       return errored.addRef(js);
     }
     KJ_CASE_ONEOF(ready, Ready) {
-      auto checkErrorsOnFinish = webCryptoOperationBegin(__func__, ready.algorithm.name);
-      OSSLCALL(EVP_DigestUpdate(ready.context.get(), buffer.begin(), buffer.size()));
+      ready.context->write(buffer);
       return kj::none;
     }
   }
@@ -743,12 +857,7 @@ kj::Maybe<StreamStates::Errored> DigestStream::close(jsg::Lock& js) {
       return errored.addRef(js);
     }
     KJ_CASE_ONEOF(ready, Ready) {
-      auto checkErrorsOnFinish = webCryptoOperationBegin(__func__, ready.algorithm.name);
-      uint size = 0;
-      auto digest = kj::heapArray<kj::byte>(EVP_MD_CTX_size(ready.context.get()));
-      OSSLCALL(EVP_DigestFinal_ex(ready.context.get(), digest.begin(), &size));
-      KJ_ASSERT(size, digest.size());
-      ready.resolver.resolve(js, kj::mv(digest));
+      ready.resolver.resolve(js, ready.context->close(js));
       state.init<StreamStates::Closed>();
       return kj::none;
     }
@@ -765,63 +874,61 @@ void DigestStream::abort(jsg::Lock& js, jsg::JsValue reason) {
 }
 
 jsg::Ref<DigestStream> DigestStream::constructor(jsg::Lock& js, Algorithm algorithm) {
-  auto paf = js.newPromiseAndResolver<kj::Array<kj::byte>>();
+  auto paf = js.newPromiseAndResolver<jsg::BufferSource>();
 
-  auto stream = jsg::alloc<DigestStream>(newWritableStreamJsController(),
+  auto stream = js.alloc<DigestStream>(newWritableStreamJsController(),
       interpretAlgorithmParam(kj::mv(algorithm)), kj::mv(paf.resolver), kj::mv(paf.promise));
 
-  stream->getController().setup(js,
-      UnderlyingSink{
-        .write =
-            [&stream = *stream](jsg::Lock& js, v8::Local<v8::Value> chunk, auto c) mutable {
-    return js.tryCatch([&] {
-      // Make sure what we got can be interpreted as bytes...
-      std::shared_ptr<v8::BackingStore> backing;
-      if (chunk->IsArrayBuffer() || chunk->IsArrayBufferView()) {
-        jsg::BufferSource source(js, chunk);
-        if (source.size() == 0) return js.resolvedPromise();
+  // clang-format off
+  stream->getController().setup(js, UnderlyingSink{
+    .write = [&stream = *stream](jsg::Lock& js, v8::Local<v8::Value> chunk, auto c) mutable {
+      return js.tryCatch([&] {
+        // Make sure what we got can be interpreted as bytes...
+        std::shared_ptr<v8::BackingStore> backing;
+        if (chunk->IsArrayBuffer() || chunk->IsArrayBufferView()) {
+          jsg::BufferSource source(js, chunk);
+          if (source.size() == 0) return js.resolvedPromise();
 
-        KJ_IF_SOME(error, stream.write(js, source.asArrayPtr())) {
+          KJ_IF_SOME(error, stream.write(js, source.asArrayPtr())) {
+            return js.rejectedPromise<void>(kj::mv(error));
+          } else {
+          }  // Here to silence a compiler warning
+          stream.bytesWritten += source.size();
+          return js.resolvedPromise();
+        } else if (chunk->IsString()) {
+          // If we receive a string, we'll convert that to UTF-8 bytes and digest that.
+          auto str = js.toString(chunk);
+          if (str.size() == 0) return js.resolvedPromise();
+          KJ_IF_SOME(error, stream.write(js, str.asBytes())) {
+            return js.rejectedPromise<void>(kj::mv(error));
+          }
+          stream.bytesWritten += str.size();
+          return js.resolvedPromise();
+        }
+        return js.rejectedPromise<void>(
+            js.typeError("DigestStream is a byte stream but received an object of "
+                        "non-ArrayBuffer/ArrayBufferView/string type on its writable side."));
+      }, [&](jsg::Value exception) { return js.rejectedPromise<void>(kj::mv(exception)); });
+    },
+    .abort = [&stream = *stream](jsg::Lock& js, auto reason) mutable {
+      return js.tryCatch([&] {
+        stream.abort(js, jsg::JsValue(reason));
+        return js.resolvedPromise();
+      }, [&](jsg::Value exception) { return js.rejectedPromise<void>(kj::mv(exception)); });
+    },
+    .close = [&stream = *stream](jsg::Lock& js) mutable {
+      return js.tryCatch([&] {
+        // If sink.close returns a non kj::none value, that means the sink was errored
+        // and we return a rejected promise here. Otherwise, we return resolved.
+        KJ_IF_SOME(error, stream.close(js)) {
           return js.rejectedPromise<void>(kj::mv(error));
         } else {
         }  // Here to silence a compiler warning
-        stream.bytesWritten += source.size();
         return js.resolvedPromise();
-      } else if (chunk->IsString()) {
-        // If we receive a string, we'll convert that to UTF-8 bytes and digest that.
-        auto str = js.toString(chunk);
-        if (str.size() == 0) return js.resolvedPromise();
-        KJ_IF_SOME(error, stream.write(js, str.asBytes())) {
-          return js.rejectedPromise<void>(kj::mv(error));
-        }
-        stream.bytesWritten += str.size();
-        return js.resolvedPromise();
-      }
-      return js.rejectedPromise<void>(
-          js.typeError("DigestStream is a byte stream but received an object of "
-                       "non-ArrayBuffer/ArrayBufferView/string type on its writable side."));
-    }, [&](jsg::Value exception) { return js.rejectedPromise<void>(kj::mv(exception)); });
-  },
-        .abort =
-            [&stream = *stream](jsg::Lock& js, auto reason) mutable {
-    return js.tryCatch([&] {
-      stream.abort(js, jsg::JsValue(reason));
-      return js.resolvedPromise();
-    }, [&](jsg::Value exception) { return js.rejectedPromise<void>(kj::mv(exception)); });
-  },
-        .close =
-            [&stream = *stream](jsg::Lock& js) mutable {
-    return js.tryCatch([&] {
-      // If sink.close returns a non kj::none value, that means the sink was errored
-      // and we return a rejected promise here. Otherwise, we return resolved.
-      KJ_IF_SOME(error, stream.close(js)) {
-        return js.rejectedPromise<void>(kj::mv(error));
-      } else {
-      }  // Here to silence a compiler warning
-      return js.resolvedPromise();
-    }, [&](jsg::Value exception) { return js.rejectedPromise<void>(kj::mv(exception)); });
-  }},
-      kj::none);
+      }, [&](jsg::Value exception) { return js.rejectedPromise<void>(kj::mv(exception)); });
+    }
+  }, kj::none);
+  // clang-format on
 
   return kj::mv(stream);
 }
